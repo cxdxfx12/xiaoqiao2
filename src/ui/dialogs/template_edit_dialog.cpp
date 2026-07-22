@@ -10,6 +10,7 @@
 #include <QMessageBox>
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QSqlDatabase>
 #include <QDateEdit>
 #include <QDebug>
 #include <QSet>
@@ -70,6 +71,12 @@ void TemplateEditDialog::SetupUI() {
     spn_vol_ratio_->setSingleStep(500);
     spn_vol_ratio_->setDecimals(0);
 
+    spn_no_weight_fee_ = new QDoubleSpinBox();
+    spn_no_weight_fee_->setRange(0, 9999);
+    spn_no_weight_fee_->setSingleStep(0.5);
+    spn_no_weight_fee_->setDecimals(2);
+    spn_no_weight_fee_->setPrefix("¥ ");
+
     chk_default_ = new QCheckBox("设为默认模板");
 
     edt_desc_ = new QLineEdit();
@@ -86,6 +93,7 @@ void TemplateEditDialog::SetupUI() {
     info_form->addRow("首重(kg):", spn_first_weight_);
     info_form->addRow("续重单位(kg):", spn_add_unit_);
     info_form->addRow("体积重比:", spn_vol_ratio_);
+    info_form->addRow("无重量默认运费:", spn_no_weight_fee_);
     info_form->addRow("", chk_default_);
     info_form->addRow("描述:", edt_desc_);
 
@@ -240,6 +248,7 @@ void TemplateEditDialog::LoadData() {
         spn_first_weight_->setValue(1.0);
         spn_add_unit_->setValue(1.0);
         spn_vol_ratio_->setValue(6000);
+        spn_no_weight_fee_->setValue(0.0);
         return;
     }
 
@@ -256,6 +265,7 @@ void TemplateEditDialog::LoadData() {
     spn_first_weight_->setValue(tpl["first_weight"].toDouble());
     spn_add_unit_->setValue(tpl["additional_unit"].toDouble());
     spn_vol_ratio_->setValue(tpl["vol_weight_ratio"].toDouble());
+    spn_no_weight_fee_->setValue(tpl.value("default_no_weight_fee", 0).toDouble());
     chk_default_->setChecked(tpl["is_default"].toBool());
     edt_desc_->setText(tpl["description"].toString());
 
@@ -415,6 +425,7 @@ void TemplateEditDialog::OnSave() {
     tpl["first_weight"] = spn_first_weight_->value();
     tpl["additional_unit"] = spn_add_unit_->value();
     tpl["vol_weight_ratio"] = spn_vol_ratio_->value();
+    tpl["default_no_weight_fee"] = spn_no_weight_fee_->value();
     tpl["description"] = edt_desc_->text().trimmed();
 
     bool ok;
@@ -449,9 +460,26 @@ void TemplateEditDialog::OnSave() {
 }
 
 void TemplateEditDialog::OnSavePricing() {
-    if (is_new_) return;
+    if (is_new_) {
+        QMessageBox::warning(this, "提示", "请先保存模板基本信息");
+        return;
+    }
 
-    QSqlQuery q(repo_->Database());
+    auto *editor = pricing_table_->indexWidget(pricing_table_->currentIndex());
+    if (editor) {
+        pricing_table_->itemDelegate()->commitData(editor);
+        pricing_table_->itemDelegate()->closeEditor(editor, QAbstractItemDelegate::NoHint);
+    }
+
+    QSqlDatabase db = repo_->Database();
+    if (!db.transaction()) {
+        QMessageBox::critical(this, "错误", "无法启动事务: " + db.lastError().text());
+        return;
+    }
+
+    bool success = true;
+    QString error_msg;
+    int total_updated = 0;
     QSet<QString> processed_zones;
 
     for (int row = 0; row < pricing_table_->rowCount(); row++) {
@@ -461,36 +489,91 @@ void TemplateEditDialog::OnSavePricing() {
         if (group_code.isEmpty() || processed_zones.contains(group_code)) continue;
         processed_zones.insert(group_code);
 
-        // 从该分区第一行读取价格
-        double p05 = pricing_table_->item(row, 2)->text().toDouble();
-        double p1 = pricing_table_->item(row, 3)->text().toDouble();
-        double p2 = pricing_table_->item(row, 4)->text().toDouble();
-        double p3 = pricing_table_->item(row, 5)->text().toDouble();
-        double mid_first = pricing_table_->item(row, 6)->text().toDouble();
-        double mid_add = pricing_table_->item(row, 7)->text().toDouble();
-        double big_first = pricing_table_->item(row, 8)->text().toDouble();
-        double big_add = pricing_table_->item(row, 9)->text().toDouble();
+        bool ok_p05, ok_p1, ok_p2, ok_p3, ok_midf, ok_mida, ok_bigf, ok_biga;
+        double p05 = pricing_table_->item(row, 2)->text().toDouble(&ok_p05);
+        double p1 = pricing_table_->item(row, 3)->text().toDouble(&ok_p1);
+        double p2 = pricing_table_->item(row, 4)->text().toDouble(&ok_p2);
+        double p3 = pricing_table_->item(row, 5)->text().toDouble(&ok_p3);
+        double mid_first = pricing_table_->item(row, 6)->text().toDouble(&ok_midf);
+        double mid_add = pricing_table_->item(row, 7)->text().toDouble(&ok_mida);
+        double big_first = pricing_table_->item(row, 8)->text().toDouble(&ok_bigf);
+        double big_add = pricing_table_->item(row, 9)->text().toDouble(&ok_biga);
 
-        auto updateTier = [&](const QString &tier_code, double first_price, double add_price) {
-            q.prepare("UPDATE tiered_pricing SET first_price=?, additional_price=? "
-                      "WHERE template_id=? AND group_code=? AND tier_code=?");
-            q.addBindValue(first_price);
-            q.addBindValue(add_price);
-            q.addBindValue(template_id_);
-            q.addBindValue(group_code);
-            q.addBindValue(tier_code);
-            q.exec();
+        if (!ok_p05 || !ok_p1 || !ok_p2 || !ok_p3 || !ok_midf || !ok_mida || !ok_bigf || !ok_biga) {
+            error_msg = QString("第%1行价格格式不正确").arg(row + 1);
+            success = false;
+            break;
+        }
+
+        QVector<QPair<QString, QPair<double, double>>> tiers = {
+            {"tier_0_0.5", {p05, 0.0}},
+            {"tier_0.5_1", {p1, 0.0}},
+            {"tier_1_2", {p2, 0.0}},
+            {"tier_2_3", {p3, 0.0}},
+            {"tier_3_30", {mid_first, mid_add}},
+            {"tier_30_plus", {big_first, big_add}},
         };
 
-        updateTier("tier_0_0.5", p05, p05);
-        updateTier("tier_0.5_1", p1, p1);
-        updateTier("tier_1_2", p2, p2);
-        updateTier("tier_2_3", p3, p3);
-        updateTier("tier_3_30", mid_first, mid_add);
-        updateTier("tier_30_plus", big_first, big_add);
+        for (const auto &tier : tiers) {
+            QSqlQuery q(db);
+            q.prepare("UPDATE tiered_pricing SET first_price=?, additional_price=? "
+                      "WHERE template_id=? AND group_code=? AND tier_code=?");
+            q.addBindValue(tier.second.first);
+            q.addBindValue(tier.second.second);
+            q.addBindValue(template_id_);
+            q.addBindValue(group_code);
+            q.addBindValue(tier.first);
+
+            if (!q.exec()) {
+                error_msg = "保存失败: " + q.lastError().text();
+                success = false;
+                break;
+            }
+
+            if (q.numRowsAffected() == 0) {
+                QSqlQuery q2(db);
+                q2.prepare("INSERT INTO tiered_pricing "
+                           "(template_id, group_code, tier_code, tier_name, "
+                           " min_weight, max_weight, first_price, additional_price, sort_order) "
+                           "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                q2.addBindValue(template_id_);
+                q2.addBindValue(group_code);
+                q2.addBindValue(tier.first);
+                q2.addBindValue("");
+                q2.addBindValue(0);
+                q2.addBindValue(0);
+                q2.addBindValue(tier.second.first);
+                q2.addBindValue(tier.second.second);
+                q2.addBindValue(0);
+
+                if (!q2.exec()) {
+                    error_msg = "插入失败: " + q2.lastError().text();
+                    success = false;
+                    break;
+                }
+                total_updated++;
+            } else {
+                total_updated += q.numRowsAffected();
+            }
+        }
+
+        if (!success) break;
     }
 
-    qDebug() << "Pricing saved for template:" << template_id_;
+    if (success) {
+        if (!db.commit()) {
+            error_msg = "提交事务失败: " + db.lastError().text();
+            success = false;
+        }
+    }
+
+    if (!success) {
+        db.rollback();
+        QMessageBox::critical(this, "错误", error_msg);
+        return;
+    }
+
+    QMessageBox::information(this, "成功", QString("报价表已保存，共更新 %1 条记录").arg(total_updated));
 }
 
 void TemplateEditDialog::OnPricingCellChanged(int row, int col) {

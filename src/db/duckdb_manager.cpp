@@ -1,4 +1,5 @@
 #include "db/duckdb_manager.hpp"
+#include "core/app_config.hpp"
 #include <QDebug>
 #include <QFileInfo>
 #include <QSqlDatabase>
@@ -18,6 +19,19 @@ bool DuckDBManager::Init(const QString &db_path) {
     try {
         db_path_ = db_path;
         db_ = std::make_unique<duckdb::DuckDB>(db_path.toStdString());
+
+        auto &cfg = core::AppConfig::Instance();
+        try {
+            auto con = CreateConnection();
+            QString mem_limit = QString("%1MB").arg(cfg.GetMemoryLimitMB());
+            QString threads = QString::number(cfg.GetThreadCount());
+            con.Query(QString("SET memory_limit = '%1'").arg(mem_limit).toStdString());
+            con.Query(QString("SET threads = %1").arg(threads).toStdString());
+            qDebug() << "DuckDB performance: memory_limit =" << mem_limit << ", threads =" << threads;
+        } catch (const std::exception &e) {
+            qWarning() << "Set DuckDB performance config warning:" << e.what();
+        }
+
         // 加载 Excel 扩展（DuckDB 1.5 中 read_xlsx 来自 excel 扩展）
         try {
             auto con = CreateConnection();
@@ -80,6 +94,7 @@ bool DuckDBManager::LoadRulesFromSQLite(const QString &rules_db_path) {
                     first_weight DOUBLE DEFAULT 1.0,
                     additional_unit DOUBLE DEFAULT 1.0,
                     vol_weight_ratio DOUBLE DEFAULT 6000.0,
+                    default_no_weight_fee DOUBLE DEFAULT 0,
                     description VARCHAR,
                     is_default INTEGER DEFAULT 0,
                     created_at TIMESTAMP,
@@ -282,8 +297,7 @@ bool DuckDBManager::ExportToFile(const QString &table_name, const QString &file_
             sql = QString("COPY %1 TO '%2' (FORMAT PARQUET)")
                 .arg(table_name, file_path);
         } else if (suffix == "xlsx") {
-            // DuckDB 1.5 中 excel 扩展提供 FORMAT xlsx（不是 GDAL）
-            sql = QString("COPY %1 TO '%2' (FORMAT xlsx)")
+            sql = QString("COPY %1 TO '%2' (FORMAT xlsx, HEADER TRUE)")
                 .arg(table_name, file_path);
         } else {
             return false;

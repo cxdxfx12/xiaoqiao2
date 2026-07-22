@@ -80,4 +80,12 @@ if(APPLE)
         MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.hbdxm.xiaoqiao"
     )
+
+    set(DEPLOY_SCRIPT ${CMAKE_SOURCE_DIR}/scripts/deploy_mac.sh)
+    if(EXISTS ${DEPLOY_SCRIPT})
+        add_custom_command(TARGET xiaoqiao_freight POST_BUILD
+            COMMAND bash ${DEPLOY_SCRIPT} $<TARGET_BUNDLE_DIR:xiaoqiao_freight>
+            COMMENT "Deploying Qt frameworks and fixing signatures..."
+        )
+    endif()
 endif()

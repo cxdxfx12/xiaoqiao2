@@ -7,6 +7,7 @@
 #include <QDateEdit>
 #include <QPushButton>
 #include <QHeaderView>
+#include <QDate>
 
 namespace freight::ui::dialogs {
 
@@ -34,8 +35,10 @@ void HistoryDialog::SetupUI() {
     edt_search->setPlaceholderText("搜索任务名称...");
     auto *date_from = new QDateEdit();
     date_from->setCalendarPopup(true);
+    date_from->setDate(QDate::currentDate().addMonths(-1));
     auto *date_to = new QDateEdit();
     date_to->setCalendarPopup(true);
+    date_to->setDate(QDate::currentDate());
     auto *btn_search = new QPushButton("搜索");
     btn_search->setIcon(icons.ActionIcon("search"));
 

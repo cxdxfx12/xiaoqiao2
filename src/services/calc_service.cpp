@@ -27,6 +27,11 @@ core::CalcResult CalcService::CalcSingle(const QString &province,
 
         QString sql = QString(R"SQL(
 WITH
+template_info AS (
+    SELECT COALESCE(default_no_weight_fee, 0) AS default_no_weight_fee
+    FROM freight_templates
+    WHERE template_id = '%1'
+),
 matched_zone AS (
     SELECT zgp.group_code, zg.group_name
     FROM zone_group_provinces zgp
@@ -61,6 +66,8 @@ tier_max AS (
 base_fee_calc AS (
     SELECT
         CASE
+            WHEN %3 <= 0 OR %3 IS NULL
+                THEN (SELECT default_no_weight_fee FROM template_info)
             WHEN (SELECT group_code FROM matched_zone) IS NULL THEN 0
             WHEN %3 <= (SELECT first_weight FROM matched_tier)
                 THEN (SELECT first_price FROM matched_tier)
@@ -226,17 +233,23 @@ customer_template_lookup AS (
     FROM input_data i
     LEFT JOIN customers c ON c.customer_id = i.customer_id
 ),
-matched_zone AS (
+template_info AS (
     SELECT
         ctl.*,
-        -- 规范化省份名（去掉 省/市/自治区 等后缀），让 Excel 全称能与规则简称匹配
-        REGEXP_REPLACE(ctl.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') AS norm_province,
+        COALESCE(ft.default_no_weight_fee, 0) AS default_no_weight_fee
+    FROM customer_template_lookup ctl
+    LEFT JOIN freight_templates ft ON ft.template_id = ctl.template_id
+),
+matched_zone AS (
+    SELECT
+        ti.*,
+        REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') AS norm_province,
         zgp.group_code,
         zg.group_name
-    FROM customer_template_lookup ctl
+    FROM template_info ti
     LEFT JOIN zone_group_provinces zgp
-        ON zgp.template_id = ctl.template_id
-       AND zgp.province = REGEXP_REPLACE(ctl.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+        ON zgp.template_id = ti.template_id
+       AND zgp.province = REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
     LEFT JOIN zone_groups zg
         ON zg.template_id = zgp.template_id
        AND zg.group_code = zgp.group_code
@@ -274,6 +287,8 @@ base_fee_calc AS (
     SELECT
         mt.*,
         CASE
+            WHEN mt.charge_weight <= 0 OR mt.charge_weight IS NULL
+                THEN mt.default_no_weight_fee
             WHEN mt.group_code IS NULL THEN 0
             WHEN mt.charge_weight <= mt.first_weight THEN mt.first_price
             WHEN mt.tier_code IS NOT NULL
@@ -327,18 +342,18 @@ strategy_surcharge_calc AS (
 )
 
 SELECT
-    order_id,
-    customer_id,
-    dest_province,
-    dest_city,
-    weight,
-    vol_weight,
-    charge_weight,
-    ROUND(base_fee, 2) AS base_fee,
-    ROUND(fuel_surcharge, 2) AS fuel_surcharge,
-    ROUND(strategy_surcharge, 2) AS strategy_surcharge,
-    ROUND(base_fee + fuel_surcharge + strategy_surcharge, 2) AS total_fee,
-    'CNY' AS currency
+    order_id AS "订单号",
+    customer_id AS "客户编号",
+    dest_province AS "目的省份",
+    dest_city AS "目的城市",
+    weight AS "实际重量(KG)",
+    vol_weight AS "体积重量(KG)",
+    charge_weight AS "计费重量(KG)",
+    ROUND(base_fee, 2) AS "基础运费",
+    ROUND(fuel_surcharge, 2) AS "燃油附加费",
+    ROUND(strategy_surcharge, 2) AS "其他附加费",
+    ROUND(base_fee + fuel_surcharge + strategy_surcharge, 2) AS "总运费",
+    'CNY' AS "币种"
 FROM strategy_surcharge_calc
     )SQL").arg(output_table, input_table);
 

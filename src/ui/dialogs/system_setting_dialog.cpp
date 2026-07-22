@@ -1,16 +1,19 @@
 #include "ui/dialogs/system_setting_dialog.hpp"
 #include "ui/icon_manager.hpp"
+#include "core/app_config.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QCheckBox>
 #include <QSpinBox>
 #include <QPushButton>
+#include <QGroupBox>
 
 namespace freight::ui::dialogs {
 
 SystemSettingDialog::SystemSettingDialog(QWidget *parent) : QDialog(parent) {
     SetupUI();
+    LoadSettings();
 }
 
 SystemSettingDialog::~SystemSettingDialog() = default;
@@ -49,23 +52,44 @@ void SystemSettingDialog::SetupUI() {
     auto *perf_layout = new QVBoxLayout(perf_tab);
     perf_layout->setSpacing(12);
 
+    chk_auto_perf_ = new QCheckBox("自动优化性能（使用系统90%资源）");
+    chk_auto_perf_->setChecked(true);
+    perf_layout->addWidget(chk_auto_perf_);
+
+    auto *sys_group = new QGroupBox("系统信息");
+    auto *sys_layout = new QVBoxLayout(sys_group);
+    lbl_sys_info_ = new QLabel();
+    lbl_sys_info_->setStyleSheet("color: #606266; font-size: 13px; line-height: 1.6;");
+    sys_layout->addWidget(lbl_sys_info_);
+    perf_layout->addWidget(sys_group);
+
+    auto *manual_group = new QGroupBox("手动设置");
+    auto *manual_layout = new QVBoxLayout(manual_group);
+    manual_layout->setSpacing(12);
+
     auto *mem_row = new QHBoxLayout();
     mem_row->addWidget(new QLabel("内存限制(MB)："));
-    auto *spn_mem = new QSpinBox();
-    spn_mem->setRange(256, 32768);
-    spn_mem->setValue(4096);
-    mem_row->addWidget(spn_mem);
+    spn_mem_ = new QSpinBox();
+    spn_mem_->setRange(256, 262144);
+    spn_mem_->setValue(4096);
+    mem_row->addWidget(spn_mem_);
     mem_row->addStretch();
-    perf_layout->addLayout(mem_row);
+    manual_layout->addLayout(mem_row);
 
     auto *thread_row = new QHBoxLayout();
     thread_row->addWidget(new QLabel("计算线程数："));
-    auto *spn_thread = new QSpinBox();
-    spn_thread->setRange(1, 64);
-    spn_thread->setValue(4);
-    thread_row->addWidget(spn_thread);
+    spn_thread_ = new QSpinBox();
+    spn_thread_->setRange(1, 128);
+    spn_thread_->setValue(4);
+    thread_row->addWidget(spn_thread_);
     thread_row->addStretch();
-    perf_layout->addLayout(thread_row);
+    manual_layout->addLayout(thread_row);
+
+    perf_layout->addWidget(manual_group);
+
+    auto *hint_label = new QLabel("提示：修改性能设置后需重启应用生效");
+    hint_label->setStyleSheet("color: #909399; font-size: 12px;");
+    perf_layout->addWidget(hint_label);
 
     perf_layout->addStretch();
     tab_widget_->addTab(perf_tab, "性能");
@@ -108,7 +132,8 @@ void SystemSettingDialog::SetupUI() {
     main_layout->addLayout(btn_layout);
 
     connect(btn_cancel, &QPushButton::clicked, this, &QDialog::reject);
-    connect(btn_ok, &QPushButton::clicked, this, &QDialog::accept);
+    connect(btn_ok, &QPushButton::clicked, this, &SystemSettingDialog::OnAccepted);
+    connect(chk_auto_perf_, &QCheckBox::toggled, this, &SystemSettingDialog::OnAutoPerformanceToggled);
 
     setStyleSheet(R"QSS(
 QDialog { background-color: #f5f7fa; }
@@ -150,7 +175,64 @@ QPushButton#normalBtn:hover {
     color: #409eff;
 }
 QCheckBox { spacing: 8px; }
+QGroupBox {
+    border: 1px solid #e4e7ed;
+    border-radius: 6px;
+    margin-top: 8px;
+    padding-top: 10px;
+    font-weight: 500;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: #606266;
+}
     )QSS");
+}
+
+void SystemSettingDialog::LoadSettings() {
+    auto &cfg = core::AppConfig::Instance();
+
+    int total_mem = core::AppConfig::GetTotalMemoryMB();
+    int cpu_cores = core::AppConfig::GetCpuCoreCount();
+    lbl_sys_info_->setText(
+        QString("系统总内存：%1 GB (%2 MB)<br>"
+                "CPU核心数：%3 核<br>"
+                "自动优化配置：内存限制 %4 MB，计算线程 %5 个")
+            .arg(total_mem / 1024)
+            .arg(total_mem)
+            .arg(cpu_cores)
+            .arg(static_cast<int>(total_mem * 0.9))
+            .arg(std::max(1, static_cast<int>(cpu_cores * 0.9)))
+    );
+
+    chk_auto_perf_->setChecked(cfg.GetAutoPerformance());
+    spn_mem_->setValue(cfg.GetMemoryLimitMB());
+    spn_thread_->setValue(cfg.GetThreadCount());
+
+    OnAutoPerformanceToggled(cfg.GetAutoPerformance());
+}
+
+void SystemSettingDialog::SaveSettings() {
+    auto &cfg = core::AppConfig::Instance();
+
+    if (chk_auto_perf_->isChecked()) {
+        cfg.SetAutoPerformance(true);
+    } else {
+        cfg.SetMemoryLimitMB(spn_mem_->value());
+        cfg.SetThreadCount(spn_thread_->value());
+    }
+}
+
+void SystemSettingDialog::OnAutoPerformanceToggled(bool checked) {
+    spn_mem_->setEnabled(!checked);
+    spn_thread_->setEnabled(!checked);
+}
+
+void SystemSettingDialog::OnAccepted() {
+    SaveSettings();
+    accept();
 }
 
 } // namespace freight::ui::dialogs

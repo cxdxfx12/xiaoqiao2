@@ -131,7 +131,7 @@ void MainWindow::SetupUI() {
     footer_label_->setOpenExternalLinks(true);
     footer_label_->setText(
         cfg.GetCompanyName() + "  © 2026   |   "
-        "<a href='http://" + cfg.GetWebsite() + "' style='color:#909399; text-decoration:none;'>"
+        "<a href='http://" + cfg.GetWebsite() + "' style='color:#409eff; text-decoration:underline;'>"
         + cfg.GetWebsite() + "</a>"
     );
     main_layout_->addWidget(footer_label_);

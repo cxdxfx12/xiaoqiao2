@@ -32,6 +32,7 @@ private:
     QDoubleSpinBox *spn_first_weight_ = nullptr;
     QDoubleSpinBox *spn_add_unit_ = nullptr;
     QDoubleSpinBox *spn_vol_ratio_ = nullptr;
+    QDoubleSpinBox *spn_no_weight_fee_ = nullptr;
     QCheckBox *chk_default_ = nullptr;
     QLineEdit *edt_desc_ = nullptr;
 

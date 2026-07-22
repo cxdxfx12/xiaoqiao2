@@ -206,24 +206,25 @@ QPushButton:hover {
     setup_btn_layout->addWidget(btn_close_);
 
     btn_start_ = new QPushButton("开始计算");
-    btn_start_->setIcon(icons.ActionIcon("calculate"));
     btn_start_->setCursor(Qt::PointingHandCursor);
     btn_start_->setDefault(true);
     btn_start_->setStyleSheet(R"QSS(
 QPushButton {
-    padding: 10px 32px;
-    background: linear-gradient(135deg, #409eff 0%, #66b1ff 100%);
-    color: white;
-    border: none;
+    padding: 12px 36px;
     border-radius: 8px;
-    font-size: 13px;
-    font-weight: 600;
+    border: 1px solid #dcdfe6;
+    background: white;
+    color: #606266;
+    font-size: 14px;
+    font-weight: 500;
 }
 QPushButton:hover {
-    background: linear-gradient(135deg, #66b1ff 0%, #89c2ff 100%);
+    border-color: #409eff;
+    color: #409eff;
 }
 QPushButton:disabled {
-    background: #c0c4cc;
+    color: #c0c4cc;
+    border-color: #e4e7ed;
 }
     )QSS");
     setup_btn_layout->addWidget(btn_start_);

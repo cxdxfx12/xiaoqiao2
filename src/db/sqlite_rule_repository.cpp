@@ -67,19 +67,28 @@ bool SqliteRuleRepository::Init() {
 
     bool ok = CreateTables();
 
+    // schema 升级到 11：增加无重量默认运费
+    if (current_version >= 10 && current_version < 11) {
+        qInfo() << "Upgrading schema from version" << current_version << "to 11";
+        QSqlQuery aq(db_);
+        aq.exec("ALTER TABLE freight_templates ADD COLUMN default_no_weight_fee REAL DEFAULT 0");
+    }
+
     // schema 升级后强制重新生成默认数据
     if (current_version < 10) {
         InitDefaultData();
+        // 修复前4个一口价阶梯的 additional_price 为0
+        QSqlQuery fix_q(db_);
+        fix_q.exec("UPDATE tiered_pricing SET additional_price = 0 WHERE tier_code IN ('tier_0_0.5', 'tier_0.5_1', 'tier_1_2', 'tier_2_3')");
     }
 
-    // 强制修复前4个一口价阶梯的 additional_price 为0，避免历史数据错误
-    QSqlQuery fix_q(db_);
-    fix_q.exec("UPDATE tiered_pricing SET additional_price = 0 WHERE tier_code IN ('tier_0_0.5', 'tier_0.5_1', 'tier_1_2', 'tier_2_3')");
-
     // 更新 schema 版本
-    if (current_version < 10) {
+    int new_version = 11;
+    if (current_version < new_version) {
         vq.exec("DELETE FROM schema_version");
-        vq.exec("INSERT INTO schema_version VALUES (10)");
+        vq.prepare("INSERT INTO schema_version VALUES (?)");
+        vq.addBindValue(new_version);
+        vq.exec();
     }
 
     return ok;
@@ -114,6 +123,7 @@ bool SqliteRuleRepository::CreateTables() {
            "first_weight REAL DEFAULT 1.0,"
            "additional_unit REAL DEFAULT 1.0,"
            "vol_weight_ratio REAL DEFAULT 6000.0,"
+           "default_no_weight_fee REAL DEFAULT 0,"
            "description TEXT,"
            "is_default INTEGER DEFAULT 0,"
            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
@@ -220,14 +230,15 @@ bool SqliteRuleRepository::CreateDefaultTemplate() {
     QString tpl_id = "zto_standard";
 
     q.prepare("INSERT OR REPLACE INTO freight_templates "
-              "(template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio, is_default, description) "
-              "VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+              "(template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio, default_no_weight_fee, is_default, description) "
+              "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     q.addBindValue(tpl_id);
     q.addBindValue("中通标准快递");
     q.addBindValue("中通");
     q.addBindValue(1.0);
     q.addBindValue(1.0);
     q.addBindValue(6000.0);
+    q.addBindValue(0.0);
     q.addBindValue(1);
     q.addBindValue("中通标准快递报价，内置默认模板");
     if (!q.exec()) {
@@ -386,6 +397,7 @@ QVariantMap SqliteRuleRepository::GetTemplate(const QString &template_id) {
         m["first_weight"] = q.value("first_weight").toDouble();
         m["additional_unit"] = q.value("additional_unit").toDouble();
         m["vol_weight_ratio"] = q.value("vol_weight_ratio").toDouble();
+        m["default_no_weight_fee"] = q.value("default_no_weight_fee").toDouble();
         m["is_default"] = q.value("is_default").toInt() == 1;
         m["description"] = q.value("description");
     }
@@ -396,13 +408,14 @@ bool SqliteRuleRepository::AddTemplate(const QVariantMap &tpl) {
     QSqlQuery q(db_);
     QString tpl_id = tpl["template_id"].toString();
 
-    q.prepare("INSERT INTO freight_templates (template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio, description) VALUES (?,?,?,?,?,?,?)");
+    q.prepare("INSERT INTO freight_templates (template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio, default_no_weight_fee, description) VALUES (?,?,?,?,?,?,?,?)");
     q.addBindValue(tpl_id);
     q.addBindValue(tpl["template_name"].toString());
     q.addBindValue(tpl["carrier_name"].toString());
     q.addBindValue(tpl.value("first_weight", 1.0).toDouble());
     q.addBindValue(tpl.value("additional_unit", 1.0).toDouble());
     q.addBindValue(tpl.value("vol_weight_ratio", 6000.0).toDouble());
+    q.addBindValue(tpl.value("default_no_weight_fee", 0.0).toDouble());
     q.addBindValue(tpl["description"].toString());
     if (!q.exec()) {
         return false;
@@ -485,12 +498,13 @@ bool SqliteRuleRepository::AddTemplate(const QVariantMap &tpl) {
 
 bool SqliteRuleRepository::UpdateTemplate(const QVariantMap &tpl) {
     QSqlQuery q(db_);
-    q.prepare("UPDATE freight_templates SET template_name=?, carrier_name=?, first_weight=?, additional_unit=?, vol_weight_ratio=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE template_id=?");
+    q.prepare("UPDATE freight_templates SET template_name=?, carrier_name=?, first_weight=?, additional_unit=?, vol_weight_ratio=?, default_no_weight_fee=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE template_id=?");
     q.addBindValue(tpl["template_name"].toString());
     q.addBindValue(tpl["carrier_name"].toString());
     q.addBindValue(tpl.value("first_weight", 1.0).toDouble());
     q.addBindValue(tpl.value("additional_unit", 1.0).toDouble());
     q.addBindValue(tpl.value("vol_weight_ratio", 6000.0).toDouble());
+    q.addBindValue(tpl.value("default_no_weight_fee", 0.0).toDouble());
     q.addBindValue(tpl.value("description", "").toString());
     q.addBindValue(tpl["template_id"].toString());
     return q.exec();
@@ -721,13 +735,14 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
     QString tpl_id = "cust_" + cust_id;
     QString tpl_name = cust["customer_name"].toString() + "专属报价";
 
-    q.prepare("INSERT INTO freight_templates (template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio, description) VALUES (?,?,?,?,?,?,?)");
+    q.prepare("INSERT INTO freight_templates (template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio, default_no_weight_fee, description) VALUES (?,?,?,?,?,?,?,?)");
     q.addBindValue(tpl_id);
     q.addBindValue(tpl_name);
     q.addBindValue("客户专属");
     q.addBindValue(1.0);
     q.addBindValue(1.0);
     q.addBindValue(6000.0);
+    q.addBindValue(0.0);
     q.addBindValue("客户专属报价表");
     q.exec();
 
