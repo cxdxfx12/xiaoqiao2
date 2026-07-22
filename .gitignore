@@ -1,0 +1,56 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+
+# Qt build artifacts
+*.o
+*.obj
+*.moc
+*.ui.h
+*.ui.cpp
+*.qrc.cpp
+*.qmlc
+*.jsc
+moc_*.cpp
+qrc_*.cpp
+ui_*.h
+_autogen/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Compiled binaries
+*.app
+*.exe
+*.dmg
+*.dll
+*.dylib
+*.so
+*.a
+*.lib
+
+# Database files (runtime data)
+*.db
+*.db-journal
+*.db-wal
+*.duckdb
+*.duckdb.wal
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Qt deployment
+*.pro.user
+*.qbs.user
