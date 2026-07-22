@@ -93,6 +93,7 @@ struct CalcResult {
     double charge_weight = 0.0;
     double base_fee = 0.0;
     double fuel_surcharge = 0.0;
+    double remote_surcharge = 0.0;
     double strategy_surcharge = 0.0;
     double total_fee = 0.0;
     QString currency = "CNY";

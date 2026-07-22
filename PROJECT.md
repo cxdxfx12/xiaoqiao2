@@ -36,7 +36,7 @@
 - ⚡ **高性能**：基于 DuckDB 列式存储引擎，百万级数据秒级计算
 - 📊 **批量处理**：支持 Excel/CSV/Parquet 多种格式导入导出
 - 🎯 **智能表头映射**：自动识别中英文表头，支持手动映射
-- 🔧 **灵活规则**：6 级重量阶梯、燃油附加费、偏远地区、自定义策略
+- 🔧 **灵活规则**：6 级重量阶梯、燃油附加费、地区加价、自定义策略
 - 🖥️ **自动性能调优**：自动检测系统资源，使用 90% 性能计算
 
 ---
@@ -138,7 +138,7 @@ DB 层 (数据持久化)
 
 #### 计算 SQL 结构（CTE 链式调用）
 
-批量计算使用一条完整的 SQL 完成，采用 8 层 CTE（公共表表达式）逐层计算：
+批量计算使用一条完整的 SQL 完成，采用 10 层 CTE（公共表表达式）逐层计算：
 
 ```sql
 CREATE OR REPLACE TABLE output_table AS
@@ -169,8 +169,11 @@ base_fee_calc AS (
 fuel_surcharge_calc AS (
     -- 8. 燃油附加费计算：取最新生效日期的费率
 ),
+remote_area_calc AS (
+    -- 9. 地区加价计算：省/市/区三级粒度匹配
+),
 strategy_surcharge_calc AS (
-    -- 9. 其他附加费策略：SUM 聚合所有匹配的策略
+    -- 10. 其他附加费策略：SUM 聚合所有匹配的策略
 )
 SELECT ... FROM strategy_surcharge_calc  -- 最终输出
 ```
@@ -240,7 +243,7 @@ SELECT ... FROM strategy_surcharge_calc  -- 最终输出
 - 计算方式：`基础运费 × 费率`
 - 有 `is_active` 字段控制启用/停用
 
-#### 偏远地区 (remote_areas)
+#### 地区加价 (remote_areas)
 
 - 按模板设置，支持省/市/区三级粒度
 - 每条记录设置附加费金额
@@ -394,7 +397,7 @@ REGEXP_REPLACE(dest_province, '(省|市|维吾尔自治区|回族自治区|壮�
 - 基本信息
 - 分区报价（矩阵式表格）
 - 燃油附加费
-- 偏远地区
+- 地区加价
 - 加价策略
 
 ---
@@ -423,7 +426,7 @@ REGEXP_REPLACE(dest_province, '(省|市|维吾尔自治区|回族自治区|壮�
 | zone_group_provinces | 分区省份关联 | id, template_id, group_code, province |
 | tiered_pricing | 阶梯定价 | id, template_id, group_code, tier_code, min_weight, max_weight, first_price, additional_price |
 | fuel_surcharge | 燃油附加费 | id, template_id, effective_date, rate, is_active |
-| remote_areas | 偏远地区 | id, template_id, province, city, district, surcharge, is_active |
+| remote_areas | 地区加价 | id, template_id, province, city, district, surcharge, is_active |
 | surcharge_strategies | 附加费策略 | strategy_id, strategy_name, strategy_scope, strategy_type, amount, priority, is_active |
 | surcharge_provinces | 策略-省份关联 | strategy_id, province |
 | surcharge_customers | 策略-客户关联 | strategy_id, customer_id |
@@ -447,7 +450,7 @@ DuckDB 中的表是从 SQLite 同步过来的，结构基本一致，但没有�
 
 ### 6.1 计算公式
 
-总运费 = 基础运费 + 燃油附加费 + 其他附加费
+总运费 = 基础运费 + 燃油附加费 + 地区加价 + 其他附加费
 
 #### 基础运费计算规则
 
@@ -470,6 +473,23 @@ DuckDB 中的表是从 SQLite 同步过来的，结构基本一致，但没有�
 
 - 取小于等于当前日期的最新一条生效记录
 - 必须 `is_active = 1`
+
+#### 地区加价
+
+```
+地区加价 = Σ 所有匹配的地区加价记录的 surcharge
+```
+
+- 支持省/市/区三级粒度匹配
+- 省份匹配时会自动去掉"省/市/自治区"等后缀
+- 多条匹配时金额累加
+- 必须 `is_active = 1`
+
+**匹配规则**：
+1. 只设置了省份 → 全省加价
+2. 设置了省份 + 城市 → 该市加价
+3. 只设置了城市（省份为空）→ 全国该城市加价
+4. 设置了省份 + 城市 + 区县 → 该区加价
 
 #### 其他附加费
 

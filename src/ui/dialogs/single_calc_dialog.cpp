@@ -99,6 +99,7 @@ void SingleCalcDialog::SetupUI() {
     addResult("计费重量", &lbl_result_charge_weight_);
     addResult("基础运费", &lbl_result_base_fee_);
     addResult("燃油附加费", &lbl_result_fuel_);
+    addResult("地区加价", &lbl_result_remote_);
     addResult("策略加价", &lbl_result_strategy_);
 
     lbl_result_total_ = new QLabel("—");
@@ -192,17 +193,19 @@ QPushButton#normalBtn:hover {
 
 void SingleCalcDialog::OnCalc() {
     QString province = cbo_province_->currentText();
+    QString city = edt_city_->text().trimmed();
     double weight = spn_weight_->value();
     double vol_weight = spn_vol_weight_->value();
     QString tpl_id = cbo_template_->currentData().toString();
 
     services::CalcService calc_svc;
-    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id);
+    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id, city);
 
     if (result.success) {
         lbl_result_charge_weight_->setText(QString::number(result.charge_weight, 'f', 3) + " kg");
         lbl_result_base_fee_->setText("¥ " + QString::number(result.base_fee, 'f', 2));
         lbl_result_fuel_->setText("¥ " + QString::number(result.fuel_surcharge, 'f', 2));
+        lbl_result_remote_->setText("¥ " + QString::number(result.remote_surcharge, 'f', 2));
         lbl_result_strategy_->setText("¥ " + QString::number(result.strategy_surcharge, 'f', 2));
         lbl_result_total_->setText("¥ " + QString::number(result.total_fee, 'f', 2));
         lbl_result_status_->setText("✅ 计算成功");
@@ -222,6 +225,7 @@ void SingleCalcDialog::OnClear() {
     lbl_result_charge_weight_->setText("—");
     lbl_result_base_fee_->setText("—");
     lbl_result_fuel_->setText("—");
+    lbl_result_remote_->setText("—");
     lbl_result_strategy_->setText("—");
     lbl_result_total_->setText("—");
     lbl_result_status_->setText("请输入信息后点击计算");

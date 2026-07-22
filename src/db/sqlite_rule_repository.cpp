@@ -357,7 +357,7 @@ bool SqliteRuleRepository::CreateDefaultSurcharges() {
                 "global", "fixed", 1.0, 10,
                 "每个包裹收取1元包装服务费");
 
-    addStrategy("remote_xz_xj", "新疆西藏偏远附加费",
+    addStrategy("remote_xz_xj", "新疆西藏地区加价",
                 "province", "per_weight", 2.0, 20,
                 "新疆、西藏地区每公斤加收2元",
                 {"新疆", "西藏"});

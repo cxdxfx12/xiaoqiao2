@@ -221,11 +221,11 @@ void RuleSettingDialog::SetupUI() {
         }
     });
 
-    // ====== 偏远地区 ======
+    // ====== 地区加价 ======
     auto *remote_tab = new QWidget();
     auto *remote_layout = new QVBoxLayout(remote_tab);
     remote_table_ = new QTableWidget(0, 6);
-    remote_table_->setHorizontalHeaderLabels({"ID", "省份", "城市", "区县", "附加费(元)", "启用"});
+    remote_table_->setHorizontalHeaderLabels({"ID", "省份", "城市", "区县", "加价(元)", "启用"});
     remote_table_->setColumnHidden(0, true);
     remote_table_->horizontalHeader()->setStretchLastSection(true);
     remote_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -247,7 +247,7 @@ void RuleSettingDialog::SetupUI() {
     remote_btn_layout->addStretch();
     remote_layout->addLayout(remote_btn_layout);
 
-    tab_widget_->addTab(remote_tab, "偏远地区");
+    tab_widget_->addTab(remote_tab, "地区加价");
 
     connect(btn_add_remote, &QPushButton::clicked, this, [this]() {
         ShowRemoteDialog(true);
@@ -265,7 +265,7 @@ void RuleSettingDialog::SetupUI() {
             return;
         }
         int id = remote_table_->item(remote_table_->currentRow(), 0)->text().toInt();
-        auto ret = QMessageBox::question(this, "确认删除", "确定要删除该偏远地区记录吗？",
+        auto ret = QMessageBox::question(this, "确认删除", "确定要删除该地区加价记录吗？",
             QMessageBox::Yes | QMessageBox::No);
         if (ret == QMessageBox::Yes) {
             auto &cfg = core::AppConfig::Instance();
@@ -444,7 +444,7 @@ void RuleSettingDialog::LoadData() {
         fuel_table_->setItem(i, 4, status_item);
     }
 
-    // 加载偏远地区
+    // 加载地区加价
     auto remotes = repo.ListRemoteAreas("zto_standard");
     remote_table_->setRowCount(remotes.size());
     for (int i = 0; i < remotes.size(); i++) {
@@ -686,7 +686,7 @@ void RuleSettingDialog::ShowFuelDialog(bool is_add) {
 
 void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
     QDialog dlg(this);
-    dlg.setWindowTitle(is_add ? "新增偏远地区" : "编辑偏远地区");
+    dlg.setWindowTitle(is_add ? "新增地区加价" : "编辑地区加价");
     dlg.resize(380, 260);
     dlg.setModal(true);
 

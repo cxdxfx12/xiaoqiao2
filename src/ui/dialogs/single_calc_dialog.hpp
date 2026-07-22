@@ -34,6 +34,7 @@ private:
     QLabel *lbl_result_charge_weight_ = nullptr;
     QLabel *lbl_result_base_fee_ = nullptr;
     QLabel *lbl_result_fuel_ = nullptr;
+    QLabel *lbl_result_remote_ = nullptr;
     QLabel *lbl_result_strategy_ = nullptr;
     QLabel *lbl_result_total_ = nullptr;
     QLabel *lbl_result_status_ = nullptr;

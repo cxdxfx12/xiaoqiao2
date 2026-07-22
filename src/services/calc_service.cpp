@@ -13,6 +13,7 @@ core::CalcResult CalcService::CalcSingle(const QString &province,
                                           double weight,
                                           double vol_weight,
                                           const QString &template_id,
+                                          const QString &city,
                                           const QString &customer_id) {
     core::CalcResult result;
     result.dest_province = province;
@@ -24,6 +25,10 @@ core::CalcResult CalcService::CalcSingle(const QString &province,
         auto con = dbm.CreateConnection();
 
         double charge_weight = (vol_weight > 0 && vol_weight > weight) ? vol_weight : weight;
+
+        QRegularExpression province_suffix_re(R"((省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$)");
+        QString norm_province = province;
+        norm_province.remove(province_suffix_re);
 
         QString sql = QString(R"SQL(
 WITH
@@ -92,14 +97,35 @@ fuel_surcharge_calc AS (
                                    AND is_active = 1
                                    AND effective_date <= CURRENT_DATE)
 ),
-strategy_surcharge_calc AS (
+remote_area_calc AS (
     SELECT
         fsc.*,
+        COALESCE((
+            SELECT SUM(ra.surcharge)
+            FROM remote_areas ra
+            WHERE ra.template_id = '%1'
+              AND ra.is_active = 1
+              AND (
+                  (ra.province IS NOT NULL AND ra.province <> ''
+                   AND ra.province = '%2'
+                   AND (ra.city IS NULL OR ra.city = '' OR ra.city = '%4')
+                   AND (ra.district IS NULL OR ra.district = ''))
+                  OR
+                  (ra.city IS NOT NULL AND ra.city <> ''
+                   AND ra.city = '%4'
+                   AND (ra.district IS NULL OR ra.district = ''))
+              )
+        ), 0) AS remote_surcharge
+    FROM fuel_surcharge_calc fsc
+),
+strategy_surcharge_calc AS (
+    SELECT
+        rac.*,
         COALESCE((
             SELECT SUM(
                 CASE s.strategy_type
                     WHEN 'fixed' THEN s.amount
-                    WHEN 'percentage' THEN fsc.base_fee * s.amount
+                    WHEN 'percentage' THEN rac.base_fee * s.amount
                     WHEN 'per_weight' THEN %3 * s.amount
                     ELSE 0
                 END
@@ -115,18 +141,20 @@ strategy_surcharge_calc AS (
               AND (s.min_weight IS NULL OR %3 >= s.min_weight)
               AND (s.max_weight IS NULL OR s.max_weight = 0 OR %3 <= s.max_weight)
         ), 0) AS strategy_surcharge
-    FROM fuel_surcharge_calc fsc
+    FROM remote_area_calc rac
 )
 SELECT
     ROUND(%3, 3) AS charge_weight,
     ROUND(base_fee, 2) AS base_fee,
     ROUND(fuel_surcharge, 2) AS fuel_surcharge,
+    ROUND(remote_surcharge, 2) AS remote_surcharge,
     ROUND(strategy_surcharge, 2) AS strategy_surcharge,
-    ROUND(base_fee + fuel_surcharge + strategy_surcharge, 2) AS total_fee
+    ROUND(base_fee + fuel_surcharge + remote_surcharge + strategy_surcharge, 2) AS total_fee
 FROM strategy_surcharge_calc
         )SQL")
-        .arg(template_id, province)
-        .arg(charge_weight);
+        .arg(template_id, norm_province)
+        .arg(charge_weight)
+        .arg(city);
 
         qDebug() << "Calculating:" << province << weight << "kg, charge_weight:" << charge_weight;
 
@@ -136,12 +164,14 @@ FROM strategy_surcharge_calc
             result.charge_weight = res->GetValue(0, 0).GetValue<double>();
             result.base_fee = res->GetValue(1, 0).GetValue<double>();
             result.fuel_surcharge = res->GetValue(2, 0).GetValue<double>();
-            result.strategy_surcharge = res->GetValue(3, 0).GetValue<double>();
-            result.total_fee = res->GetValue(4, 0).GetValue<double>();
+            result.remote_surcharge = res->GetValue(3, 0).GetValue<double>();
+            result.strategy_surcharge = res->GetValue(4, 0).GetValue<double>();
+            result.total_fee = res->GetValue(5, 0).GetValue<double>();
             result.success = true;
             qDebug() << "  Result:"
                      << "base_fee=" << result.base_fee
                      << "fuel=" << result.fuel_surcharge
+                     << "remote=" << result.remote_surcharge
                      << "strategy=" << result.strategy_surcharge
                      << "total=" << result.total_fee;
         } else {
@@ -315,30 +345,51 @@ fuel_surcharge_calc AS (
                                    AND is_active = 1
                                    AND effective_date <= CURRENT_DATE)
 ),
-strategy_surcharge_calc AS (
+remote_area_calc AS (
     SELECT
         fsc.*,
+        COALESCE((
+            SELECT SUM(ra.surcharge)
+            FROM remote_areas ra
+            WHERE ra.template_id = fsc.template_id
+              AND ra.is_active = 1
+              AND (
+                  (ra.province IS NOT NULL AND ra.province <> ''
+                   AND ra.province = REGEXP_REPLACE(fsc.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                   AND (ra.city IS NULL OR ra.city = '' OR ra.city = fsc.dest_city)
+                   AND (ra.district IS NULL OR ra.district = ''))
+                  OR
+                  (ra.city IS NOT NULL AND ra.city <> ''
+                   AND ra.city = fsc.dest_city
+                   AND (ra.district IS NULL OR ra.district = ''))
+              )
+        ), 0) AS remote_surcharge
+    FROM fuel_surcharge_calc fsc
+),
+strategy_surcharge_calc AS (
+    SELECT
+        rac.*,
         COALESCE((
             SELECT SUM(
                 CASE s.strategy_type
                     WHEN 'fixed' THEN s.amount
-                    WHEN 'percentage' THEN fsc.base_fee * s.amount
-                    WHEN 'per_weight' THEN fsc.charge_weight * s.amount
+                    WHEN 'percentage' THEN rac.base_fee * s.amount
+                    WHEN 'per_weight' THEN rac.charge_weight * s.amount
                     ELSE 0
                 END
             )
             FROM surcharge_strategies s
             LEFT JOIN surcharge_provinces sp ON sp.strategy_id = s.strategy_id
             WHERE s.is_active = 1
-              AND s.template_id = fsc.template_id
+              AND s.template_id = rac.template_id
               AND (
                   s.strategy_scope = 'global'
-                  OR (s.strategy_scope = 'province' AND sp.province = REGEXP_REPLACE(fsc.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', ''))
+                  OR (s.strategy_scope = 'province' AND sp.province = REGEXP_REPLACE(rac.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', ''))
               )
-              AND (s.min_weight IS NULL OR fsc.charge_weight >= s.min_weight)
-              AND (s.max_weight IS NULL OR s.max_weight = 0 OR fsc.charge_weight <= s.max_weight)
+              AND (s.min_weight IS NULL OR rac.charge_weight >= s.min_weight)
+              AND (s.max_weight IS NULL OR s.max_weight = 0 OR rac.charge_weight <= s.max_weight)
         ), 0) AS strategy_surcharge
-    FROM fuel_surcharge_calc fsc
+    FROM remote_area_calc rac
 )
 
 SELECT
@@ -351,8 +402,9 @@ SELECT
     charge_weight AS "计费重量(KG)",
     ROUND(base_fee, 2) AS "基础运费",
     ROUND(fuel_surcharge, 2) AS "燃油附加费",
+    ROUND(remote_surcharge, 2) AS "地区加价",
     ROUND(strategy_surcharge, 2) AS "其他附加费",
-    ROUND(base_fee + fuel_surcharge + strategy_surcharge, 2) AS "总运费",
+    ROUND(base_fee + fuel_surcharge + remote_surcharge + strategy_surcharge, 2) AS "总运费",
     'CNY' AS "币种"
 FROM strategy_surcharge_calc
     )SQL").arg(output_table, input_table);

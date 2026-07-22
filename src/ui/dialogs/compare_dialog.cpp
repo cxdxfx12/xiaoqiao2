@@ -59,8 +59,8 @@ void CompareDialog::SetupUI() {
     main_layout->addWidget(input_group);
 
     // 结果表格
-    table_ = new QTableWidget(0, 5);
-    table_->setHorizontalHeaderLabels({"模板名称", "基础运费", "燃油附加费", "策略加价", "总运费"});
+    table_ = new QTableWidget(0, 6);
+    table_->setHorizontalHeaderLabels({"模板名称", "基础运费", "燃油附加费", "地区加价", "策略加价", "总运费"});
     table_->horizontalHeader()->setStretchLastSection(true);
     table_->setSelectionBehavior(QAbstractItemView::SelectRows);
     table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -172,16 +172,18 @@ void CompareDialog::OnCompare() {
         if (result.success) {
             table_->setItem(i, 1, new QTableWidgetItem("¥ " + QString::number(result.base_fee, 'f', 2)));
             table_->setItem(i, 2, new QTableWidgetItem("¥ " + QString::number(result.fuel_surcharge, 'f', 2)));
-            table_->setItem(i, 3, new QTableWidgetItem("¥ " + QString::number(result.strategy_surcharge, 'f', 2)));
+            table_->setItem(i, 3, new QTableWidgetItem("¥ " + QString::number(result.remote_surcharge, 'f', 2)));
+            table_->setItem(i, 4, new QTableWidgetItem("¥ " + QString::number(result.strategy_surcharge, 'f', 2)));
             auto *total_item = new QTableWidgetItem("¥ " + QString::number(result.total_fee, 'f', 2));
             total_item->setForeground(QBrush(QColor("#f56c6c")));
             total_item->setFont(QFont(table_->font().family(), table_->font().pointSize(), QFont::Bold));
-            table_->setItem(i, 4, total_item);
+            table_->setItem(i, 5, total_item);
         } else {
             table_->setItem(i, 1, new QTableWidgetItem("-"));
             table_->setItem(i, 2, new QTableWidgetItem("-"));
             table_->setItem(i, 3, new QTableWidgetItem("-"));
-            table_->setItem(i, 4, new QTableWidgetItem("计算失败: " + result.error_msg));
+            table_->setItem(i, 4, new QTableWidgetItem("-"));
+            table_->setItem(i, 5, new QTableWidgetItem("计算失败: " + result.error_msg));
         }
     }
 }
