@@ -1,14 +1,13 @@
 #include "ui/dialogs/about_dialog.hpp"
 #include "ui/icon_manager.hpp"
 #include "core/app_config.hpp"
+#include "core/license_manager.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QPushButton>
 #include <QFrame>
 #include <QLabel>
 #include <QString>
-#include <QNetworkInterface>
-#include <QCryptographicHash>
 #include <QDebug>
 #include <QMessageBox>
 #include <QInputDialog>
@@ -18,33 +17,9 @@
 
 namespace freight::ui::dialogs {
 
-QString GenerateMachineCode() {
-    QString raw;
-
-    QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
-    for (const auto &iface : ifaces) {
-        if (iface.isValid() && !iface.hardwareAddress().isEmpty()
-            && (iface.type() == QNetworkInterface::Ethernet
-                || iface.type() == QNetworkInterface::Wifi)) {
-            raw += iface.hardwareAddress();
-        }
-    }
-
-    QString machine_id = QString::fromStdString(
-        QCryptographicHash::hash(raw.toUtf8(), QCryptographicHash::Md5).toHex().toStdString()
-    ).toUpper();
-
-    // 格式化为 XXXX-XXXX-XXXX-XXXX
-    QString formatted;
-    for (int i = 0; i < machine_id.length(); i += 4) {
-        if (i > 0) formatted += "-";
-        formatted += machine_id.mid(i, 4);
-    }
-    return formatted;
-}
-
 AboutDialog::AboutDialog(QWidget *parent) : QDialog(parent) {
     SetupUI();
+    RefreshLicenseInfo();
 }
 
 AboutDialog::~AboutDialog() = default;
@@ -55,7 +30,7 @@ void AboutDialog::SetupUI() {
 
     setWindowTitle("关于");
     setWindowIcon(icons.SettingIcon("about"));
-    resize(460, 500);
+    resize(460, 520);
     setModal(true);
 
     auto *main_layout = new QVBoxLayout(this);
@@ -120,8 +95,6 @@ void AboutDialog::SetupUI() {
     main_layout->addSpacing(8);
 
     // 授权信息区域
-    QString machine_code = GenerateMachineCode();
-
     auto *auth_label = new QLabel("授权信息");
     auth_label->setStyleSheet("font-size: 14px; font-weight: 600; color: #303133;");
     main_layout->addWidget(auth_label);
@@ -129,6 +102,7 @@ void AboutDialog::SetupUI() {
     main_layout->addSpacing(4);
 
     // 机器码
+    QString machine_code = core::LicenseManager::GenerateMachineCode();
     auto *mc_layout = new QHBoxLayout();
     auto *mc_label = new QLabel("机器码：");
     mc_label->setStyleSheet("font-size: 12px; color: #909399; min-width: 60px;");
@@ -149,10 +123,10 @@ void AboutDialog::SetupUI() {
     auto *lic_layout = new QHBoxLayout();
     auto *lic_label = new QLabel("授权状态：");
     lic_label->setStyleSheet("font-size: 12px; color: #909399; min-width: 60px;");
-    auto *lic_value = new QLabel("试用版");
-    lic_value->setStyleSheet("font-size: 13px; color: #e6a23c; font-weight: 500;");
+    lbl_lic_status_ = new QLabel("加载中...");
+    lbl_lic_status_->setStyleSheet("font-size: 13px; color: #e6a23c; font-weight: 500;");
     lic_layout->addWidget(lic_label);
-    lic_layout->addWidget(lic_value, 1);
+    lic_layout->addWidget(lbl_lic_status_, 1);
     main_layout->addLayout(lic_layout);
 
     main_layout->addSpacing(4);
@@ -161,20 +135,20 @@ void AboutDialog::SetupUI() {
     auto *exp_layout = new QHBoxLayout();
     auto *exp_label = new QLabel("有效期：");
     exp_label->setStyleSheet("font-size: 12px; color: #909399; min-width: 60px;");
-    auto *exp_value = new QLabel("30天试用");
-    exp_value->setStyleSheet("font-size: 13px; color: #606266;");
+    lbl_lic_expire_ = new QLabel("—");
+    lbl_lic_expire_->setStyleSheet("font-size: 13px; color: #606266;");
     exp_layout->addWidget(exp_label);
-    exp_layout->addWidget(exp_value, 1);
+    exp_layout->addWidget(lbl_lic_expire_, 1);
     main_layout->addLayout(exp_layout);
 
     main_layout->addStretch();
 
     // 按钮
     auto *btn_layout = new QHBoxLayout();
-    auto *btn_activate = new QPushButton(" 授权激活");
-    btn_activate->setCursor(Qt::PointingHandCursor);
-    btn_activate->setStyleSheet("padding: 8px 16px; border: 1px solid #409eff; color: #409eff; border-radius: 6px; background: white;");
-    btn_layout->addWidget(btn_activate);
+    btn_activate_ = new QPushButton(" 授权激活");
+    btn_activate_->setCursor(Qt::PointingHandCursor);
+    btn_activate_->setStyleSheet("padding: 8px 16px; border: 1px solid #409eff; color: #409eff; border-radius: 6px; background: white;");
+    btn_layout->addWidget(btn_activate_);
     btn_layout->addStretch();
 
     auto *btn_ok = new QPushButton(" 确定");
@@ -189,14 +163,7 @@ void AboutDialog::SetupUI() {
         QGuiApplication::clipboard()->setText(machine_code);
         QMessageBox::information(nullptr, "提示", "机器码已复制到剪贴板");
     });
-    connect(btn_activate, &QPushButton::clicked, this, [this]() {
-        bool ok;
-        QString key = QInputDialog::getText(this, "授权激活",
-            "请输入授权码：", QLineEdit::Normal, "", &ok);
-        if (ok && !key.trimmed().isEmpty()) {
-            QMessageBox::information(this, "提示", "授权验证功能开发中...\n\n请联系客服：17771300068");
-        }
-    });
+    connect(btn_activate_, &QPushButton::clicked, this, &AboutDialog::OnActivate);
 
     setStyleSheet(R"QSS(
 QDialog {
@@ -213,6 +180,55 @@ QPushButton#primaryBtn {
 }
 QPushButton#primaryBtn:hover { background-color: #66b1ff; }
     )QSS");
+}
+
+void AboutDialog::OnActivate() {
+    bool ok;
+    QString key = QInputDialog::getText(this, "授权激活",
+        "请输入授权码：", QLineEdit::Normal, "", &ok);
+    if (!ok || key.trimmed().isEmpty()) {
+        return;
+    }
+
+    auto &lic_mgr = core::LicenseManager::Instance();
+    if (lic_mgr.ActivateLicense(key.trimmed())) {
+        QMessageBox::information(this, "成功", "授权激活成功！");
+        RefreshLicenseInfo();
+    } else {
+        auto info = lic_mgr.GetLicenseInfo();
+        QString err = info.error_msg.isEmpty() ? "未知错误" : info.error_msg;
+        QMessageBox::warning(this, "失败", "授权激活失败：" + err);
+    }
+}
+
+void AboutDialog::RefreshLicenseInfo() {
+    auto &lic_mgr = core::LicenseManager::Instance();
+    auto info = lic_mgr.GetLicenseInfo();
+
+    if (info.valid && !info.IsExpired()) {
+        lbl_lic_status_->setText(info.TypeString());
+        if (info.type == core::LicenseType::Permanent) {
+            lbl_lic_status_->setStyleSheet("font-size: 13px; color: #67c23a; font-weight: 500;");
+            lbl_lic_expire_->setText("永久有效");
+        } else {
+            lbl_lic_status_->setStyleSheet("font-size: 13px; color: #409eff; font-weight: 500;");
+            int days = info.DaysRemaining();
+            lbl_lic_expire_->setText(QString("%1（剩余 %2 天）")
+                .arg(info.expire_date.toString("yyyy-MM-dd"))
+                .arg(days));
+        }
+        btn_activate_->setText(" 重新激活");
+    } else {
+        lbl_lic_status_->setText("试用版");
+        lbl_lic_status_->setStyleSheet("font-size: 13px; color: #e6a23c; font-weight: 500;");
+        int days = info.DaysRemaining();
+        if (days > 0) {
+            lbl_lic_expire_->setText(QString("%1天试用").arg(days));
+        } else {
+            lbl_lic_expire_->setText("试用已过期");
+        }
+        btn_activate_->setText(" 授权激活");
+    }
 }
 
 } // namespace freight::ui::dialogs

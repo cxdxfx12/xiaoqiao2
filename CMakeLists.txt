@@ -19,6 +19,8 @@ set(PROJECT_SOURCES
     src/core/app_config.hpp
     src/core/app_config.cpp
     src/core/freight_types.hpp
+    src/core/license_manager.hpp
+    src/core/license_manager.cpp
     src/db/duckdb_manager.hpp
     src/db/duckdb_manager.cpp
     src/db/sqlite_rule_repository.hpp
@@ -88,4 +90,78 @@ if(APPLE)
             COMMENT "Deploying Qt frameworks and fixing signatures..."
         )
     endif()
+endif()
+
+# 授权生成器工具 (GUI版)
+add_executable(license_generator MACOSX_BUNDLE
+    tools/license_generator/main.cpp
+    tools/license_generator/license_generator_widget.hpp
+    tools/license_generator/license_generator_widget.cpp
+    src/core/license_manager.hpp
+    src/core/license_manager.cpp
+)
+
+target_include_directories(license_generator PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(license_generator PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Widgets
+    Qt6::Network
+)
+
+if(APPLE)
+    set_target_properties(license_generator PROPERTIES
+        MACOSX_BUNDLE_BUNDLE_NAME "授权生成器"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.0"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "com.hbdxm.license-generator"
+    )
+
+    set(LIC_DEPLOY_SCRIPT ${CMAKE_SOURCE_DIR}/scripts/deploy_mac.sh)
+    if(EXISTS ${LIC_DEPLOY_SCRIPT})
+        add_custom_command(TARGET license_generator POST_BUILD
+            COMMAND bash ${LIC_DEPLOY_SCRIPT} $<TARGET_BUNDLE_DIR:license_generator>
+            COMMENT "Deploying Qt frameworks for license generator..."
+        )
+    endif()
+endif()
+
+# 批量命令行计算工具（console 版，无 GUI）
+add_executable(batch_runner
+    tools/batch_runner/main.cpp
+    src/core/app_config.hpp
+    src/core/app_config.cpp
+    src/core/freight_types.hpp
+    src/core/license_manager.hpp
+    src/core/license_manager.cpp
+    src/db/duckdb_manager.hpp
+    src/db/duckdb_manager.cpp
+    src/db/sqlite_rule_repository.hpp
+    src/db/sqlite_rule_repository.cpp
+    src/services/rule_service.hpp
+    src/services/rule_service.cpp
+    src/services/calc_service.hpp
+    src/services/calc_service.cpp
+    src/services/history_service.hpp
+    src/services/history_service.cpp
+)
+target_include_directories(batch_runner PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${DUCKDB_INCLUDE_DIR}
+)
+target_link_libraries(batch_runner PRIVATE
+    Qt6::Core
+    Qt6::Sql
+    Qt6::Concurrent
+    Qt6::Network
+    ${DUCKDB_LIBRARY}
+)
+if(APPLE)
+    set_target_properties(batch_runner PROPERTIES
+        MACOSX_BUNDLE OFF
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
 endif()

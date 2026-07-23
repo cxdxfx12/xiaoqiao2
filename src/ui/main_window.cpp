@@ -1,6 +1,7 @@
 #include "ui/main_window.hpp"
 #include "ui/icon_manager.hpp"
 #include "core/app_config.hpp"
+#include "core/license_manager.hpp"
 #include "ui/dialogs/single_calc_dialog.hpp"
 #include "ui/dialogs/batch_calc_dialog.hpp"
 #include "ui/dialogs/rule_setting_dialog.hpp"
@@ -12,6 +13,8 @@
 #include <QApplication>
 #include <QScreen>
 #include <QDebug>
+#include <QMessageBox>
+#include <QTimer>
 
 namespace freight::ui {
 
@@ -19,6 +22,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     SetupUI();
     SetupStyles();
     SetupAdBanner();
+
+    QTimer::singleShot(300, this, &MainWindow::CheckLicenseStartup);
 }
 
 MainWindow::~MainWindow() = default;
@@ -244,36 +249,43 @@ void MainWindow::OnAdTimer() {
 }
 
 void MainWindow::OnSingleCalc() {
+    if (!CheckLicenseOrWarn()) return;
     dialogs::SingleCalcDialog dlg(this);
     dlg.exec();
 }
 
 void MainWindow::OnBatchCalc() {
+    if (!CheckLicenseOrWarn()) return;
     dialogs::BatchCalcDialog dlg(this);
     dlg.exec();
 }
 
 void MainWindow::OnCompare() {
+    if (!CheckLicenseOrWarn()) return;
     dialogs::CompareDialog dlg(this);
     dlg.exec();
 }
 
 void MainWindow::OnHistory() {
+    if (!CheckLicenseOrWarn()) return;
     dialogs::HistoryDialog dlg(this);
     dlg.exec();
 }
 
 void MainWindow::OnRuleSetting() {
+    if (!CheckLicenseOrWarn()) return;
     dialogs::RuleSettingDialog dlg(this);
     dlg.exec();
 }
 
 void MainWindow::OnCustomerSetting() {
+    if (!CheckLicenseOrWarn()) return;
     dialogs::CustomerSettingDialog dlg(this);
     dlg.exec();
 }
 
 void MainWindow::OnSystemSetting() {
+    if (!CheckLicenseOrWarn()) return;
     dialogs::SystemSettingDialog dlg(this);
     dlg.exec();
 }
@@ -281,6 +293,32 @@ void MainWindow::OnSystemSetting() {
 void MainWindow::OnAbout() {
     dialogs::AboutDialog dlg(this);
     dlg.exec();
+}
+
+bool MainWindow::CheckLicenseOrWarn() {
+    auto &lic = core::LicenseManager::Instance();
+    if (lic.IsFunctionAvailable()) return true;
+    QMessageBox::warning(nullptr, "功能受限",
+        "该功能需要授权后才能使用。\n\n"
+        "请购买正版授权以解锁全部功能。\n\n"
+        "客服热线：17771300068");
+    return false;
+}
+
+void MainWindow::CheckLicenseStartup() {
+    auto &lic = core::LicenseManager::Instance();
+    bool show_expired = false;
+    bool show_near = false;
+    int remaining = 0;
+    QString message;
+
+    lic.CheckStartupReminder(show_expired, show_near, remaining, message);
+
+    if (show_expired) {
+        QMessageBox::critical(this, "授权已过期", message);
+    } else if (show_near) {
+        QMessageBox::warning(this, "授权即将到期", message);
+    }
 }
 
 } // namespace freight::ui

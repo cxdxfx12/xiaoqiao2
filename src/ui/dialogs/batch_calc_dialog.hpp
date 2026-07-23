@@ -6,6 +6,10 @@
 #include <QLabel>
 #include <QTableWidget>
 #include <QStackedWidget>
+#include <QFutureWatcher>
+#include <QTimer>
+#include <QString>
+#include <cstdint>
 
 namespace freight::ui::dialogs {
 
@@ -22,8 +26,23 @@ private slots:
     void OnStartCalc();
     void OnExport();
     void OnBackToSetup();
+    void OnCalcFinished();
+    void OnProgressPulse();
 
 private:
+    struct CalcContext {
+        QString normalized_table;
+        QString output_table;
+        QString output;
+        QString result_table;
+        bool success = false;
+        QString error_title;
+        QString error_msg;
+        int64_t total_rows = 0;
+        double total_fee = 0.0;
+        int64_t elapsed_ms = 0;
+    };
+
     void SetupUI();
     void LoadPreviewData();
 
@@ -45,6 +64,9 @@ private:
 
     QString output_path_;
     QString result_table_;
+
+    QFutureWatcher<CalcContext> *watcher_ = nullptr;
+    QTimer *progress_pulse_ = nullptr;
 };
 
 } // namespace freight::ui::dialogs

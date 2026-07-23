@@ -3,6 +3,7 @@
 #include <QString>
 #include <QDebug>
 #include "core/app_config.hpp"
+#include "core/license_manager.hpp"
 #include "db/duckdb_manager.hpp"
 #include "services/rule_service.hpp"
 #include "ui/main_window.hpp"
@@ -47,6 +48,12 @@ int main(int argc, char *argv[]) {
     }
 
     freight::ui::IconManager::Instance();
+
+    // 初始化授权系统
+    freight::core::LicenseManager::Instance().Init();
+    auto lic_info = freight::core::LicenseManager::Instance().GetLicenseInfo();
+    qDebug() << "授权状态:" << lic_info.TypeString()
+             << "剩余天数:" << lic_info.DaysRemaining();
 
     freight::ui::MainWindow w;
     w.show();

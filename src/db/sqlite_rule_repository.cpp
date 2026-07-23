@@ -74,10 +74,18 @@ bool SqliteRuleRepository::Init() {
         aq.exec("ALTER TABLE freight_templates ADD COLUMN default_no_weight_fee REAL DEFAULT 0");
     }
 
-    // schema 升级后强制重新生成默认数据
-    if (current_version < 10) {
+    // 默认数据统一只初始化一次
+    // （旧版本 schema 升级 <10 必须初始化，新版本第一次运行也初始化）
+    bool need_init_default = (current_version < 10) || IsFirstRun();
+    if (need_init_default) {
+        if (current_version < 10) {
+            qInfo() << "Schema upgrade init: generating default data";
+        } else {
+            qInfo() << "First run: generating default data";
+        }
         InitDefaultData();
         // 修复前4个一口价阶梯的 additional_price 为0
+        // （新版 CreateDefaultTemplate 已正确写入 add_price=0，此修复主要兼容旧数据残留的情况）
         QSqlQuery fix_q(db_);
         fix_q.exec("UPDATE tiered_pricing SET additional_price = 0 WHERE tier_code IN ('tier_0_0.5', 'tier_0.5_1', 'tier_1_2', 'tier_2_3')");
     }
@@ -210,10 +218,6 @@ bool SqliteRuleRepository::CreateTables() {
            "end_date DATE NOT NULL,"
            "week_days VARCHAR(20))");
 
-    if (IsFirstRun()) {
-        InitDefaultData();
-    }
-
     return true;
 }
 
@@ -298,7 +302,7 @@ bool SqliteRuleRepository::CreateDefaultTemplate() {
 
         QList<Tier> tiers = {
             {"tier_0_0.5", "0-0.5KG", 0, 0.5, 0.5, z.t05_first, 0.5, 0, 1},
-            {"tier_0.5_1", "0.51KG-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
+            {"tier_0.5_1", "0.5-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
             {"tier_1_2", "1-2KG", 1.0, 2.0, 1.0, z.t2_first, 1.0, 0, 3},
             {"tier_2_3", "2-3KG", 2.0, 3.0, 1.0, z.t3_first, 1.0, 0, 4},
             {"tier_3_30", "3-30KG", 3.0, 30.0, 1.0, z.mid_first, 1.0, z.mid_add, 5},
@@ -466,7 +470,7 @@ bool SqliteRuleRepository::AddTemplate(const QVariantMap &tpl) {
 
         QList<Tier> tiers = {
             {"tier_0_0.5", "0-0.5KG", 0, 0.5, 0.5, z.t05_first, 0.5, 0, 1},
-            {"tier_0.5_1", "0.51KG-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
+            {"tier_0.5_1", "0.5-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
             {"tier_1_2", "1-2KG", 1.0, 2.0, 1.0, z.t2_first, 1.0, 0, 3},
             {"tier_2_3", "2-3KG", 2.0, 3.0, 1.0, z.t3_first, 1.0, 0, 4},
             {"tier_3_30", "3-30KG", 3.0, 30.0, 1.0, z.mid_first, 1.0, z.mid_add, 5},
@@ -790,7 +794,7 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
 
         QList<Tier> tiers = {
             {"tier_0_0.5", "0-0.5KG", 0, 0.5, 0.5, z.t05_first, 0.5, 0, 1},
-            {"tier_0.5_1", "0.51KG-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
+            {"tier_0.5_1", "0.5-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
             {"tier_1_2", "1-2KG", 1.0, 2.0, 1.0, z.t2_first, 1.0, 0, 3},
             {"tier_2_3", "2-3KG", 2.0, 3.0, 1.0, z.t3_first, 1.0, 0, 4},
             {"tier_3_30", "3-30KG", 3.0, 30.0, 1.0, z.mid_first, 1.0, z.mid_add, 5},

@@ -2,6 +2,7 @@
 #include "ui/icon_manager.hpp"
 #include "ui/dialogs/header_mapping_dialog.hpp"
 #include "services/calc_service.hpp"
+#include "services/history_service.hpp"
 #include "db/duckdb_manager.hpp"
 #include "db/sqlite_rule_repository.hpp"
 #include "core/app_config.hpp"
@@ -16,14 +17,28 @@
 #include <QFileInfo>
 #include <QDebug>
 #include <QLabel>
+#include <QElapsedTimer>
+#include <QtConcurrent>
 
 namespace freight::ui::dialogs {
 
 BatchCalcDialog::BatchCalcDialog(QWidget *parent) : QDialog(parent) {
     SetupUI();
+    watcher_ = new QFutureWatcher<CalcContext>(this);
+    connect(watcher_, &QFutureWatcher<CalcContext>::finished, this, &BatchCalcDialog::OnCalcFinished);
+    progress_pulse_ = new QTimer(this);
+    progress_pulse_->setInterval(500);
+    connect(progress_pulse_, &QTimer::timeout, this, &BatchCalcDialog::OnProgressPulse);
 }
 
-BatchCalcDialog::~BatchCalcDialog() = default;
+BatchCalcDialog::~BatchCalcDialog() {
+    if (progress_pulse_ && progress_pulse_->isActive()) {
+        progress_pulse_->stop();
+    }
+    if (watcher_ && watcher_->isRunning()) {
+        watcher_->waitForFinished();
+    }
+}
 
 void BatchCalcDialog::SetupUI() {
     auto &icons = IconManager::Instance();
@@ -384,9 +399,12 @@ void BatchCalcDialog::OnStartCalc() {
     progress_->setValue(10);
     lbl_status_->setText("正在读取文件...");
 
+    QElapsedTimer timer;
+    timer.start();
+
     services::CalcService calc_svc;
 
-    // 1. 导入文件到 DuckDB
+    // 1. 导入文件到 DuckDB（需要 SQL 创建表，放主线程）
     auto &dbm = db::DuckDBManager::Instance();
     QString input_table = "_input_tmp";
     QString output_table = "_output_tmp";
@@ -408,17 +426,19 @@ void BatchCalcDialog::OnStartCalc() {
     QMap<QString, QString> mapping = calc_svc.AutoMapColumns(actual_cols);
     qDebug() << "Auto mapping:" << mapping;
 
-    // 3. 检查必填列
+    // 3. 检查必填列，必要时弹表头映射对话框（UI 交互必须主线程）
     bool need_mapping = !mapping.contains("dest_province") || !mapping.contains("weight");
 
     if (need_mapping) {
-        // 弹出表头映射对话框
         QStringList preview_headers = calc_svc.GetPreviewHeaders(input_table);
         QList<QStringList> preview_rows = calc_svc.GetPreviewRows(input_table, 5);
 
         HeaderMappingDialog dlg(actual_cols, mapping, preview_headers, preview_rows, this);
         if (dlg.exec() == QDialog::Accepted) {
             mapping = dlg.GetMapping();
+            if (dlg.IsRememberRequested()) {
+                services::CalcService::RememberMapping(mapping, actual_cols);
+            }
         } else {
             progress_->setValue(0);
             lbl_status_->setText("已取消");
@@ -428,9 +448,9 @@ void BatchCalcDialog::OnStartCalc() {
     }
 
     progress_->setValue(50);
-    lbl_status_->setText("正在计算运费...");
+    lbl_status_->setText("正在归一化数据...");
 
-    // 4. 创建归一化表
+    // 4. 创建归一化表（快速查询，可以放主线程）
     QString normalized_table = calc_svc.CreateNormalizedTable(input_table, mapping);
     if (normalized_table.isEmpty()) {
         progress_->setValue(0);
@@ -440,34 +460,144 @@ void BatchCalcDialog::OnStartCalc() {
         return;
     }
 
-    // 5. 执行计算
-    if (!calc_svc.CalcBatch(normalized_table, output_table)) {
+    progress_->setValue(55);
+    lbl_status_->setText("正在计算运费（后台线程执行，UI 不会卡顿）...");
+    progress_pulse_->start();
+
+    // 5-7. 计算 + 导出 + 保存历史：放到后台线程异步执行，避免大文件卡死 UI
+    CalcContext initial_ctx;
+    initial_ctx.normalized_table = normalized_table;
+    initial_ctx.output_table = output_table;
+    initial_ctx.output = output;
+    initial_ctx.result_table = output_table;
+    initial_ctx.elapsed_ms = 0;  // 后台重新计时
+
+    QFuture<CalcContext> future = QtConcurrent::run(
+        [input, normalized_table, output_table, output]() -> CalcContext {
+            CalcContext ctx;
+            ctx.normalized_table = normalized_table;
+            ctx.output_table = output_table;
+            ctx.output = output;
+            ctx.result_table = output_table;
+
+            QElapsedTimer t;
+            t.start();
+
+            try {
+                services::CalcService svc;
+                auto &db = db::DuckDBManager::Instance();
+
+                // 5. 执行计算
+                if (!svc.CalcBatch(normalized_table, output_table)) {
+                    ctx.error_title = "失败";
+                    ctx.error_msg =
+                        "计算失败，请检查：\n"
+                        "1. 文件是否包含\"省份\"或\"目的省份\"列\n"
+                        "2. 文件是否包含\"重量\"或\"实际重量\"列\n"
+                        "3. 文件格式是否正确（xlsx/csv）";
+                    return ctx;
+                }
+
+                // 6. 导出结果
+                if (!db.ExportToFile(output_table, output)) {
+                    ctx.error_title = "失败";
+                    ctx.error_msg = "结果导出失败";
+                    return ctx;
+                }
+
+                // 7. 保存历史（后台线程，HistoryService 用独立 SQLite 连接）
+                try {
+                    auto &cfg = core::AppConfig::Instance();
+                    services::HistoryService history_svc(cfg.GetHistoryDbPath());
+                    history_svc.Init();
+
+                    auto con = db.CreateConnection();
+                    auto cnt_res = con.Query(
+                        QString("SELECT COUNT(*) FROM %1").arg(output_table).toStdString());
+                    ctx.total_rows = cnt_res->GetValue(0, 0).GetValue<int64_t>();
+
+                    try {
+                        auto fee_res = con.Query(
+                            QString("SELECT SUM(总运费) FROM %1").arg(output_table).toStdString());
+                        if (fee_res->RowCount() > 0) {
+                            ctx.total_fee = fee_res->GetValue(0, 0).GetValue<double>();
+                        }
+                    } catch (...) {
+                        try {
+                            auto fee_res = con.Query(
+                                QString("SELECT SUM(total_fee) FROM %1").arg(output_table).toStdString());
+                            if (fee_res->RowCount() > 0) {
+                                ctx.total_fee = fee_res->GetValue(0, 0).GetValue<double>();
+                            }
+                        } catch (...) {}
+                    }
+
+                    QFileInfo fi(input);
+                    QVariantMap record;
+                    record["task_name"] = fi.completeBaseName();
+                    record["input_file"] = input;
+                    record["output_file"] = output;
+                    record["total_rows"] = static_cast<int>(ctx.total_rows);
+                    record["total_fee"] = ctx.total_fee;
+                    record["duration_ms"] = static_cast<int>(t.elapsed());
+                    record["status"] = 1;
+                    history_svc.AddHistory(record);
+                } catch (const std::exception &e) {
+                    qWarning() << "Save history failed (background):" << e.what();
+                }
+
+                ctx.success = true;
+            } catch (const std::exception &e) {
+                ctx.error_title = "失败";
+                ctx.error_msg = QString("计算异常：%1").arg(e.what());
+            } catch (...) {
+                ctx.error_title = "失败";
+                ctx.error_msg = "计算发生未知异常";
+            }
+
+            ctx.elapsed_ms = t.elapsed();
+            return ctx;
+        });
+
+    watcher_->setFuture(future);
+}
+
+void BatchCalcDialog::OnProgressPulse() {
+    int v = progress_->value();
+    if (v < 98) {
+        progress_->setValue(v + 1);
+    }
+}
+
+void BatchCalcDialog::OnCalcFinished() {
+    progress_pulse_->stop();
+    CalcContext ctx = watcher_->result();
+
+    if (!ctx.success) {
         progress_->setValue(0);
         lbl_status_->setText("计算失败");
-        QMessageBox::critical(this, "失败",
-            "计算失败，请检查：\n"
-            "1. 文件是否包含\"省份\"或\"目的省份\"列\n"
-            "2. 文件是否包含\"重量\"或\"实际重量\"列\n"
-            "3. 文件格式是否正确（xlsx/csv）");
-        btn_start_->setEnabled(true);
-        return;
-    }
-
-    // 6. 导出结果
-    if (!dbm.ExportToFile(output_table, output)) {
-        progress_->setValue(0);
-        lbl_status_->setText("导出失败");
-        QMessageBox::critical(this, "失败", "结果导出失败");
+        QString title = ctx.error_title.isEmpty() ? QStringLiteral("失败") : ctx.error_title;
+        QString msg = ctx.error_msg.isEmpty() ? QStringLiteral("未知错误") : ctx.error_msg;
+        QMessageBox::critical(this, title, msg);
         btn_start_->setEnabled(true);
         return;
     }
 
     progress_->setValue(100);
-    lbl_status_->setText("计算完成！");
-    output_path_ = output;
-    result_table_ = "_output_tmp";
+    if (ctx.elapsed_ms > 0) {
+        lbl_status_->setText(QString("计算完成！耗时 %1 s，共 %2 条，合计 %3 元")
+            .arg(ctx.elapsed_ms / 1000.0, 0, 'f', 1)
+            .arg(ctx.total_rows)
+            .arg(ctx.total_fee, 0, 'f', 2));
+    } else {
+        lbl_status_->setText("计算完成！");
+    }
+
+    output_path_ = ctx.output;
+    result_table_ = ctx.output_table;
     LoadPreviewData();
     stack_->setCurrentIndex(1);
+    btn_start_->setEnabled(true);
 }
 
 void BatchCalcDialog::LoadPreviewData() {
@@ -489,10 +619,10 @@ void BatchCalcDialog::LoadPreviewData() {
         preview_table_->setRowCount(row_count);
 
         QStringList headers = {
-            "订单号", "客户ID", "目的省份", "目的城市",
-            "实际重量(kg)", "体积重量(kg)", "计费重量(kg)",
-            "基础运费(元)", "燃油附加费(元)", "策略加价(元)",
-            "总运费(元)", "币种"
+            "订单号", "客户编号", "目的省份", "目的城市",
+            "实际重量(KG)", "体积重量(KG)", "计费重量(KG)",
+            "基础运费", "燃油附加费", "地区加价", "其他附加费",
+            "总运费", "币种"
         };
         if (col_count > headers.size()) {
             for (int i = headers.size(); i < col_count; i++) {

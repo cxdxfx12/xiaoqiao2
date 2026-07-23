@@ -6,6 +6,8 @@ RuleService::RuleService(db::SqliteRuleRepository *repo, QObject *parent)
     : QObject(parent), repo_(repo) {}
 
 void RuleService::InitDefaultData() {
+    // 默认数据由 SqliteRuleRepository::UpgradeSchema() 内部按需初始化，无需外部显式操作。
+    // 保留此空方法以兼容接口。
 }
 
 QVariantList RuleService::ListTemplates() {

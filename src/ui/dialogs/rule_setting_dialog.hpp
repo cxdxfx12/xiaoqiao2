@@ -3,6 +3,8 @@
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QPushButton>
+#include <QComboBox>
+#include <QLineEdit>
 
 namespace freight::ui::dialogs {
 
@@ -13,9 +15,16 @@ public:
     explicit RuleSettingDialog(QWidget *parent = nullptr);
     ~RuleSettingDialog() override;
 
+    void OpenMappingTab();
+
 private slots:
     void OnFuelItemClicked(int row, int col);
     void OnRemoteItemClicked(int row, int col);
+    void OnResetMappingKeywords();
+    void OnApplyMappingKeywords();
+    void OnEditMappingRow(int row);
+    void OnResetMappingRow(int row);
+    void OnQuickAddKeyword();
 
 private:
     void SetupUI();
@@ -24,13 +33,25 @@ private:
     void ShowFuelDialog(bool is_add);
     void ShowRemoteDialog(bool is_add);
 
+    void SetupMappingTab(QWidget *tab);
+    void LoadMappingTable();
+
     QTabWidget *tab_widget_ = nullptr;
     QTableWidget *tpl_table_ = nullptr;
     QTableWidget *surcharge_table_ = nullptr;
     QTableWidget *fuel_table_ = nullptr;
     QTableWidget *remote_table_ = nullptr;
+    QTableWidget *mapping_table_ = nullptr;
     QPushButton *btn_close_ = nullptr;
     QPushButton *btn_apply_ = nullptr;
+
+    QPushButton *btn_mapping_reset_ = nullptr;
+    QPushButton *btn_mapping_apply_ = nullptr;
+    QPushButton *btn_mapping_quick_add_ = nullptr;
+    QComboBox *cb_mapping_quick_std_ = nullptr;
+    QLineEdit *ed_mapping_quick_kw_ = nullptr;
+
+    int mapping_tab_idx_ = -1;
 };
 
 } // namespace freight::ui::dialogs

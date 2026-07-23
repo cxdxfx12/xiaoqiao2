@@ -29,11 +29,13 @@ private slots:
     void OnSystemSetting();
     void OnAbout();
     void OnAdTimer();
+    void CheckLicenseStartup();
 
 private:
     void SetupUI();
     void SetupStyles();
     void SetupAdBanner();
+    bool CheckLicenseOrWarn();
 
     QWidget *central_widget_ = nullptr;
     QVBoxLayout *main_layout_ = nullptr;

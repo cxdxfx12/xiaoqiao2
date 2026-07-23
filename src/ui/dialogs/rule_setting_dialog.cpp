@@ -23,6 +23,7 @@
 #include <QDialogButtonBox>
 #include <QDateTime>
 #include <QRandomGenerator>
+#include <QPlainTextEdit>
 
 namespace freight::ui::dialogs {
 
@@ -279,6 +280,11 @@ void RuleSettingDialog::SetupUI() {
     connect(fuel_table_, &QTableWidget::cellClicked, this, &RuleSettingDialog::OnFuelItemClicked);
     connect(remote_table_, &QTableWidget::cellClicked, this, &RuleSettingDialog::OnRemoteItemClicked);
 
+    // ====== Tab 6: 表头映射关键字 ======
+    auto *mapping_tab = new QWidget();
+    SetupMappingTab(mapping_tab);
+    mapping_tab_idx_ = tab_widget_->addTab(mapping_tab, "🧭 表头关键字");
+
     main_layout->addWidget(tab_widget_);
 
     // 底部按钮
@@ -459,6 +465,8 @@ void RuleSettingDialog::LoadData() {
         status_item->setForeground(active ? QColor("#67c23a") : QColor("#909399"));
         remote_table_->setItem(i, 5, status_item);
     }
+
+    LoadMappingTable();
 }
 
 void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
@@ -615,6 +623,391 @@ void RuleSettingDialog::OnRemoteItemClicked(int row, int col) {
     repo.Init();
     repo.SetRemoteAreaActive(id, !current_active);
     LoadData();
+}
+
+void RuleSettingDialog::OpenMappingTab() {
+    if (mapping_tab_idx_ >= 0) {
+        tab_widget_->setCurrentIndex(mapping_tab_idx_);
+    }
+}
+
+void RuleSettingDialog::SetupMappingTab(QWidget *tab) {
+    auto &icons = IconManager::Instance();
+    auto *root = new QVBoxLayout(tab);
+    root->setContentsMargins(16, 16, 16, 16);
+    root->setSpacing(12);
+
+    auto *tip = new QLabel("每行 1 个标准列，多个关键字用「、顿号」分隔（其他常用分隔符逗号/分号/空格/换行在编辑弹窗也能自动识别）。\n"
+                           "蓝色=系统默认关键字，橙色=你自定义添加的关键字。编辑后自动保存，重启也生效。");
+    tip->setWordWrap(true);
+    tip->setStyleSheet("color:#606266;padding:10px 12px;background:#ecf5ff;border:1px solid #d9ecff;border-radius:6px;line-height:1.55;");
+    root->addWidget(tip);
+
+    auto *add_bar = new QHBoxLayout();
+    add_bar->setSpacing(8);
+    add_bar->addWidget(new QLabel("⚡ 快速追加关键字到:"));
+    cb_mapping_quick_std_ = new QComboBox();
+    for (const QString &std_name : core::AppConfig::StandardColumnOrder()) {
+        cb_mapping_quick_std_->addItem(core::AppConfig::StandardColumnToCn(std_name), std_name);
+    }
+    cb_mapping_quick_std_->setMinimumWidth(160);
+    add_bar->addWidget(cb_mapping_quick_std_);
+
+    ed_mapping_quick_kw_ = new QLineEdit();
+    ed_mapping_quick_kw_->setPlaceholderText("例如：商家单号、抛重、实际KG、实际重量（多词可用、顿号一次多个）");
+    add_bar->addWidget(ed_mapping_quick_kw_, 1);
+
+    btn_mapping_quick_add_ = new QPushButton(" ➕ 添加");
+    btn_mapping_quick_add_->setIcon(icons.ActionIcon("add"));
+    btn_mapping_quick_add_->setObjectName("primaryBtn");
+    btn_mapping_quick_add_->setCursor(Qt::PointingHandCursor);
+    add_bar->addWidget(btn_mapping_quick_add_);
+    root->addLayout(add_bar);
+
+    mapping_table_ = new QTableWidget(0, 4);
+    mapping_table_->setHorizontalHeaderLabels({"标准列(中文)", "标准列(英文)", "关键字（顿号分隔，双击或点右侧编辑）", "操作"});
+    mapping_table_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    mapping_table_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    mapping_table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    mapping_table_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    mapping_table_->verticalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    mapping_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    mapping_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    mapping_table_->setWordWrap(true);
+    mapping_table_->verticalHeader()->setVisible(false);
+    mapping_table_->horizontalHeader()->setMinimumSectionSize(40);
+    mapping_table_->setMinimumHeight(420);
+    root->addWidget(mapping_table_, 1);
+
+    auto *op_bar = new QHBoxLayout();
+    btn_mapping_reset_ = new QPushButton(" 🔄 恢复默认关键字（清空所有自定义）");
+    btn_mapping_reset_->setIcon(icons.ActionIcon("reset"));
+    btn_mapping_reset_->setCursor(Qt::PointingHandCursor);
+    btn_mapping_apply_ = new QPushButton(" ✅ 应用（立即生效）");
+    btn_mapping_apply_->setObjectName("primaryBtn");
+    btn_mapping_apply_->setCursor(Qt::PointingHandCursor);
+    op_bar->addWidget(btn_mapping_reset_);
+    op_bar->addStretch();
+    op_bar->addWidget(btn_mapping_apply_);
+    root->addLayout(op_bar);
+
+    connect(btn_mapping_quick_add_, &QPushButton::clicked, this, &RuleSettingDialog::OnQuickAddKeyword);
+    connect(ed_mapping_quick_kw_, &QLineEdit::returnPressed, this, &RuleSettingDialog::OnQuickAddKeyword);
+    connect(btn_mapping_reset_, &QPushButton::clicked, this, &RuleSettingDialog::OnResetMappingKeywords);
+    connect(btn_mapping_apply_, &QPushButton::clicked, this, &RuleSettingDialog::OnApplyMappingKeywords);
+    connect(mapping_table_, &QTableWidget::cellDoubleClicked, this, [this](int row, int col) {
+        if (col == 2) OnEditMappingRow(row);
+    });
+}
+
+static QStringList split_keywords(const QString &raw) {
+    QString s = raw;
+    for (const QChar sep : {
+        QChar(0x3001), QChar(';'), QChar(0xFF1B), QChar(','),
+        QChar(0xFF0C), QChar('|'), QChar('/'), QChar('\\'),
+        QChar('\t'), QChar('\n'), QChar('\r')
+    }) {
+        s.replace(sep, ' ');
+    }
+    QStringList all = s.split(' ', Qt::SkipEmptyParts, Qt::CaseInsensitive);
+    QStringList out;
+    QSet<QString> seen;
+    for (const QString &k : all) {
+        QString t = k.trimmed();
+        if (t.isEmpty()) continue;
+        if (seen.contains(t.toLower())) continue;
+        seen.insert(t.toLower());
+        out.append(t);
+    }
+    return out;
+}
+
+static QStringList case_unique(const QStringList &list) {
+    QStringList out;
+    QSet<QString> seen;
+    for (const QString &k : list) {
+        QString t = k.trimmed();
+        if (t.isEmpty()) continue;
+        if (seen.contains(t.toLower())) continue;
+        seen.insert(t.toLower());
+        out.append(t);
+    }
+    return out;
+}
+
+void RuleSettingDialog::LoadMappingTable() {
+    if (!mapping_table_) return;
+    auto &cfg = core::AppConfig::Instance();
+    const auto &defs = core::AppConfig::DefaultMappingKeywords();
+    const auto cust = cfg.GetMappingKeywords();
+    const auto &req = core::AppConfig::RequiredStandardColumns();
+    mapping_table_->blockSignals(true);
+    mapping_table_->setRowCount(0);
+
+    const auto &order = core::AppConfig::StandardColumnOrder();
+    for (const QString &std_col : order) {
+        int r = mapping_table_->rowCount();
+        mapping_table_->insertRow(r);
+
+        QString cn = core::AppConfig::StandardColumnToCn(std_col);
+        if (req.contains(std_col)) cn.prepend("★ ");
+        auto *cn_item = new QTableWidgetItem(cn);
+        cn_item->setFlags(cn_item->flags() & ~Qt::ItemIsEditable);
+        cn_item->setFont(QFont(QString::fromUtf8("PingFang SC"), -1, QFont::DemiBold));
+        if (req.contains(std_col)) cn_item->setForeground(QColor(245, 108, 108));
+        mapping_table_->setItem(r, 0, cn_item);
+
+        auto *en_item = new QTableWidgetItem(std_col);
+        en_item->setFlags(en_item->flags() & ~Qt::ItemIsEditable);
+        en_item->setForeground(QColor(144, 147, 153));
+        mapping_table_->setItem(r, 1, en_item);
+
+        const QStringList def_list = defs.value(std_col);
+        QStringList cust_list = cust.value(std_col);
+        QSet<QString> def_low;
+        for (const QString &d : def_list) def_low.insert(d.toLower());
+        QStringList pure_cust;
+        for (const QString &c : cust_list) {
+            if (!def_low.contains(c.toLower())) pure_cust.append(c);
+        }
+        pure_cust = case_unique(pure_cust);
+
+        QString html;
+        QStringList def_parts;
+        for (const QString &d : case_unique(def_list)) {
+            def_parts.append(QString("<span style=\"color:#1f6feb;\">%1</span>").arg(d.toHtmlEscaped()));
+        }
+        QStringList cust_parts;
+        for (const QString &c : pure_cust) {
+            cust_parts.append(QString("<span style=\"color:#d97706;font-weight:600;\">%1</span>").arg(c.toHtmlEscaped()));
+        }
+        QStringList all_parts = def_parts + cust_parts;
+        html = all_parts.join("、");
+        auto *kw_item = new QTableWidgetItem();
+        kw_item->setData(Qt::UserRole, std_col);
+        kw_item->setData(Qt::UserRole + 1, pure_cust.join("、"));
+        kw_item->setTextAlignment(Qt::AlignLeft | Qt::AlignTop);
+        QLabel *lbl = new QLabel();
+        lbl->setTextFormat(Qt::RichText);
+        lbl->setText(html);
+        lbl->setWordWrap(true);
+        lbl->setStyleSheet("padding:4px 6px;background:#ffffff;");
+        lbl->setMargin(4);
+        mapping_table_->setCellWidget(r, 2, lbl);
+        QObject::connect(lbl, &QLabel::linkActivated, lbl, [this, r](const QString &) { OnEditMappingRow(r); });
+        mapping_table_->item(r, 0)->setData(Qt::UserRole, std_col);
+
+        auto *op_cell = new QWidget();
+        auto *op_layout = new QHBoxLayout(op_cell);
+        op_layout->setContentsMargins(6, 4, 6, 4);
+        op_layout->setSpacing(6);
+        QPushButton *btn_edit = new QPushButton(" ✏️ 编辑");
+        btn_edit->setCursor(Qt::PointingHandCursor);
+        btn_edit->setStyleSheet("QPushButton{padding:4px 10px;border-radius:5px;background:#fef3c7;border:1px solid #fcd34d;color:#92400e;}QPushButton:hover{background:#fde68a;}");
+        QPushButton *btn_reset_row = new QPushButton(" 🔙 恢复此行默认");
+        btn_reset_row->setCursor(Qt::PointingHandCursor);
+        btn_reset_row->setStyleSheet("QPushButton{padding:4px 10px;border-radius:5px;background:#e0e7ff;border:1px solid #c7d2fe;color:#3730a3;}QPushButton:hover{background:#c7d2fe;}");
+        op_layout->addWidget(btn_edit);
+        op_layout->addWidget(btn_reset_row);
+        op_layout->addStretch();
+        mapping_table_->setCellWidget(r, 3, op_cell);
+        QObject::connect(btn_edit, &QPushButton::clicked, this, [this, r]() { OnEditMappingRow(r); });
+        QObject::connect(btn_reset_row, &QPushButton::clicked, this, [this, r]() { OnResetMappingRow(r); });
+    }
+    mapping_table_->blockSignals(false);
+    mapping_table_->resizeRowsToContents();
+}
+
+static QString std_col_of_row(QTableWidget *tbl, int row) {
+    if (!tbl || row < 0 || row >= tbl->rowCount()) return {};
+    if (auto *en = tbl->item(row, 1)) return en->text();
+    return {};
+}
+
+void RuleSettingDialog::OnEditMappingRow(int row) {
+    QString std_col = std_col_of_row(mapping_table_, row);
+    if (std_col.isEmpty()) return;
+    auto &cfg = core::AppConfig::Instance();
+    const auto &defs = core::AppConfig::DefaultMappingKeywords();
+    QStringList cur_def = case_unique(defs.value(std_col));
+    QStringList cur_custom = case_unique(cfg.GetMappingKeywords().value(std_col));
+    QSet<QString> def_low;
+    for (const QString &d : cur_def) def_low.insert(d.toLower());
+    QStringList pure_custom;
+    for (const QString &c : cur_custom) {
+        if (!def_low.contains(c.toLower())) pure_custom.append(c);
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle(QString("编辑关键字：%1").arg(core::AppConfig::StandardColumnToCn(std_col)));
+    dlg.resize(620, 520);
+    dlg.setModal(true);
+    auto &icons = IconManager::Instance();
+
+    auto *root = new QVBoxLayout(&dlg);
+    root->setContentsMargins(16, 16, 16, 16);
+    root->setSpacing(10);
+
+    auto *tip = new QLabel(
+        QString("标准列：<b>%1</b>（<span style=\"color:#6b7280;\">%2</span>）<br/>"
+                "分隔符自动识别：<b>「、顿号 / 逗号 , ， / 分号 ; ； / 空格 / 换行」</b>均可分隔多个关键字<br/>"
+                "<span style=\"color:#1f6feb;\">蓝色 = 系统默认（建议保留）</span> / "
+                "<span style=\"color:#d97706;font-weight:600;\">橙色 = 自定义追加</span> / "
+                "没写在下方的默认关键字会被系统保留（只读，无法删除）。")
+            .arg(core::AppConfig::StandardColumnToCn(std_col), std_col));
+    tip->setWordWrap(true);
+    tip->setStyleSheet("padding:10px;background:#f0f9ff;border:1px solid #bae6fd;border-radius:6px;color:#334155;");
+    root->addWidget(tip);
+
+    auto *hint1 = new QLabel(QString("🔵 系统默认关键字（只读预览）：%1").arg(cur_def.join("、")));
+    hint1->setStyleSheet("color:#1e3a8a;padding:6px 8px;background:#eff6ff;border-radius:5px;");
+    hint1->setWordWrap(true);
+    root->addWidget(hint1);
+
+    auto *lbl_custom = new QLabel("🟠 在此处编辑/追加自定义关键字（可一次写一堆）：");
+    lbl_custom->setStyleSheet("font-weight:600;color:#78350f;");
+    root->addWidget(lbl_custom);
+
+    auto *ed = new QPlainTextEdit();
+    ed->setPlaceholderText("示例：\n商家单号、商家编码\nbox_no、快递编号\n面单号、发货单号\n\n（空行会自动忽略）");
+    ed->setPlainText(pure_custom.join("\n"));
+    ed->setStyleSheet("QPlainTextEdit{font-family:Menlo,Consolas,Monospace;font-size:13px;padding:8px;border:1px solid #d1d5db;border-radius:6px;}");
+    root->addWidget(ed, 1);
+
+    auto *btn_row = new QHBoxLayout();
+    auto *btn_paste_ton = new QPushButton(" 🔤 从顿号字符串粘贴成多行");
+    btn_paste_ton->setIcon(icons.ActionIcon("reset"));
+    auto *btn_clear_custom = new QPushButton(" 🗑 清空自定义");
+    auto *btn_cancel = new QPushButton(" 取消");
+    auto *btn_ok = new QPushButton(" 💾 确认保存");
+    btn_ok->setObjectName("primaryBtn");
+    btn_paste_ton->setCursor(Qt::PointingHandCursor);
+    btn_clear_custom->setCursor(Qt::PointingHandCursor);
+    btn_cancel->setCursor(Qt::PointingHandCursor);
+    btn_ok->setCursor(Qt::PointingHandCursor);
+    btn_row->addWidget(btn_paste_ton);
+    btn_row->addWidget(btn_clear_custom);
+    btn_row->addStretch();
+    btn_row->addWidget(btn_cancel);
+    btn_row->addWidget(btn_ok);
+    root->addLayout(btn_row);
+
+    bool ok_clicked = false;
+    connect(btn_ok, &QPushButton::clicked, &dlg, [&ok_clicked, &dlg]() { ok_clicked = true; dlg.accept(); });
+    connect(btn_cancel, &QPushButton::clicked, &dlg, &QDialog::reject);
+    connect(btn_clear_custom, &QPushButton::clicked, ed, [ed]() {
+        auto ret = QMessageBox::question(ed->window(), "清空自定义", "确定清空下方所有自定义关键字吗？\n（系统默认关键字保持不变）",
+                                         QMessageBox::Yes | QMessageBox::No);
+        if (ret == QMessageBox::Yes) ed->clear();
+    });
+    connect(btn_paste_ton, &QPushButton::clicked, this, [ed]() {
+        bool ok = false;
+        QString raw = QInputDialog::getMultiLineText(
+            ed->window(), "粘贴顿号分隔的关键字",
+            "把要追加的关键字一次性粘贴进来，分隔符随便（顿号/逗号/换行都可，自动拆分去重）：",
+            ed->toPlainText(), &ok);
+        if (!ok) return;
+        QStringList parts = split_keywords(raw);
+        QString cur = ed->toPlainText();
+        QStringList merged = split_keywords(cur);
+        QSet<QString> seen;
+        for (const QString &p : merged) seen.insert(p.toLower());
+        for (const QString &p : parts) {
+            if (!seen.contains(p.toLower())) { merged.append(p); seen.insert(p.toLower()); }
+        }
+        ed->setPlainText(merged.join("\n"));
+    });
+
+    if (dlg.exec() != QDialog::Accepted || !ok_clicked) return;
+
+    QStringList new_custom = split_keywords(ed->toPlainText());
+    QSet<QString> def_low_set;
+    for (const QString &d : cur_def) def_low_set.insert(d.toLower());
+    QStringList final_custom;
+    for (const QString &k : new_custom) {
+        if (def_low_set.contains(k.toLower())) continue;
+        final_custom.append(k);
+    }
+    final_custom = case_unique(final_custom);
+
+    const QStringList old_custom = pure_custom;
+    QSet<QString> new_low;
+    for (const QString &c : final_custom) new_low.insert(c.toLower());
+    for (const QString &old_k : old_custom) {
+        if (!new_low.contains(old_k.toLower())) {
+            cfg.RemoveMappingKeyword(std_col, old_k);
+        }
+    }
+    for (const QString &new_k : final_custom) {
+        cfg.AddMappingKeyword(std_col, new_k);
+    }
+    LoadMappingTable();
+}
+
+void RuleSettingDialog::OnResetMappingRow(int row) {
+    QString std_col = std_col_of_row(mapping_table_, row);
+    if (std_col.isEmpty()) return;
+    auto ret = QMessageBox::question(this, "恢复此行默认",
+        QString("确定清空「%1」下所有自定义关键字并恢复系统默认吗？\n（系统默认关键字不会丢失）")
+            .arg(core::AppConfig::StandardColumnToCn(std_col)),
+        QMessageBox::Yes | QMessageBox::No);
+    if (ret != QMessageBox::Yes) return;
+    auto &cfg = core::AppConfig::Instance();
+    QStringList old = cfg.GetMappingKeywords().value(std_col);
+    for (const QString &k : old) cfg.RemoveMappingKeyword(std_col, k);
+    LoadMappingTable();
+}
+
+void RuleSettingDialog::OnQuickAddKeyword() {
+    if (!cb_mapping_quick_std_ || !ed_mapping_quick_kw_) return;
+    QString raw = ed_mapping_quick_kw_->text().trimmed();
+    if (raw.isEmpty()) {
+        QMessageBox::warning(this, "提示", "请输入关键字（可以一次填多个：商家单号、抛重、实际KG）");
+        return;
+    }
+    QString std_col = cb_mapping_quick_std_->currentData().toString();
+    QStringList parts = split_keywords(raw);
+    if (parts.isEmpty()) {
+        QMessageBox::warning(this, "提示", "未识别出有效关键字");
+        return;
+    }
+    auto &cfg = core::AppConfig::Instance();
+    QStringList added;
+    for (const QString &k : parts) {
+        if (cfg.GetEffectiveMappingKeywords().value(std_col).contains(k, Qt::CaseInsensitive)) continue;
+        cfg.AddMappingKeyword(std_col, k);
+        added.append(k);
+    }
+    ed_mapping_quick_kw_->clear();
+    LoadMappingTable();
+    if (!added.isEmpty()) {
+        QMessageBox::information(this, "已追加",
+            QString("已为「%1」追加 %2 条自定义关键字：%3")
+                .arg(core::AppConfig::StandardColumnToCn(std_col))
+                .arg(added.size()).arg(added.join("、")));
+    } else {
+        QMessageBox::information(this, "没有变化", "输入的关键字已经存在于系统默认或自定义中，无需重复添加。");
+    }
+}
+
+void RuleSettingDialog::OnResetMappingKeywords() {
+    auto ret = QMessageBox::question(this, "确认恢复",
+        "确定清空所有自定义关键字并恢复系统默认吗？",
+        QMessageBox::Yes | QMessageBox::No);
+    if (ret != QMessageBox::Yes) return;
+    core::AppConfig::Instance().ResetMappingKeywords();
+    LoadMappingTable();
+}
+
+void RuleSettingDialog::OnApplyMappingKeywords() {
+    auto &cfg = core::AppConfig::Instance();
+    const auto &defs = core::AppConfig::DefaultMappingKeywords();
+    int total_custom = 0;
+    for (auto it = defs.cbegin(); it != defs.cend(); ++it) {
+        total_custom += cfg.GetMappingKeywords().value(it.key()).size();
+    }
+    QMessageBox::information(this, "已应用",
+        QString("关键字已立即生效（系统默认 + %1 条自定义），下次自动映射会使用。").arg(total_custom));
 }
 
 void RuleSettingDialog::ShowFuelDialog(bool is_add) {

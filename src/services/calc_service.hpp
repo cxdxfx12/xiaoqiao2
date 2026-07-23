@@ -34,6 +34,9 @@ public:
                                   const QMap<QString, QString> &mapping);
     QString NormalizeColumns(const QString &input_table);
 
+    static void RememberMapping(const QMap<QString, QString> &confirmed,
+                                const QStringList &actual_cols);
+
     // 获取预览数据（前5行）
     QStringList GetPreviewHeaders(const QString &table_name);
     QList<QStringList> GetPreviewRows(const QString &table_name, int max_rows = 5);
