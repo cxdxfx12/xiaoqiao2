@@ -20,6 +20,8 @@
 #include <QThread>
 #include <QHeaderView>
 #include <QFileInfo>
+#include <QDir>
+#include <QDate>
 #include <QDebug>
 #include <QLabel>
 #include <QElapsedTimer>
@@ -436,51 +438,89 @@ void BatchCalcDialog::OnSelectOutput() {
 }
 
 namespace {
-// 将输入文件名规范化成无重复后缀的「<basename>已结算.xlsx」
-// 同时兼容：用户在输出框里写的是文件夹 / 具体文件名 / 畸形扩展名
-QString ResolveOutputPath(const QString &input_file, const QString &output_text) {
-    QFileInfo inf(input_file);
-    QString base = inf.completeBaseName();
-
-    // 1. 先去掉 base 末尾已经存在的多种结算/结果后缀（防止：_结果_结果 / _运费结果_运费结果 等重复叠加）
-    //    按从长到短匹配，一次只剥一层（但用 while 循环最多剥 3 层防极端）
+QString StripOldSuffix(QString base) {
+    // 去掉末尾常见的自动生成后缀（旧系统残留的 _结果 / _运费结果 / 已结算 / YYYYMMDD 等，最多剥3层
+    static const QStringList tails = {
+        QStringLiteral("_运费结果_运费结果"),
+        QStringLiteral("_结果_结果"),
+        QStringLiteral("已结算已结算"),
+        QStringLiteral("_运费结果"),
+        QStringLiteral("_结果"),
+        QStringLiteral("已结算"),
+    };
     for (int iter = 0; iter < 3; ++iter) {
         bool stripped = false;
-        static const QStringList tails = {
-            QStringLiteral("_运费结果_运费结果"),
-            QStringLiteral("_结果_结果"),
-            QStringLiteral("已结算已结算"),
-            QStringLiteral("_运费结果"),
-            QStringLiteral("_结果"),
-            QStringLiteral("已结算"),
-        };
-        for (const auto &t : tails) {
-            if (base.endsWith(t, Qt::CaseInsensitive)) {
-                base.chop(t.length());
-                stripped = true;
-                break;
+        // 剥日期尾巴：_YYYYMMDD
+        if (base.length() >= 9) {
+            QString tail = base.right(9);
+            if (tail.startsWith('_')) {
+            QString digits = tail.mid(1);
+            if (digits.length() == 8) {
+                bool ok = true;
+                for (int i = 0; i < 8; ++i) if (!digits[i].isDigit()) { ok = false; break; }
+                if (ok) { base.chop(9); stripped = true; }
+            }
+            }
+        }
+        if (!stripped) {
+            for (const auto &t : tails) {
+                if (base.endsWith(t, Qt::CaseInsensitive)) {
+                    base.chop(t.length());
+                    stripped = true;
+                    break;
+                }
             }
         }
         if (!stripped) break;
     }
-    QString default_name = base + QStringLiteral("已结算.xlsx");
+    return base;
+}
+
+// 从输入文件得到干净的basename，去掉所有旧系统自动加的尾巴
+QString CleanInputBase(const QString &input_file) {
+    return StripOldSuffix(QFileInfo(input_file).completeBaseName());
+}
+
+// 将输入文件名规范化成无重复后缀的「<basename>_<YYYYMMDD>_已结算.xlsx」
+QString ResolveOutputPath(const QString &input_file, const QString &output_text) {
+    QString base = CleanInputBase(input_file);
+    QString today = QDate::currentDate().toString("yyyyMMdd");
+    QString default_name = base + QStringLiteral("_") + today + QStringLiteral("_已结算.xlsx");
+
+    QString folder_default_dir = QFileInfo(input_file).absolutePath();
 
     QString text = output_text.trimmed();
+    QFileInfo inf_input(input_file);
+
     if (text.isEmpty()) {
-        // 未指定：输出到输入文件同级目录
-        return QFileInfo(inf.absolutePath() + "/" + default_name).absoluteFilePath();
+        return QFileInfo(folder_default_dir + "/" + default_name).absoluteFilePath();
     }
 
     QFileInfo of(text);
-    if (of.isDir() || text.endsWith('/') || text.endsWith('\\')
-        || of.suffix().isEmpty() /* 没扩展名当文件夹 */) {
-        // 是文件夹
+    bool treat_as_folder = of.isDir()
+                         || text.endsWith('/')
+                         || text.endsWith('\\')
+                         || of.suffix().isEmpty();
+
+    if (!treat_as_folder) {
+        // 用户填了文件名：
+        // 如果文件名像是旧系统自动生成的文件（basename去掉尾巴后跟输入basename相同）则强制重命名，
+        // 否则认为用户想自定义文件名→尊重用户自定义（如要完全自定义就去掉「不覆盖。
+        QString of_base_clean = StripOldSuffix(of.completeBaseName());
+        QString input_base_clean = CleanInputBase(input_file);
+        if (of_base_clean.compare(input_base_clean, Qt::CaseInsensitive) == 0) {
+            treat_as_folder = true; // 名字和输入原名（清尾的，
+                                                     // 按强制新名字，
+        }
+    }
+
+    if (treat_as_folder) {
         QString folder = of.absoluteFilePath();
         if (folder.isEmpty()) folder = QDir(text).absolutePath();
         return QFileInfo(folder + "/" + default_name).absoluteFilePath();
     }
 
-    // 用户写了具体文件名：修正畸形扩展名 .xlsxx / .xlsxx / .xlxs -> .xlsx
+    //  具体文件名路径
     QString suf = of.suffix().toLower();
     static const QRegularExpression kBadXlsx("^x{1,}l{1,}s{1,}x{1,}$");
     QString abs_path;

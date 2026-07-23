@@ -4,6 +4,7 @@
 #include "db/sqlite_rule_repository.hpp"
 #include "services/calc_service.hpp"
 #include <QCoreApplication>
+#include <QDate>
 #include <QDir>
 #include <QFileInfo>
 #include <QStringList>
@@ -85,7 +86,9 @@ int main(int argc, char *argv[]) {
     if (inputs.isEmpty()) {
         qInfo() << "用法: batch_runner [-o 输出目录] 输入文件1 [输入文件2 ...]";
         qInfo() << "示例: batch_runner -o /Users/cxd/帐单 /Users/cxd/帐单/*.xlsx";
-        qInfo() << "  输出文件名规则：<原文件名>已结算.xlsx（自动去重避免_结果_结果重复）";
+        qInfo().noquote() << QString("  输出文件名规则：<原文件名>_<当前日期YYYYMMDD>_已结算.xlsx  例：珀莱雅-4月发件账单_%1_已结算.xlsx")
+                             .arg(QDate::currentDate().toString("yyyyMMdd"));
+        qInfo() << "  （自动剥除历史的 _结果/_运费结果/已结算 等重复后缀）";
         return 0;
     }
 
@@ -94,23 +97,38 @@ int main(int argc, char *argv[]) {
     }
     QDir().mkpath(out_dir);
     out_dir = QFileInfo(out_dir).absoluteFilePath();
+    QString today = QDate::currentDate().toString("yyyyMMdd");
 
     auto NormalizeBase = [](QString base) -> QString {
+        static const QStringList tails = {
+            QStringLiteral("_运费结果_运费结果"),
+            QStringLiteral("_结果_结果"),
+            QStringLiteral("已结算已结算"),
+            QStringLiteral("_运费结果"),
+            QStringLiteral("_结果"),
+            QStringLiteral("已结算"),
+        };
         for (int iter = 0; iter < 3; ++iter) {
             bool stripped = false;
-            static const QStringList tails = {
-                QStringLiteral("_运费结果_运费结果"),
-                QStringLiteral("_结果_结果"),
-                QStringLiteral("已结算已结算"),
-                QStringLiteral("_运费结果"),
-                QStringLiteral("_结果"),
-                QStringLiteral("已结算"),
-            };
-            for (const auto &t : tails) {
-                if (base.endsWith(t, Qt::CaseInsensitive)) {
-                    base.chop(t.length());
-                    stripped = true;
-                    break;
+            // 剥 _YYYYMMDD 日期尾巴
+            if (base.length() >= 9) {
+                QString tail = base.right(9);
+                if (tail.startsWith('_')) {
+                    QString digits = tail.mid(1);
+                    if (digits.length() == 8) {
+                        bool ok = true;
+                        for (int i = 0; i < 8; ++i) if (!digits[i].isDigit()) { ok = false; break; }
+                        if (ok) { base.chop(9); stripped = true; }
+                    }
+                }
+            }
+            if (!stripped) {
+                for (const auto &t : tails) {
+                    if (base.endsWith(t, Qt::CaseInsensitive)) {
+                        base.chop(t.length());
+                        stripped = true;
+                        break;
+                    }
                 }
             }
             if (!stripped) break;
@@ -129,7 +147,9 @@ int main(int argc, char *argv[]) {
         qInfo() << "处理:" << fi.fileName();
         QString suf = fi.suffix().toLower();
         QString out_suf = (suf == "csv" ? "csv" : (suf == "parquet" ? "parquet" : "xlsx"));
-        QString out_name = NormalizeBase(fi.completeBaseName()) + QStringLiteral("已结算.") + out_suf;
+        QString clean_base = NormalizeBase(fi.completeBaseName());
+        QString out_name = clean_base + QStringLiteral("_") + today
+                        + QStringLiteral("_已结算.") + out_suf;
         QString out = QDir(out_dir).filePath(out_name);
         if (ProcessOne(inp, out) == 0) total_ok++;
         else total_fail++;
