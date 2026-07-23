@@ -45,7 +45,9 @@
 | 规则设置 | 运费模板管理、阶梯定价配置、燃油附加费、地区加价、自定义加价策略 |
 | 客户规则设置 | 客户信息管理、客户专属报价表（矩阵格式）编辑、折扣设置、默认模板绑定 |
 | 系统设置 | 自动性能优化（使用系统90%资源）、手动内存/线程配置、系统信息展示 |
+| 快递模板识别管理 | 8 家快递自动识别模板的「总开关 + 逐条启用/禁用」、双击行可编辑、新增/删除，**自定义模板自动覆盖同ID内置模板** |
 | 关于/授权 | 软件版本信息、机器码生成、授权码激活、授权有效期管理 |
+| 品牌图标系统 | 全套「祥云快递盒」方案B：Mac App Bundle (.icns) / Dock / 所有窗口标题栏 / 关于页 Logo / QRC 资源 PNG 16-1024 |
 
 ### 核心特性
 
@@ -54,6 +56,8 @@
 - 🎯 **智能表头映射**：自动识别中英文表头（精确匹配优先 + 子串匹配兜底），缺失必填列时弹手动映射对话框
 - 🔧 **灵活规则**：6 级重量阶梯、燃油附加费、地区加价（省/市/区三级）、自定义策略
 - 🖥️ **自动性能调优**：启动时自动检测系统资源，使用 90% 内存和 CPU 核心数配置 DuckDB
+- 🧠 **8 家快递模板自动识别 + 可视化管理**：内置中通/圆通/韵达/申通/极兔/邮政EMS/顺丰/德邦 模板指纹；「⚙️ 管理模板」入口支持启用禁用/双击编辑/增删；自定义模板与内置同ID 时**自定义优先覆盖**，避免改代码重启
+- 🎨 **品牌项目图标全套生成**：按「祥云快递盒」方案B QPainter 程序化绘制 → 一键输出 Mac icns / 9 种尺寸 PNG / QRC 资源；Dock/Finder/窗口标题栏/Alt-Tab/关于页处处一致
 - 🔐 **授权保护**：机器码绑定授权码、HMAC-SHA256 签名、防时间篡改、试用版/个人版/企业版/永久版多级别授权
 - 📝 **历史可追溯**：每次批量计算自动保存记录，日期范围筛选、关键字搜索、旧数据清理
 
@@ -81,24 +85,36 @@
 
 ```
 xiaoqiao_freight/
-├── CMakeLists.txt              # CMake 构建配置（主程序 + 授权生成器）
-├── PROJECT.md                  # 本项目文档
+├── CMakeLists.txt              # CMake 构建配置（主程序+授权生成器+gen_icon图标生成器+t7_test接口测试）
+├── PROJECT.md                  # 项目文档（主文档）
+├── PROJECT_v1.1.md             # v1.1 详细说明
+├── PROJECT_v1.1_new.md         # 本项目文档（最完整最新版，含T7+图标系统说明）
+├── PERFORMANCE_OPTIMIZATION.md # 性能优化专项文档
 ├── .gitignore                  # Git 忽略规则
 ├── resources/
-│   └── resources.qrc           # Qt 资源文件（预留图标等资源）
+│   ├── resources.qrc           # Qt 资源文件：注册 icons/png/logo_*.png 共9档(16→1024)
+│   └── icons/
+│       ├── xiaoqiao.icns       # Mac App Bundle 图标（392KB，10档尺寸，Finder/Dock预览）
+│       ├── xiaoqiao.iconset/   # .icns 打包源：10档 icon_*@2x.png
+│       └── png/                # 项目PNG资源：logo_16/24/32/48/64/128/256/512/1024.png
 ├── scripts/
 │   └── deploy_mac.sh           # macOS 部署脚本（macdeployqt + 签名修复 + 去隔离属性）
 ├── tools/
-│   └── license_generator/      # 授权生成器工具（独立 GUI 程序）
-│       ├── main.cpp
-│       ├── license_generator_widget.hpp
-│       └── license_generator_widget.cpp
+│   ├── license_generator/      # 授权生成器工具（独立 GUI 程序）
+│   │   ├── main.cpp
+│   │   ├── license_generator_widget.hpp
+│   │   └── license_generator_widget.cpp
+│   ├── gen_icon/               # Logo 图标生成器（QGuiApplication + QPainter 代码绘制方案B，一键输出 .icns + PNG 全量）
+│   │   └── main.cpp
+│   ├── t7_test/                # 功能7模板识别 Headless 接口回归测试(5项/100%覆盖T7核心)
+│   │   └── main.cpp
+│   └── batch_runner/           # 批量计算非GUI入口
 └── src/
-    ├── main.cpp                # 程序入口
+    ├── main.cpp                # 程序入口（含 app.setWindowIcon -> app_logo 64x64）
     ├── core/                   # 核心类型与配置
-    │   ├── app_config.hpp      # 应用配置（单例、性能调优、路径管理）
+    │   ├── app_config.hpp      # 应用配置（单例、性能调优、路径管理 + T7模板启用状态/自定义模板持久化）
     │   ├── app_config.cpp
-    │   ├── freight_types.hpp   # 数据结构定义（枚举、CalcResult、SurchargeStrategy）
+    │   ├── freight_types.hpp   # 数据结构定义（枚举、CalcResult、SurchargeStrategy、TemplateFingerprint）
     │   ├── license_manager.hpp # 授权管理器（单例）
     │   └── license_manager.cpp
     ├── db/                     # 数据存储层
@@ -109,6 +125,8 @@ xiaoqiao_freight/
     ├── services/               # 业务服务层
     │   ├── calc_service.hpp           # 计算服务（单条/批量/文件）
     │   ├── calc_service.cpp
+    │   ├── template_recognizer.hpp    # T7 快递模板自动识别器（关键词+列名双重匹配，自定义模板优先覆盖内置）
+    │   ├── template_recognizer.cpp
     │   ├── rule_service.hpp           # 规则服务（转发至 Repository，发 RulesChanged 信号）
     │   ├── rule_service.cpp
     │   ├── history_service.hpp        # 历史记录服务（增删查改、清理）
@@ -116,47 +134,52 @@ xiaoqiao_freight/
     └── ui/                     # 界面层
         ├── main_window.hpp     # 主窗口
         ├── main_window.cpp
-        ├── icon_manager.hpp    # 图标管理器（程序化绘制，缓存）
+        ├── icon_manager.hpp    # 图标管理器（QPainter程序化绘制方案B + 名称+尺寸缓存，GenerateLogoIcon 新绘制「祥云快递盒」）
         ├── icon_manager.cpp
-        └── dialogs/            # 对话框
+        └── dialogs/            # 对话框（12个）
             ├── single_calc_dialog.*     # 单条计算
-            ├── batch_calc_dialog.*      # 批量计算
+            ├── batch_calc_dialog.*      # 批量计算（新增"⚙️ 管理模板"按钮→打开模板管理窗口）
             ├── compare_dialog.*         # 对比分析
             ├── history_dialog.*         # 历史记录
             ├── rule_setting_dialog.*    # 规则设置（多 Tab）
-            ├── template_edit_dialog.*   # 模板编辑（阶梯价、分区、燃油）
+            ├── template_edit_dialog.*   # 运费价格模板编辑（阶梯价、分区、燃油）
+            ├── courier_template_manager_dialog.*  # T7 快递识别模板管理：总开关+启用列复选框+增/改/删/批量启用禁用
+            ├── courier_template_edit_dialog.*     # T7 快递识别模板编辑：ID/名称/快递/多行关键词/两列映射表
             ├── customer_setting_dialog.*# 客户设置 + 客户报价矩阵
             ├── system_setting_dialog.*  # 系统设置（性能）
             ├── header_mapping_dialog.*  # 表头手动映射
-            └── about_dialog.*           # 关于 + 授权激活
+            └── about_dialog.*           # 关于 + 授权激活 + 品牌Logo
 ```
 
 ### 架构设计（三层架构）
 
 ```
-┌──────────────────────────────────────────────┐
-│              UI 层 (Qt Widgets)               │
-│  MainWindow / 10 个 Dialog / IconManager      │
-└──────────────────────┬───────────────────────┘
+┌──────────────────────────────────────────────────┐
+│              UI 层 (Qt Widgets)                   │
+│  MainWindow / 12 个 Dialog / IconManager          │
+│ （+ CourierTemplateManager + CourierTemplateEdit）│
+└──────────────────────┬───────────────────────────┘
                        ↓
-┌──────────────────────────────────────────────┐
-│           Service 层 (业务逻辑)               │
-│  CalcService  RuleService  HistoryService     │
-└──────────────────────┬───────────────────────┘
+┌──────────────────────────────────────────────────┐
+│           Service 层 (业务逻辑)                    │
+│  CalcService / RuleService / HistoryService /      │
+│  TemplateRecognizer (T7-8家快递模板识别+去重)       │
+└──────────────────────┬───────────────────────────┘
                        ↓
-┌──────────────────────────────────────────────┐
-│           DB 层 (数据持久化)                   │
-│  SQLite (rules.db + history.db)               │
-│  DuckDB (calc.duckdb - 列式计算引擎)          │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│           DB 层 (数据持久化 + config.ini)          │
+│  SQLite (rules.db + history.db)                   │
+│  DuckDB (calc.duckdb - 列式计算引擎)               │
+│  AppConfig config.ini（模板启用开关 + 自定义模板） │
+└──────────────────────────────────────────────────┘
 ```
 
 **命名空间约定**：所有代码位于 `freight::xxx` 命名空间下
-- `freight::core` — 核心配置与类型
+- `freight::core` — 核心配置与类型（含 T7 `TemplateFingerprint`）
 - `freight::db` — 数据存储层
-- `freight::services` — 业务服务层
-- `freight::ui` — 界面层（含 `freight::ui::dialogs` 子命名空间）
-- `freight::tools` — 工具模块（授权生成器）
+- `freight::services` — 业务服务层（含 `TemplateRecognizer` 模板识别）
+- `freight::ui` — 界面层（含 `freight::ui::dialogs` 子命名空间，现 12 个对话框）
+- `freight::tools` — 工具模块（授权生成器 / gen_icon 图标生成器 / t7_test 接口回归测试 / batch_runner 批量入口）
 
 ---
 
@@ -576,17 +599,19 @@ thread_count    = MAX(1, ROUND(CPU 核心数 × 0.9))
 
 ---
 
-### 4.8 图标管理器
-
-**文件**：[icon_manager.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/icon_manager.hpp) + [icon_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/icon_manager.cpp)
-
-**纯代码绘制**图标（不依赖 PNG 资源），使用 QPainter 程序化绘制，按名称+尺寸+分类缓存到 `QMap<QString, QIcon>`。
+### 4.8 图标管理器 & 品牌图标系统 (方案B：祥云快递盒
+**文件**：
+- 运行时绘制：[icon_manager.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/icon_manager.hpp) + [icon_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/icon_manager.cpp)
+- 资产生成工具：[tools/gen_icon/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/gen_icon/main.cpp)
+- 打包注入：[CMakeLists.txt](file:///Users/cxd/duckdb/xiaoqiao_freight/CMakeLists.txt#L96-L109) (MACOSX_BUNDLE_ICON_FILE)
+- 资源注册：[resources/resources.qrc](file:///Users/cxd/duckdb/xiaoqiao_freight/resources/resources.qrc)
+- 应用入口设置全局窗口图标：[src/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/main.cpp#L50-L52)
 
 #### 尺寸枚举 (IconSize)
 SIZE_16 / SIZE_20 / SIZE_24 / SIZE_32 / SIZE_48 / SIZE_64
 
 #### 分类枚举 (IconCategory)
-CARD（64px 卡片大图）/ SETTING（24px 设置按钮）/ ACTION（16px 工具栏）/ STATUS（24px 状态）/ LOGO（32px 窗口图标）
+CARD（64px 卡片大图）/ SETTING（24px 设置按钮）/ ACTION（16px 工具栏）/ STATUS（24px 状态）/ LOGO（32/64 窗口图标）
 
 #### 便捷方法
 ```cpp
@@ -597,6 +622,95 @@ StatusIcon("success")       // 等价 GetIcon(..., STATUS, SIZE_24)
 ```
 
 生成器方法：`GenerateCardIcon` / `GenerateSettingIcon` / `GenerateActionIcon` / `GenerateLogoIcon`（每个方法内部 switch(name) 用 QPainter 绘制对应图形）。
+
+#### 全新 `GenerateLogoIcon()` 新版方案B 语义解析（代码重绘版
+按 100% 程序化绘制（无任何资源依赖，任何尺寸即时重绘无锯齿：
+
+| 视觉元素 | 坐标/颜色 | 语义 |
+|---|---|---|
+| 圆角方形底 | #4facfe → #00c6fb | 蓝→青 45°渐变 | 行业专业可信（蓝=物流/科技） |
+| 快递盒 | 白底+#0d5cb8 深蓝线 | 物流快递=行业语义一眼认出是物流软件 |
+| 黄色胶带 | #ffd86b 圆角矩形 | 盒盖封条，真实「封箱胶带 |
+| 蓝底白字「乔」贴标 | #409eff 圆角方形贴 | 品牌识别品牌锚点=小乔品牌，中心居中 |
+| 左上祥云 | 白色半透明三椭圆 | 祥云=小乔，暗示"小吉祥，双关=祥云=好运 |
+| 右下小算盘 | 绿渐变#43e97b→#38f9d7 | 绿渐变绿=算账/盈利/运费结算正确 |
+| 顶部柔光 | 顶部 58%不透明 | 让图标带立体玻璃感 |
+
+Dock图标（App Bundle 注入：
+- CMake 设置 `MACOSX_BUNDLE_ICON_FILE "xiaoqiao.icns"`，同时 `set_source_files_properties(... MACOSX_PACKAGE_LOCATION "Resources")` 把 `resources/icons/xiaoqiao.icns (392KB，复制进 Bundle 的 `.app/Contents/Resources/`，`Info.plist` 自动生成 `CFBundleIconFile = xiaoqiao.icns。
+- Finder预览、Dock、Launchpad图标全部生效；Windows exe：
+- `resources/icons/png/logo_256.png 可以直接用 imagemagick 或 Ncapconvert to `.ico` 注入 .exe 资源；
+
+一键再生成：
+```bash
+cd build && cmake --build . --target gen_icon
+./bin/gen_icon ../resources/icons/xiaoqiao.iconset
+# 产出：
+#   resources/icons/xiaoqiao.icns         #  Mac Bundle
+#   resources/icons/png/logo_16~1024.png   # 资源/QT RCC 资源
+```
+
+---
+
+### 4.9 快递模板自动识别 & 可视化管理（功能7 / T7）
+
+**文件**：
+- 模板指纹与持久化：[app_config.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/app_config.hpp) / [app_config.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/app_config.cpp)
+- 识别与识别器(识别/去重/覆盖：[template_recognizer.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/template_recognizer.hpp) / [template_recognizer.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/template_recognizer.cpp)
+- 管理对话框（列表+启用列+增改删）：[courier_template_manager_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/courier_template_manager_dialog.cpp)
+- 编辑对话框（点开编辑ID/名称/快递/关键词/列映射）：[courier_template_edit_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/courier_template_edit_dialog.cpp)
+- 入口按钮：[batch_calc_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/batch_calc_dialog.cpp)（批量计算页"⚙️ 管理模板"
+
+#### 核心数据结构：TemplateFingerprint
+```cpp
+struct TemplateFingerprint {
+    QString   template_id;
+    QString   display_name;
+    QString   courier_name;
+    QStringList required_keywords; // 内容关键词（"中通"|"顺丰特惠）
+    QMap<QString, QString> column_mapping; // 列映射：Excel列名 → 标准列(order_id/dest_province/weight 等
+    bool      enabled = true;
+    bool      is_builtin = false; // 内置 vs 自定义
+};
+```
+
+#### 内置8家内置模板
+中通 / 圆通 / 韵达 / 申通 / 极兔 / 邮政EMS / 顺丰 / 德邦 各有 6个指纹：每个模板必须≥1条关键词 ≥2组列映射保证可落地。
+
+#### 持久化 (config.ini 键
+- `[Templates/disabled_ids = QStringList` — 单条禁用列表
+- `[Templates]/auto_detect_global = true/false` — 总开关
+- `[Custom_Templates]` 小节：所有自定义模板。
+- `AppConfig::GetAllTemplateFingerprints(enabled_only)` — 拉取时合并 内置+自定义，并按enabled过滤。
+
+#### 识别器算法核心算法：关键词+列名双重匹配（合并打分：
+1. 先过滤掉 `GetAllTemplateFingerprints(true)` **已启用**的模板。
+2. **去重覆盖**：相同template_id若有自定义模板时，**丢弃同ID。
+3. 样本前5行内容中关键词命中次数权重 × 0.6 + Excel表头列命中文精确/子串命中权重×0.4；分数最高且大于阈值才返回。
+4. 返回 `TemplateMatchResult` {matched/template_id/match_score`。
+
+#### UI：列表页能力：
+- 顶部：总开关（一键全启用全禁用；
+- 每行：启用复选框勾选立生效；
+- 双击任意非第0列=行打开编辑对话框；
+- 选中1行：选中/编辑/删除/全部启用/全部禁用；
+- 删除内置模板会："系统内置模板不可删除，①取消勾选禁用 ②编辑生成自定义覆盖版"提示；
+- 顶部统计：总数 N / M（已启用数 / 内置数 / 自定义数 + M自定义数。
+
+编辑对话框校验规则：
+```cpp
+- template_id 内置不可编辑仅允许ID锁存自定义可改（内置ID上锁🔒
+- 必填：display_name / 空，关键词自动；
+- 关键词多行输入 ，自动 分割顿号逗号/分;
+- 列映射表：≥至少2组，不允许重重复Excel列名
+- 保存时：写入到 AppConfig::AddCustomTemplateFingerprint 或 UpdateCustomTemplateFingerprint；若是内置被保存=自动 另存为自定义覆盖版（is_builtin=false）。
+
+Headless 接口回归测试工具：tools/t7_test/main.cpp 5项100%覆盖：
+1. 默认 ≥8内置模板合法；
+2. 单条禁用+全局开关读写；
+3. 自定义模板同ID覆盖内置；
+4. CRUD；
+5. 持久化写盘重启一致。
 
 ---
 
@@ -831,7 +945,9 @@ END
 | **CustomerSettingDialog** | customer_setting_dialog.* | 左侧 QListWidget 客户列表（增删改/批量导入）；右侧客户专属报价矩阵表格：10 列表头（报价区域/目的省份/0-0.5KG/0.5-1KG/1-2KG/2-3KG/3-30KG/30KG+/其他/备注）。报价区域列合并单元格，同分区省份连续排列；区域名和省份名只读，价格列双击可编辑；编辑某省份价格时自动同步同分区其他省份；保存时按分区去重写入 tiered_pricing。底部：保存报价按钮。 |
 | **SystemSettingDialog** | system_setting_dialog.* | Tab1 性能设置：☑ 自动优化性能（使用系统90%资源）默认勾选；系统信息展示（总内存/CPU核数/自动计算后的内存限制和线程数）；手动内存 MB + 线程数 SpinBox（自动模式下禁用）；Tab2 预留。确定/取消按钮。 |
 | **HeaderMappingDialog** | header_mapping_dialog.* | 当 AutoMap 缺失必填列时弹出。左列导入表头 + 右列标准列（必填标红星 *）+ 红色箭头连线可视化映射；点击交互调整；底部 QTableWidget 预览前 5 行数据。确认后返回自定义 mapping。 |
-| **AboutDialog** | about_dialog.* | 品牌 Logo、应用名 + "v1.0.0"、公司名、官网（蓝色下划线）、客服电话。授权信息区：机器码（X-XXX-XXX-XXX-XXX，带一键复制按钮）、授权状态（试用版/个人版/企业版/永久版）、有效期（剩余天数）、"授权激活"按钮（弹输入框输入授权码 → LicenseManager.ActivateLicense()）。 |
+| **AboutDialog** | about_dialog.* | 品牌 Logo（祥云快递盒方案B 64x64）、应用名 + "v1.0.0"、公司名、官网（蓝色下划线）、客服电话。授权信息区：机器码（X-XXX-XXX-XXX-XXX，带一键复制按钮）、授权状态（试用版/个人版/企业版/永久版）、有效期（剩余天数）、"授权激活"按钮（弹输入框输入授权码 → LicenseManager.ActivateLicense()）。 |
+| **CourierTemplateManagerDialog** | courier_template_manager_dialog.* | T7 快递识别模板管理页：顶部「启用快递模板自动识别」全局开关 + 状态统计(总数/启用/内置/自定义)；列表首列"启用"复选框勾选立即生效；双击行打开编辑；按钮：新增/编辑/删除(内置防删)/全部启用/全部禁用；发射 TemplatesChanged 信号同步主界面自动识别勾选框状态。 |
+| **CourierTemplateEditDialog** | courier_template_edit_dialog.* | T7 快递识别模板编辑页：Tab1 基本信息(内置ID锁🔒自定义可改/名称/快递公司)；Tab2 关键词多行输入，顿号逗号换行自动去重；Tab3 列映射表(Excel原始列→系统标准列)增删改、校验≥2组、不允许重复Excel列；保存时写入自定义模板(内置编辑→生成自定义覆盖版)。 |
 
 ---
 
@@ -1139,6 +1255,16 @@ bash xiaoqiao_freight/scripts/deploy_mac.sh build/bin/license_generator.app
 | 页脚官网链接（外链+下划线） | [main_window.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/main_window.cpp#L133-L142) | footer_label_ |
 | 授权启动后检查弹窗 | [main_window.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/main_window.cpp#L300-L313) | `CheckLicenseStartup()` |
 | macdeployqt + 签名修复脚本 | [deploy_mac.sh](file:///Users/cxd/duckdb/xiaoqiao_freight/scripts/deploy_mac.sh) | 第 1-46 行 |
+| T7 模板指纹数据结构+8内置模板 | [app_config.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/app_config.hpp#L125-L150) | `TemplateFingerprint + BuildBuiltinTemplates()` |
+| T7 识别+关键词+列名双重评分 +自定义优先覆盖去重 | [template_recognizer.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/template_recognizer.cpp#L40-L120) | `RecognizeFromColumns()` |
+| T7 模板管理窗口(列表+启用+增改删+信号) | [courier_template_manager_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/courier_template_manager_dialog.cpp#L1-L320) | `OnAddTemplate()/OnEditTemplate()/OnDeleteTemplate()/OnToggleEnabled()` |
+| T7 模板编辑对话框(关键词自动分割+列映射表校验) | [courier_template_edit_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/courier_template_edit_dialog.cpp#L1-L280) | `OnOk()` + 校验逻辑 |
+| 批量计算页「⚙️ 管理模板」入口按钮 | [batch_calc_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/batch_calc_dialog.cpp#L880-L920) | `OnManageTemplates()` |
+| 方案B「祥云快递盒」代码绘制Logo（窗口+关于页+菜单） | [icon_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/icon_manager.cpp#L294-L407) | `DrawSchemeBLogo() / GenerateLogoIcon()` |
+| Mac App Bundle 注入 .icns + Info.plist CFBundleIconFile | [CMakeLists.txt](file:///Users/cxd/duckdb/xiaoqiao_freight/CMakeLists.txt#L96-L109) | `MACOSX_BUNDLE_ICON_FILE + target_sources(.icns)` |
+| 一键生成 .icns + 9档PNG 资源工具 | [gen_icon/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/gen_icon/main.cpp#L1-L240) | `DrawLogoSchemeB() + iconutil -c icns` |
+| T7 Headless 5项接口回归测试 | [t7_test/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/t7_test/main.cpp#L1-L180) | 1)8内置 2)开关 3)自定义覆盖 4)CRUD 5)持久化 |
+| 全局 Alt-Tab 窗口统一图标 app.setWindowIcon | [main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/main.cpp#L50-L52) | `app.setWindowIcon(icons.GetIcon(app_logo, LOGO, 64))` |
 
 ---
 
