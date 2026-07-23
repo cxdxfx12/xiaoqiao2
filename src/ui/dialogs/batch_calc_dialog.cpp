@@ -153,15 +153,15 @@ QPushButton:hover { background: #66b1ff; }
     auto *output_row = new QHBoxLayout();
     output_row->setSpacing(12);
     edt_output_ = new QLineEdit();
-    edt_output_->setPlaceholderText("选择结果保存路径");
+    edt_output_->setPlaceholderText("选择结果保存文件夹（默认 = 输入文件同目录，文件名自动加「已结算」后缀）");
     edt_output_->setStyleSheet(edt_input_->styleSheet());
-    auto *btn_browse_out = new QPushButton("浏览路径");
+    auto *btn_browse_out = new QPushButton("浏览文件夹");
     btn_browse_out->setCursor(Qt::PointingHandCursor);
     btn_browse_out->setStyleSheet(btn_browse_in->styleSheet());
     connect(btn_browse_out, &QPushButton::clicked, this, &BatchCalcDialog::OnSelectOutput);
     output_row->addWidget(edt_output_, 1);
     output_row->addWidget(btn_browse_out);
-    form_layout->addRow("输出文件", output_row);
+    form_layout->addRow("输出文件夹", output_row);
 
     auto *opts_row = new QHBoxLayout();
     opts_row->setSpacing(20);
@@ -424,40 +424,93 @@ void BatchCalcDialog::OnDetectTemplate() {
 
 void BatchCalcDialog::OnSelectOutput() {
     auto &cfg = core::AppConfig::Instance();
-    QString file = QFileDialog::getSaveFileName(this, "保存结果", cfg.GetLastOutputDir(),
-        "Excel文件 (*.xlsx);;CSV文件 (*.csv);;Parquet文件 (*.parquet)");
-    if (!file.isEmpty()) {
-        edt_output_->setText(file);
-        cfg.SetLastOutputDir(QFileInfo(file).absolutePath());
+    QString start_dir = cfg.GetLastOutputDir().isEmpty()
+                            ? QDir::homePath()
+                            : cfg.GetLastOutputDir();
+    QString dir = QFileDialog::getExistingDirectory(this, "选择结果保存文件夹", start_dir,
+        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+    if (!dir.isEmpty()) {
+        edt_output_->setText(QDir::toNativeSeparators(dir));
+        cfg.SetLastOutputDir(dir);
     }
 }
 
+namespace {
+// 将输入文件名规范化成无重复后缀的「<basename>已结算.xlsx」
+// 同时兼容：用户在输出框里写的是文件夹 / 具体文件名 / 畸形扩展名
+QString ResolveOutputPath(const QString &input_file, const QString &output_text) {
+    QFileInfo inf(input_file);
+    QString base = inf.completeBaseName();
+
+    // 1. 先去掉 base 末尾已经存在的多种结算/结果后缀（防止：_结果_结果 / _运费结果_运费结果 等重复叠加）
+    //    按从长到短匹配，一次只剥一层（但用 while 循环最多剥 3 层防极端）
+    for (int iter = 0; iter < 3; ++iter) {
+        bool stripped = false;
+        static const QStringList tails = {
+            QStringLiteral("_运费结果_运费结果"),
+            QStringLiteral("_结果_结果"),
+            QStringLiteral("已结算已结算"),
+            QStringLiteral("_运费结果"),
+            QStringLiteral("_结果"),
+            QStringLiteral("已结算"),
+        };
+        for (const auto &t : tails) {
+            if (base.endsWith(t, Qt::CaseInsensitive)) {
+                base.chop(t.length());
+                stripped = true;
+                break;
+            }
+        }
+        if (!stripped) break;
+    }
+    QString default_name = base + QStringLiteral("已结算.xlsx");
+
+    QString text = output_text.trimmed();
+    if (text.isEmpty()) {
+        // 未指定：输出到输入文件同级目录
+        return QFileInfo(inf.absolutePath() + "/" + default_name).absoluteFilePath();
+    }
+
+    QFileInfo of(text);
+    if (of.isDir() || text.endsWith('/') || text.endsWith('\\')
+        || of.suffix().isEmpty() /* 没扩展名当文件夹 */) {
+        // 是文件夹
+        QString folder = of.absoluteFilePath();
+        if (folder.isEmpty()) folder = QDir(text).absolutePath();
+        return QFileInfo(folder + "/" + default_name).absoluteFilePath();
+    }
+
+    // 用户写了具体文件名：修正畸形扩展名 .xlsxx / .xlsxx / .xlxs -> .xlsx
+    QString suf = of.suffix().toLower();
+    static const QRegularExpression kBadXlsx("^x{1,}l{1,}s{1,}x{1,}$");
+    QString abs_path;
+    if (kBadXlsx.match(suf).hasMatch() && suf != "xlsx" && suf != "xls") {
+        QString fixed = of.absolutePath() + "/" + of.completeBaseName() + ".xlsx";
+        abs_path = QFileInfo(fixed).absoluteFilePath();
+    } else {
+        abs_path = of.absoluteFilePath();
+    }
+    return abs_path;
+}
+} // namespace
+
 void BatchCalcDialog::OnStartCalc() {
     QString input = edt_input_->text();
-    QString output = edt_output_->text();
-
     if (input.isEmpty() || !QFileInfo::exists(input)) {
         QMessageBox::warning(this, "提示", "请选择有效的输入文件");
         return;
     }
+    // 强制 input 为绝对路径
+    input = QFileInfo(input).absoluteFilePath();
 
-    // 如果用户没有选择输出路径，则自动生成: 输入同级目录/输入文件名_运费结果.xlsx
-    if (output.isEmpty()) {
-        QFileInfo fi(input);
-        QString out_dir = fi.absolutePath();
-        QString base = fi.completeBaseName();
-        // 默认用上次目录
-        auto &cfg = core::AppConfig::Instance();
-        if (!cfg.GetLastOutputDir().isEmpty()) {
-            out_dir = cfg.GetLastOutputDir();
-        }
-        output = QDir(out_dir).filePath(base + "_运费结果.xlsx");
-        edt_output_->setText(output);
-        cfg.SetLastOutputDir(out_dir);
-        qDebug() << "Auto-generated output path:" << output;
-    }
+    // 智能解析输出路径：支持 文件夹/文件名/空/畸形扩展名 四种输入
+    QString output = ResolveOutputPath(input, edt_output_->text());
+    edt_output_->setText(QDir::toNativeSeparators(output));
 
-    core::AppConfig::Instance().AddRecentFile(input);
+    auto &cfg = core::AppConfig::Instance();
+    cfg.SetLastOutputDir(QFileInfo(output).absolutePath());
+    cfg.AddRecentFile(input);
+    qDebug() << "Resolved output path:" << output;
 
     btn_start_->setEnabled(false);
     progress_->setValue(10);

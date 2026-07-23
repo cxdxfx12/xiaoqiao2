@@ -84,14 +84,39 @@ int main(int argc, char *argv[]) {
 
     if (inputs.isEmpty()) {
         qInfo() << "用法: batch_runner [-o 输出目录] 输入文件1 [输入文件2 ...]";
-        qInfo() << "示例: batch_runner -o /Users/cxd/帐单/结果 /Users/cxd/帐单/*.xlsx";
+        qInfo() << "示例: batch_runner -o /Users/cxd/帐单 /Users/cxd/帐单/*.xlsx";
+        qInfo() << "  输出文件名规则：<原文件名>已结算.xlsx（自动去重避免_结果_结果重复）";
         return 0;
     }
 
     if (out_dir.isEmpty()) {
-        out_dir = QFileInfo(inputs.first()).absolutePath() + "/小乔计算结果";
+        out_dir = QFileInfo(inputs.first()).absolutePath();
     }
     QDir().mkpath(out_dir);
+    out_dir = QFileInfo(out_dir).absoluteFilePath();
+
+    auto NormalizeBase = [](QString base) -> QString {
+        for (int iter = 0; iter < 3; ++iter) {
+            bool stripped = false;
+            static const QStringList tails = {
+                QStringLiteral("_运费结果_运费结果"),
+                QStringLiteral("_结果_结果"),
+                QStringLiteral("已结算已结算"),
+                QStringLiteral("_运费结果"),
+                QStringLiteral("_结果"),
+                QStringLiteral("已结算"),
+            };
+            for (const auto &t : tails) {
+                if (base.endsWith(t, Qt::CaseInsensitive)) {
+                    base.chop(t.length());
+                    stripped = true;
+                    break;
+                }
+            }
+            if (!stripped) break;
+        }
+        return base;
+    };
 
     qInfo() << "==== 批量计算开始 ====";
     qInfo() << "输出目录:" << out_dir;
@@ -103,7 +128,8 @@ int main(int argc, char *argv[]) {
         if (!fi.exists()) { qWarning() << "  [SKIP] 文件不存在:" << inp; continue; }
         qInfo() << "处理:" << fi.fileName();
         QString suf = fi.suffix().toLower();
-        QString out_name = fi.completeBaseName() + "_运费结果." + (suf == "csv" ? "csv" : (suf == "parquet" ? "parquet" : "xlsx"));
+        QString out_suf = (suf == "csv" ? "csv" : (suf == "parquet" ? "parquet" : "xlsx"));
+        QString out_name = NormalizeBase(fi.completeBaseName()) + QStringLiteral("已结算.") + out_suf;
         QString out = QDir(out_dir).filePath(out_name);
         if (ProcessOne(inp, out) == 0) total_ok++;
         else total_fail++;
