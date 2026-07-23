@@ -99,7 +99,14 @@ if(APPLE)
         MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
         MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.hbdxm.xiaoqiao"
+        MACOSX_BUNDLE_ICON_FILE "xiaoqiao.icns"
     )
+    set(APP_ICON_FILE "${CMAKE_SOURCE_DIR}/resources/icons/xiaoqiao.icns")
+    if(EXISTS ${APP_ICON_FILE})
+        set_source_files_properties(${APP_ICON_FILE} PROPERTIES
+            MACOSX_PACKAGE_LOCATION "Resources")
+        target_sources(xiaoqiao_freight PRIVATE ${APP_ICON_FILE})
+    endif()
 
     set(DEPLOY_SCRIPT ${CMAKE_SOURCE_DIR}/scripts/deploy_mac.sh)
     if(EXISTS ${DEPLOY_SCRIPT})
@@ -218,6 +225,16 @@ target_link_libraries(t7_test PRIVATE
 )
 if(APPLE)
     set_target_properties(t7_test PROPERTIES
+        MACOSX_BUNDLE OFF
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+endif()
+
+# Logo / App Icon 生成工具：输出 xiaoqiao.icns + png/logo_XX.png 到 resources/icons/
+add_executable(gen_icon tools/gen_icon/main.cpp)
+target_link_libraries(gen_icon PRIVATE Qt6::Core Qt6::Gui)
+if(APPLE)
+    set_target_properties(gen_icon PROPERTIES
         MACOSX_BUNDLE OFF
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )

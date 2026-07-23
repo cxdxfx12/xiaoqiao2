@@ -47,7 +47,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    freight::ui::IconManager::Instance();
+    freight::ui::IconManager &icons = freight::ui::IconManager::Instance();
+    app.setWindowIcon(icons.GetIcon("app_logo", freight::ui::IconCategory::LOGO,
+                      freight::ui::IconSize::SIZE_64));
 
     // 初始化授权系统
     freight::core::LicenseManager::Instance().Init();
