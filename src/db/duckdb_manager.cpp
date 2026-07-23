@@ -1,6 +1,7 @@
 #include "db/duckdb_manager.hpp"
 #include "core/app_config.hpp"
 #include <QDebug>
+#include <QDir>
 #include <QFileInfo>
 #include <QSqlDatabase>
 #include <QSqlQuery>
@@ -337,27 +338,45 @@ bool DuckDBManager::ExportToFile(const QString &table_name, const QString &file_
     try {
         auto con = CreateConnection();
         QFileInfo fi(file_path);
-        QString suffix = fi.suffix().toLower();
+        QString abs_path = fi.absoluteFilePath();
 
-        QString sql;
-        if (suffix == "csv") {
-            sql = QString("COPY %1 TO '%2' (FORMAT CSV, HEADER TRUE)")
-                .arg(table_name, file_path);
-        } else if (suffix == "parquet") {
-            sql = QString("COPY %1 TO '%2' (FORMAT PARQUET)")
-                .arg(table_name, file_path);
-        } else if (suffix == "xlsx" || suffix == "xls") {
-            // .xls 输出按 xlsx 格式（DuckDB xlsx 写在 Excel 里可正常打开）
-            sql = QString("COPY %1 TO '%2' (FORMAT xlsx, HEADER TRUE)")
-                .arg(table_name, file_path);
-        } else {
+        // 1. 保证父目录存在
+        QDir().mkpath(fi.absolutePath());
+        if (!QDir(fi.absolutePath()).exists()) {
+            qCritical() << "Export failed: cannot create parent dir:" << fi.absolutePath();
             return false;
         }
 
+        // 2. 路径中的单引号需要双写（DuckDB SQL 字符串标准转义），否则会 Parser syntax error
+        QString escaped_path = abs_path;
+        escaped_path.replace("'", "''");
+
+        QString suffix = fi.suffix().toLower();
+        QString sql;
+        if (suffix == "csv") {
+            sql = QString("COPY %1 TO '%2' (FORMAT CSV, HEADER TRUE)")
+                .arg(table_name, escaped_path);
+        } else if (suffix == "parquet") {
+            sql = QString("COPY %1 TO '%2' (FORMAT PARQUET)")
+                .arg(table_name, escaped_path);
+        } else if (suffix == "xlsx" || suffix == "xls") {
+            // .xls 输出按 xlsx 格式（DuckDB xlsx 写在 Excel 里可正常打开）
+            sql = QString("COPY %1 TO '%2' (FORMAT xlsx, HEADER TRUE)")
+                .arg(table_name, escaped_path);
+        } else {
+            qCritical() << "Export failed: unsupported suffix:" << suffix;
+            return false;
+        }
+
+        qDebug() << "ExportToFile:" << sql;
         con.Query(sql.toStdString());
+        if (!QFileInfo::exists(abs_path) || QFileInfo(abs_path).size() == 0) {
+            qCritical() << "Export failed: output file missing or empty:" << abs_path;
+            return false;
+        }
         return true;
     } catch (const std::exception &e) {
-        qCritical() << "Export failed:" << e.what();
+        qCritical() << "Export failed: table=" << table_name << "path=" << file_path << "err=" << e.what();
         return false;
     }
 }

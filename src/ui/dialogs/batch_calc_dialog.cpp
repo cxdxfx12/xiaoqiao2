@@ -436,9 +436,25 @@ void BatchCalcDialog::OnStartCalc() {
     QString input = edt_input_->text();
     QString output = edt_output_->text();
 
-    if (input.isEmpty() || output.isEmpty()) {
-        QMessageBox::warning(this, "提示", "请选择输入和输出文件");
+    if (input.isEmpty() || !QFileInfo::exists(input)) {
+        QMessageBox::warning(this, "提示", "请选择有效的输入文件");
         return;
+    }
+
+    // 如果用户没有选择输出路径，则自动生成: 输入同级目录/输入文件名_运费结果.xlsx
+    if (output.isEmpty()) {
+        QFileInfo fi(input);
+        QString out_dir = fi.absolutePath();
+        QString base = fi.completeBaseName();
+        // 默认用上次目录
+        auto &cfg = core::AppConfig::Instance();
+        if (!cfg.GetLastOutputDir().isEmpty()) {
+            out_dir = cfg.GetLastOutputDir();
+        }
+        output = QDir(out_dir).filePath(base + "_运费结果.xlsx");
+        edt_output_->setText(output);
+        cfg.SetLastOutputDir(out_dir);
+        qDebug() << "Auto-generated output path:" << output;
     }
 
     core::AppConfig::Instance().AddRecentFile(input);
@@ -571,8 +587,14 @@ void BatchCalcDialog::OnStartCalc() {
                     return ctx;
                 }
                 if (!db.ExportToFile(output_table, output)) {
-                    ctx.error_title = "失败";
-                    ctx.error_msg = "结果导出失败";
+                    ctx.error_title = "结果导出失败";
+                    QFileInfo of(output);
+                    ctx.error_msg = QString(
+                        "无法将计算结果写入文件，请检查：\n"
+                        "1. 目标路径是否可写（是否磁盘满/有权限）：\n   %1\n"
+                        "2. 输出路径中是否含特殊字符\n"
+                        "3. 文件是否被 Excel 占用，请关闭后重试"
+                    ).arg(QDir::toNativeSeparators(of.absoluteFilePath()));
                     return ctx;
                 }
 

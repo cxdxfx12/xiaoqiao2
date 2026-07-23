@@ -3,6 +3,7 @@
 #include "core/app_config.hpp"
 #include "db/duckdb_manager.hpp"
 #include <QDebug>
+#include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QVariantList>
@@ -252,7 +253,10 @@ bool CalcService::CalcFromFile(const QString &input_file,
 
         emit ProgressChanged(85);
         if (!dbm.ExportToFile(output_table, output_file)) {
-            emit CalcFinished(false, QStringLiteral("结果导出失败"));
+            QString native_path = QDir::toNativeSeparators(QFileInfo(output_file).absoluteFilePath());
+            emit CalcFinished(false,
+                QStringLiteral("结果导出失败\n路径：%1\n\n请检查：\n1. 输出目录是否可写\n2. 文件是否被 Excel/WPS 占用\n3. 磁盘是否已满")
+                    .arg(native_path));
             return false;
         }
 
