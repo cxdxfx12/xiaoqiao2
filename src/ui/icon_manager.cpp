@@ -76,6 +76,8 @@ QIcon IconManager::GenerateCardIcon(const QString &name, int size) {
         c1 = QColor("#909399"); c2 = QColor("#6d63c4");
     } else if (name == "history") {
         c1 = QColor("#67c23a"); c2 = QColor("#409eff");
+    } else if (name == "calc_detail" || name == "dashboard") {
+        c1 = QColor("#8e44ad"); c2 = QColor("#f39c12");
     } else {
         c1 = QColor("#409eff"); c2 = QColor("#67c23a");
     }
@@ -148,6 +150,28 @@ QIcon IconManager::GenerateCardIcon(const QString &name, int size) {
         p.setPen(QPen(QColor("#67c23a"), size*0.05));
         p.drawLine(cx, cy, cx, cy-s*0.5);
         p.drawLine(cx, cy, cx+s*0.4, cy-s*0.1);
+    } else if (name == "calc_detail" || name == "dashboard") {
+        p.setBrush(QColor(255,255,255,240));
+        p.setPen(Qt::NoPen);
+        p.drawRoundedRect(cx-s*0.7, cy-s*0.7, s*1.4, s*1.3, size*0.05, size*0.05);
+        p.setBrush(QColor("#8e44ad"));
+        p.drawRoundedRect(cx-s*0.5, cy+s*0.1, s*0.22, s*0.45, size*0.03, size*0.03);
+        p.setBrush(QColor("#409eff"));
+        p.drawRoundedRect(cx-s*0.18, cy-s*0.2, s*0.22, s*0.75, size*0.03, size*0.03);
+        p.setBrush(QColor("#f39c12"));
+        p.drawRoundedRect(cx+s*0.14, cy-s*0.45, s*0.22, s*1.0, size*0.03, size*0.03);
+        p.setPen(QPen(QColor("#e74c3c"), size*0.06));
+        p.setBrush(Qt::NoBrush);
+        QPolygonF line;
+        line << QPointF(cx-s*0.55, cy-s*0.35)
+             << QPointF(cx-s*0.25, cy-s*0.55)
+             << QPointF(cx+s*0.05, cy-s*0.1)
+             << QPointF(cx+s*0.35, cy-s*0.45)
+             << QPointF(cx+s*0.55, cy-s*0.6);
+        p.drawPolyline(line);
+        p.setBrush(QColor("#e74c3c"));
+        p.setPen(Qt::NoPen);
+        p.drawEllipse(cx+s*0.55-size*0.04, cy-s*0.6-size*0.04, size*0.08, size*0.08);
     }
 
     p.end();

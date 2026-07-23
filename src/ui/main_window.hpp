@@ -24,6 +24,7 @@ private slots:
     void OnBatchCalc();
     void OnCompare();
     void OnHistory();
+    void OnDashboard();
     void OnRuleSetting();
     void OnCustomerSetting();
     void OnSystemSetting();
@@ -53,12 +54,14 @@ private:
     QPushButton *btn_batch_calc_ = nullptr;
     QPushButton *btn_compare_ = nullptr;
     QPushButton *btn_history_ = nullptr;
+    QPushButton *btn_dashboard_ = nullptr;
 
     QFrame *setting_area_ = nullptr;
     QHBoxLayout *setting_layout_ = nullptr;
     QPushButton *btn_rule_setting_ = nullptr;
     QPushButton *btn_customer_setting_ = nullptr;
     QPushButton *btn_system_setting_ = nullptr;
+    QPushButton *btn_dashboard_setting_ = nullptr;
     QPushButton *btn_about_ = nullptr;
 
     QLabel *footer_label_ = nullptr;

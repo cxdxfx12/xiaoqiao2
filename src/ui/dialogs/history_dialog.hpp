@@ -6,6 +6,8 @@
 #include <QLabel>
 #include <QPushButton>
 
+namespace freight::ui { class TableSearchBox; }
+
 namespace freight::ui::dialogs {
 
 class HistoryDialog : public QDialog {
@@ -21,6 +23,7 @@ private slots:
     void OnCleanup();
     void OnOpenFile();
     void OnExport();
+    void OnRecalcSelected();
 
 private:
     void SetupUI();
@@ -36,7 +39,10 @@ private:
     QPushButton *btn_export_ = nullptr;
     QPushButton *btn_delete_ = nullptr;
     QPushButton *btn_clean_ = nullptr;
+    QPushButton *btn_recalc_ = nullptr;
     QPushButton *btn_close_ = nullptr;
+
+    TableSearchBox *search_box_ = nullptr;
 };
 
 } // namespace freight::ui::dialogs

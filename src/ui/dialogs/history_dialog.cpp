@@ -1,5 +1,7 @@
 #include "ui/dialogs/history_dialog.hpp"
 #include "ui/icon_manager.hpp"
+#include "ui/ux_helper.hpp"
+#include "ui/dialogs/batch_calc_dialog.hpp"
 #include "services/history_service.hpp"
 #include "core/app_config.hpp"
 #include <QVBoxLayout>
@@ -76,6 +78,11 @@ void HistoryDialog::SetupUI() {
     table_->setColumnWidth(5, 80);
     main_layout->addWidget(table_, 1);
 
+    // S1~S3 + S6 小甜点增强
+    UxHelper::InstallCopyMenu(table_);
+    UxHelper::InstallAutoResizeOnDblClick(table_);
+    search_box_ = UxHelper::InstallSearch(table_, this);
+
     // 统计
     lbl_stats_ = new QLabel("共 0 条记录 | 成功 0 条 | 失败 0 条");
     lbl_stats_->setStyleSheet("color: #909399; font-size: 12px;");
@@ -86,6 +93,9 @@ void HistoryDialog::SetupUI() {
     btn_open_ = new QPushButton(" 打开结果文件");
     btn_open_->setIcon(icons.ActionIcon("export"));
     btn_open_->setCursor(Qt::PointingHandCursor);
+    btn_recalc_ = new QPushButton(" 🔄 重算选中(S7)");
+    btn_recalc_->setToolTip("使用当前规则重新计算选中的历史任务");
+    btn_recalc_->setCursor(Qt::PointingHandCursor);
     btn_export_ = new QPushButton(" 导出Excel");
     btn_export_->setIcon(icons.ActionIcon("export"));
     btn_export_->setCursor(Qt::PointingHandCursor);
@@ -95,6 +105,7 @@ void HistoryDialog::SetupUI() {
     btn_clean_ = new QPushButton(" 清理历史");
     btn_clean_->setCursor(Qt::PointingHandCursor);
     btn_layout->addWidget(btn_open_);
+    btn_layout->addWidget(btn_recalc_);
     btn_layout->addWidget(btn_export_);
     btn_layout->addWidget(btn_delete_);
     btn_layout->addWidget(btn_clean_);
@@ -113,6 +124,7 @@ void HistoryDialog::SetupUI() {
     connect(btn_clean_, &QPushButton::clicked, this, &HistoryDialog::OnCleanup);
     connect(btn_open_, &QPushButton::clicked, this, &HistoryDialog::OnOpenFile);
     connect(btn_export_, &QPushButton::clicked, this, &HistoryDialog::OnExport);
+    connect(btn_recalc_, &QPushButton::clicked, this, &HistoryDialog::OnRecalcSelected);
     connect(table_, &QTableWidget::cellDoubleClicked, this, [this](int row, int) {
         if (row < 0) return;
         QString output_file = table_->item(row, 0)->data(Qt::UserRole).toString();
@@ -195,6 +207,7 @@ void HistoryDialog::LoadHistory() {
         auto *name_item = new QTableWidgetItem(r["task_name"].toString());
         name_item->setData(Qt::UserRole, r["output_file"].toString());
         name_item->setData(Qt::UserRole + 1, r["id"].toLongLong());
+        name_item->setData(Qt::UserRole + 2, r["input_file"].toString());
         table_->setItem(i, 0, name_item);
 
         table_->setItem(i, 1, new QTableWidgetItem(r["created_at"].toString()));
@@ -233,6 +246,11 @@ void HistoryDialog::LoadHistory() {
 
     lbl_stats_->setText(QString("共 %1 条记录 | 成功 %2 条 | 失败 %3 条")
         .arg(records.size()).arg(success_count).arg(fail_count));
+
+    // S6 金额染色
+    UxHelper::ApplyFeeColorToTable(table_, 3,
+        core::AppConfig::Instance().GetFeeLowThreshold(),
+        core::AppConfig::Instance().GetFeeHighThreshold());
 }
 
 void HistoryDialog::OnSearch() {
@@ -322,6 +340,41 @@ void HistoryDialog::OnExport() {
 
     QFile::copy(output_file, save_path);
     QMessageBox::information(this, "成功", "文件已导出到：" + save_path);
+}
+
+void HistoryDialog::OnRecalcSelected() {
+    int row = table_->currentRow();
+    if (row < 0) {
+        QMessageBox::information(this, "提示", "请先选择一条要重算的历史记录 (S7)");
+        return;
+    }
+    QString input_file = table_->item(row, 0)->data(Qt::UserRole + 2).toString();
+    if (input_file.isEmpty() || !QFileInfo::exists(input_file)) {
+        QMessageBox::warning(this, "提示",
+            "原输入文件不存在，无法重算。\n\n可能原因：文件已被移动或删除。\n"
+            "您可以在批量计算中重新选择文件进行计算。");
+        return;
+    }
+    accept();
+    QTimer::singleShot(50, this->parentWidget(), [this, input_file]() {
+        if (!parentWidget()) return;
+        BatchCalcDialog dlg(parentWidget());
+        dlg.setAttribute(Qt::WA_DeleteOnClose, false);
+        QMetaObject::invokeMethod(&dlg, [&dlg, input_file]() {
+            auto *edt = dlg.findChild<QLineEdit *>("edt_input_");
+            if (!edt) {
+                auto list = dlg.findChildren<QLineEdit *>();
+                for (auto *e : list) {
+                    if (e->placeholderText().contains("选择要计算") ||
+                        e->placeholderText().contains("输入文件")) {
+                        edt = e; break;
+                    }
+                }
+            }
+            if (edt) edt->setText(input_file);
+        }, Qt::QueuedConnection);
+        dlg.exec();
+    });
 }
 
 } // namespace freight::ui::dialogs

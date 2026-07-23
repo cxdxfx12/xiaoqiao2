@@ -9,7 +9,7 @@ set(CMAKE_AUTOUIC ON)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Sql Concurrent Network)
+find_package(Qt6 6.5 REQUIRED COMPONENTS Core Gui Widgets Sql Concurrent Network Charts PrintSupport)
 
 find_library(DUCKDB_LIBRARY duckdb REQUIRED)
 find_path(DUCKDB_INCLUDE_DIR duckdb.hpp REQUIRED)
@@ -31,10 +31,16 @@ set(PROJECT_SOURCES
     src/services/calc_service.cpp
     src/services/history_service.hpp
     src/services/history_service.cpp
+    src/services/dashboard_service.hpp
+    src/services/dashboard_service.cpp
+    src/services/template_recognizer.hpp
+    src/services/template_recognizer.cpp
     src/ui/main_window.hpp
     src/ui/main_window.cpp
     src/ui/icon_manager.hpp
     src/ui/icon_manager.cpp
+    src/ui/ux_helper.hpp
+    src/ui/ux_helper.cpp
     src/ui/dialogs/single_calc_dialog.hpp
     src/ui/dialogs/single_calc_dialog.cpp
     src/ui/dialogs/batch_calc_dialog.hpp
@@ -43,6 +49,10 @@ set(PROJECT_SOURCES
     src/ui/dialogs/rule_setting_dialog.cpp
     src/ui/dialogs/template_edit_dialog.hpp
     src/ui/dialogs/template_edit_dialog.cpp
+    src/ui/dialogs/courier_template_manager_dialog.hpp
+    src/ui/dialogs/courier_template_manager_dialog.cpp
+    src/ui/dialogs/courier_template_edit_dialog.hpp
+    src/ui/dialogs/courier_template_edit_dialog.cpp
     src/ui/dialogs/customer_setting_dialog.hpp
     src/ui/dialogs/customer_setting_dialog.cpp
     src/ui/dialogs/system_setting_dialog.hpp
@@ -55,6 +65,12 @@ set(PROJECT_SOURCES
     src/ui/dialogs/compare_dialog.cpp
     src/ui/dialogs/header_mapping_dialog.hpp
     src/ui/dialogs/header_mapping_dialog.cpp
+    src/ui/dialogs/fee_breakdown_dialog.hpp
+    src/ui/dialogs/fee_breakdown_dialog.cpp
+    src/ui/dialogs/dashboard_dialog.hpp
+    src/ui/dialogs/dashboard_dialog.cpp
+    src/ui/dialogs/diff_report_dialog.hpp
+    src/ui/dialogs/diff_report_dialog.cpp
     resources/resources.qrc
 )
 
@@ -72,6 +88,8 @@ target_link_libraries(xiaoqiao_freight PRIVATE
     Qt6::Sql
     Qt6::Concurrent
     Qt6::Network
+    Qt6::Charts
+    Qt6::PrintSupport
     ${DUCKDB_LIBRARY}
 )
 
@@ -161,6 +179,45 @@ target_link_libraries(batch_runner PRIVATE
 )
 if(APPLE)
     set_target_properties(batch_runner PROPERTIES
+        MACOSX_BUNDLE OFF
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+endif()
+
+# T7 功能7 Headless 接口测试
+add_executable(t7_test
+    tools/t7_test/main.cpp
+    src/core/app_config.hpp
+    src/core/app_config.cpp
+    src/core/freight_types.hpp
+    src/core/license_manager.hpp
+    src/core/license_manager.cpp
+    src/services/template_recognizer.hpp
+    src/services/template_recognizer.cpp
+    src/services/calc_service.hpp
+    src/services/calc_service.cpp
+    src/services/rule_service.hpp
+    src/services/rule_service.cpp
+    src/services/history_service.hpp
+    src/services/history_service.cpp
+    src/db/sqlite_rule_repository.hpp
+    src/db/sqlite_rule_repository.cpp
+    src/db/duckdb_manager.hpp
+    src/db/duckdb_manager.cpp
+)
+target_include_directories(t7_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${DUCKDB_INCLUDE_DIR}
+)
+target_link_libraries(t7_test PRIVATE
+    Qt6::Core
+    Qt6::Sql
+    Qt6::Concurrent
+    Qt6::Network
+    ${DUCKDB_LIBRARY}
+)
+if(APPLE)
+    set_target_properties(t7_test PROPERTIES
         MACOSX_BUNDLE OFF
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )

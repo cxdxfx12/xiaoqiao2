@@ -3,6 +3,7 @@
 #include <QDir>
 #include <QThread>
 #include <QSet>
+#include <QFileInfo>
 #include <algorithm>
 
 #ifdef Q_OS_MAC
@@ -62,6 +63,141 @@ static QMap<QString, QStringList> BuildDefaultMappingKeywords() {
     return m;
 }
 
+static QList<TemplateFingerprint> BuildBuiltinTemplates() {
+    QList<TemplateFingerprint> list;
+    auto markBuiltin = [](TemplateFingerprint &t) { t.is_builtin = true; t.enabled = true; return t; };
+
+    {
+        TemplateFingerprint t;
+        t.template_id = "zto_standard";
+        t.display_name = "中通快递-标准模板";
+        t.courier_name = "中通";
+        t.required_keywords = {"中通", "ZTO", "网点名称", "派件员"};
+        t.column_mapping = {
+            {"运单号", "order_id"}, {"订单号", "order_id"},
+            {"目的省份", "dest_province"}, {"省份", "dest_province"},
+            {"目的城市", "dest_city"}, {"城市", "dest_city"},
+            {"实际重量", "weight"}, {"重量", "weight"}, {"实重", "weight"},
+            {"体积重量", "vol_weight"}, {"体积重", "vol_weight"},
+            {"客户编号", "customer_id"}, {"客户代码", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    {
+        TemplateFingerprint t;
+        t.template_id = "yto_standard";
+        t.display_name = "圆通速递-标准模板";
+        t.courier_name = "圆通";
+        t.required_keywords = {"圆通", "YTO", "业务员"};
+        t.column_mapping = {
+            {"运单号", "order_id"}, {"快递单号", "order_id"},
+            {"收件省", "dest_province"}, {"目的地省", "dest_province"},
+            {"收件市", "dest_city"}, {"目的地市", "dest_city"},
+            {"重量", "weight"}, {"实际重量", "weight"},
+            {"体积重", "vol_weight"}, {"材积", "vol_weight"},
+            {"客户编号", "customer_id"}, {"客户", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    {
+        TemplateFingerprint t;
+        t.template_id = "yd_standard";
+        t.display_name = "韵达速递-标准模板";
+        t.courier_name = "韵达";
+        t.required_keywords = {"韵达", "YUNDA", "服务站"};
+        t.column_mapping = {
+            {"单号", "order_id"}, {"运单号", "order_id"},
+            {"到达省份", "dest_province"}, {"省", "dest_province"},
+            {"到达城市", "dest_city"}, {"市", "dest_city"},
+            {"货物重量", "weight"}, {"重", "weight"},
+            {"材积重", "vol_weight"}, {"抛重", "vol_weight"},
+            {"网点编号", "customer_id"}, {"网点", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    {
+        TemplateFingerprint t;
+        t.template_id = "sto_standard";
+        t.display_name = "申通快递-标准模板";
+        t.courier_name = "申通";
+        t.required_keywords = {"申通", "STO", "派件网点"};
+        t.column_mapping = {
+            {"运单编号", "order_id"}, {"申通单号", "order_id"},
+            {"寄达省份", "dest_province"}, {"收件省份", "dest_province"},
+            {"寄达城市", "dest_city"}, {"收件城市", "dest_city"},
+            {"结算重量", "weight"}, {"计费重量", "weight"},
+            {"体积重量", "vol_weight"},
+            {"客户名称", "customer_id"}, {"客户ID", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    {
+        TemplateFingerprint t;
+        t.template_id = "jitu_standard";
+        t.display_name = "极兔速递-标准模板";
+        t.courier_name = "极兔";
+        t.required_keywords = {"极兔", "J&T", "JT", "派件员编码"};
+        t.column_mapping = {
+            {"单号", "order_id"}, {"面单号", "order_id"},
+            {"收货省", "dest_province"}, {"到件省", "dest_province"},
+            {"收货市", "dest_city"}, {"到件市", "dest_city"},
+            {"KG", "weight"}, {"kg", "weight"}, {"重量", "weight"},
+            {"体积重", "vol_weight"},
+            {"商家编号", "customer_id"}, {"商家", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    {
+        TemplateFingerprint t;
+        t.template_id = "ems_standard";
+        t.display_name = "邮政EMS-标准模板";
+        t.courier_name = "邮政";
+        t.required_keywords = {"邮政", "EMS", "邮区", "邮件号码"};
+        t.column_mapping = {
+            {"邮件号码", "order_id"}, {"邮件编号", "order_id"},
+            {"省名", "dest_province"}, {"寄达省", "dest_province"},
+            {"市名", "dest_city"}, {"寄达市", "dest_city"},
+            {"重量", "weight"}, {"实际重量", "weight"},
+            {"体积重量", "vol_weight"},
+            {"客户编号", "customer_id"}, {"客户代码", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    {
+        TemplateFingerprint t;
+        t.template_id = "sf_standard";
+        t.display_name = "顺丰速运-标准模板";
+        t.courier_name = "顺丰";
+        t.required_keywords = {"顺丰", "SF", "顺丰速运", "收派员"};
+        t.column_mapping = {
+            {"顺丰单号", "order_id"}, {"运单号", "order_id"},
+            {"目的地省", "dest_province"}, {"目的地省份", "dest_province"},
+            {"目的地市", "dest_city"}, {"目的地城市", "dest_city"},
+            {"计费重量", "weight"}, {"charge_weight", "weight"},
+            {"体积重量", "vol_weight"}, {"volumetric", "vol_weight"},
+            {"月结卡号", "customer_id"}, {"月结账号", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    {
+        TemplateFingerprint t;
+        t.template_id = "deppon_standard";
+        t.display_name = "德邦快递-标准模板";
+        t.courier_name = "德邦";
+        t.required_keywords = {"德邦", "DEPPON", "接货仓", "外场"};
+        t.column_mapping = {
+            {"运单号", "order_id"}, {"德邦单号", "order_id"},
+            {"目的省份", "dest_province"}, {"目的站省", "dest_province"},
+            {"目的城市", "dest_city"}, {"目的站市", "dest_city"},
+            {"毛重", "weight"}, {"实际重量", "weight"},
+            {"材积", "vol_weight"}, {"材积重", "vol_weight"},
+            {"客户代码", "customer_id"}, {"客户编号", "customer_id"}
+        };
+        list << markBuiltin(t);
+    }
+    return list;
+}
+
 const QMap<QString, QString>& AppConfig::StandardColumnChinese() {
     static const auto m = BuildStandardColumnChinese();
     return m;
@@ -96,6 +232,11 @@ const QMap<QString, QStringList>& AppConfig::DefaultMappingKeywords() {
     return m;
 }
 
+const QList<TemplateFingerprint>& AppConfig::BuiltinTemplateFingerprints() {
+    static const auto list = BuildBuiltinTemplates();
+    return list;
+}
+
 bool AppConfig::Init() {
     QString data_dir = QStandardPaths::writableLocation(
         QStandardPaths::AppDataLocation);
@@ -108,6 +249,9 @@ bool AppConfig::Init() {
     settings_ = std::make_unique<QSettings>(data_dir_ + "/config.ini", QSettings::IniFormat);
     LoadPerformanceSettings();
     LoadMappingKeywords();
+    LoadRecentFiles();
+    LoadFeeThresholds();
+    LoadCustomTemplates();
     return true;
 }
 
@@ -259,6 +403,206 @@ void AppConfig::SaveMappingKeywords() {
             settings_->setValue("standard", it.key());
             settings_->setValue("keyword", kw);
         }
+    }
+    settings_->endArray();
+    settings_->sync();
+}
+
+// ========== S5 记住常用目录 ==========
+QString AppConfig::GetLastInputDir() const {
+    if (!last_input_dir_.isEmpty() && QDir(last_input_dir_).exists()) return last_input_dir_;
+    return QDir::homePath();
+}
+void AppConfig::SetLastInputDir(const QString &dir) {
+    last_input_dir_ = dir;
+    if (settings_) {
+        settings_->setValue("paths/last_input_dir", dir);
+        settings_->sync();
+    }
+}
+QString AppConfig::GetLastOutputDir() const {
+    if (!last_output_dir_.isEmpty() && QDir(last_output_dir_).exists()) return last_output_dir_;
+    return GetResultsDir();
+}
+void AppConfig::SetLastOutputDir(const QString &dir) {
+    last_output_dir_ = dir;
+    if (settings_) {
+        settings_->setValue("paths/last_output_dir", dir);
+        settings_->sync();
+    }
+}
+QStringList AppConfig::GetRecentFiles() const {
+    return recent_files_;
+}
+void AppConfig::AddRecentFile(const QString &file) {
+    if (file.isEmpty()) return;
+    recent_files_.removeAll(file);
+    recent_files_.prepend(file);
+    while (recent_files_.size() > 10) recent_files_.removeLast();
+    SaveRecentFiles();
+}
+void AppConfig::ClearRecentFiles() {
+    recent_files_.clear();
+    SaveRecentFiles();
+}
+void AppConfig::LoadRecentFiles() {
+    if (!settings_) return;
+    last_input_dir_ = settings_->value("paths/last_input_dir", "").toString();
+    last_output_dir_ = settings_->value("paths/last_output_dir", "").toString();
+    int size = settings_->beginReadArray("recent_files");
+    for (int i = 0; i < size; ++i) {
+        settings_->setArrayIndex(i);
+        QString f = settings_->value("file").toString();
+        if (QFileInfo::exists(f)) recent_files_ << f;
+    }
+    settings_->endArray();
+}
+void AppConfig::SaveRecentFiles() {
+    if (!settings_) return;
+    settings_->beginWriteArray("recent_files");
+    for (int i = 0; i < recent_files_.size(); ++i) {
+        settings_->setArrayIndex(i);
+        settings_->setValue("file", recent_files_.at(i));
+    }
+    settings_->endArray();
+    settings_->sync();
+}
+
+// ========== S6 金额染色阈值 ==========
+double AppConfig::GetFeeLowThreshold() const { return fee_low_threshold_; }
+void AppConfig::SetFeeLowThreshold(double v) {
+    fee_low_threshold_ = v;
+    SaveFeeThresholds();
+}
+double AppConfig::GetFeeHighThreshold() const { return fee_high_threshold_; }
+void AppConfig::SetFeeHighThreshold(double v) {
+    fee_high_threshold_ = v;
+    SaveFeeThresholds();
+}
+void AppConfig::LoadFeeThresholds() {
+    if (!settings_) return;
+    fee_low_threshold_ = settings_->value("fee_thresholds/low", 5.0).toDouble();
+    fee_high_threshold_ = settings_->value("fee_thresholds/high", 20.0).toDouble();
+}
+void AppConfig::SaveFeeThresholds() {
+    if (!settings_) return;
+    settings_->setValue("fee_thresholds/low", fee_low_threshold_);
+    settings_->setValue("fee_thresholds/high", fee_high_threshold_);
+    settings_->sync();
+}
+
+// ========== 功能7 模板指纹库 ==========
+QList<TemplateFingerprint> AppConfig::GetCustomTemplateFingerprints() const {
+    return custom_templates_;
+}
+void AppConfig::AddCustomTemplateFingerprint(const TemplateFingerprint &fp) {
+    for (int i = custom_templates_.size() - 1; i >= 0; --i) {
+        if (custom_templates_[i].template_id == fp.template_id) {
+            custom_templates_.removeAt(i);
+        }
+    }
+    custom_templates_ << fp;
+    SaveCustomTemplates();
+}
+void AppConfig::RemoveCustomTemplateFingerprint(const QString &template_id) {
+    for (int i = custom_templates_.size() - 1; i >= 0; --i) {
+        if (custom_templates_[i].template_id == template_id) {
+            custom_templates_.removeAt(i);
+        }
+    }
+    disabled_template_ids_.remove(template_id);
+    SaveCustomTemplates();
+}
+void AppConfig::UpdateCustomTemplateFingerprint(const TemplateFingerprint &fp) {
+    for (int i = 0; i < custom_templates_.size(); ++i) {
+        if (custom_templates_[i].template_id == fp.template_id) {
+            custom_templates_[i] = fp;
+            SaveCustomTemplates();
+            return;
+        }
+    }
+    AddCustomTemplateFingerprint(fp);
+}
+QList<TemplateFingerprint> AppConfig::GetAllTemplateFingerprints(bool enabled_only) const {
+    QList<TemplateFingerprint> result = BuiltinTemplateFingerprints();
+    for (auto &t : result) {
+        t.enabled = !disabled_template_ids_.contains(t.template_id);
+    }
+    for (auto t : custom_templates_) {
+        t.enabled = !disabled_template_ids_.contains(t.template_id);
+        result.append(t);
+    }
+    if (enabled_only) {
+        QList<TemplateFingerprint> filtered;
+        for (const auto &t : result) if (t.enabled) filtered << t;
+        return filtered;
+    }
+    return result;
+}
+bool AppConfig::IsTemplateEnabled(const QString &template_id) const {
+    return !disabled_template_ids_.contains(template_id);
+}
+void AppConfig::SetTemplateEnabled(const QString &template_id, bool enabled) {
+    if (enabled) disabled_template_ids_.remove(template_id);
+    else disabled_template_ids_.insert(template_id);
+    SaveCustomTemplates();
+}
+bool AppConfig::GetTemplateAutoDetectGlobal() const {
+    return template_auto_detect_global_;
+}
+void AppConfig::SetTemplateAutoDetectGlobal(bool enabled) {
+    template_auto_detect_global_ = enabled;
+    SaveCustomTemplates();
+}
+void AppConfig::LoadCustomTemplates() {
+    if (!settings_) return;
+    custom_templates_.clear();
+    disabled_template_ids_.clear();
+    template_auto_detect_global_ = settings_->value("templates/auto_detect_global", true).toBool();
+    QStringList disabled = settings_->value("templates/disabled_ids", QStringList()).toStringList();
+    for (const auto &id : disabled) disabled_template_ids_.insert(id);
+
+    int size = settings_->beginReadArray("custom_templates");
+    for (int i = 0; i < size; ++i) {
+        settings_->setArrayIndex(i);
+        TemplateFingerprint fp;
+        fp.template_id = settings_->value("template_id").toString();
+        fp.display_name = settings_->value("display_name").toString();
+        fp.courier_name = settings_->value("courier_name").toString();
+        fp.required_keywords = settings_->value("keywords").toStringList();
+        fp.enabled = settings_->value("enabled", true).toBool();
+        fp.is_builtin = false;
+        QString mapping_str = settings_->value("mapping").toString();
+        QStringList pairs = mapping_str.split("||", Qt::SkipEmptyParts);
+        for (const auto &p : pairs) {
+            QStringList kv = p.split("=>", Qt::SkipEmptyParts);
+            if (kv.size() == 2) fp.column_mapping[kv[0]] = kv[1];
+        }
+        if (!fp.template_id.isEmpty()) custom_templates_ << fp;
+    }
+    settings_->endArray();
+}
+void AppConfig::SaveCustomTemplates() {
+    if (!settings_) return;
+    QStringList disabled;
+    for (const auto &id : disabled_template_ids_) disabled << id;
+    settings_->setValue("templates/auto_detect_global", template_auto_detect_global_);
+    settings_->setValue("templates/disabled_ids", disabled);
+
+    settings_->beginWriteArray("custom_templates");
+    for (int i = 0; i < custom_templates_.size(); ++i) {
+        settings_->setArrayIndex(i);
+        const auto &fp = custom_templates_[i];
+        settings_->setValue("template_id", fp.template_id);
+        settings_->setValue("display_name", fp.display_name);
+        settings_->setValue("courier_name", fp.courier_name);
+        settings_->setValue("keywords", fp.required_keywords);
+        settings_->setValue("enabled", fp.enabled);
+        QStringList pairs;
+        for (auto it = fp.column_mapping.begin(); it != fp.column_mapping.end(); ++it) {
+            pairs << it.key() + "=>" + it.value();
+        }
+        settings_->setValue("mapping", pairs.join("||"));
     }
     settings_->endArray();
     settings_->sync();
