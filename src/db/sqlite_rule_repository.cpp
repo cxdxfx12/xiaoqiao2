@@ -135,8 +135,69 @@ bool SqliteRuleRepository::Init() {
         }
     }
 
+    // ============================================================
+    // Schema 12→13 全局模板迁移：
+    // 早期 fuel_surcharge / remote_areas 只绑定到 zto_standard，
+    // 新版代码支持 template_id='*' 代表全局（所有模板通用），
+    // 但存量老用户数据仍然全是 zto_standard，导致切客户模板
+    // （蜜丝婷/珀莱雅专属报价）时 IN(当前模板, '*') 查不到记录
+    // → 运费计算漏 1 元地区加价 / 燃油 %。
+    // 迁移策略：
+    //   1. remote_areas：对每个 (province,city,district) 组合，
+    //      若 template_id='*' 不存在，就把 zto_standard 的记录
+    //      INSERT OR IGNORE 为 *=全局版本，保留 zto_standard
+    //      原记录（不删，怕用户确实要在中通模板差异化）。金额相同时
+    //      查询 UNION IN(当前,*) 会按模板优先级各加一次，通常
+    //      用户会手动删除 zto_standard 多余那条，不删也能接受。
+    //   2. fuel_surcharge：同理，每个 effective_date，若 *=全局
+    //      不存在就把 zto_standard 的 rate 复制到 *=全局。
+    // ============================================================
+    if (current_version >= 12 && current_version < 13) {
+        qInfo() << "[data-fix] Schema 12→13: 升级 zto_standard 绑定的 remote/fuel 记录为全局 * 生效模板";
+        {
+            QSqlQuery qmig(db_);
+            qmig.prepare(R"SQL(
+                INSERT OR IGNORE INTO remote_areas
+                    (template_id, province, city, district, surcharge, is_active)
+                SELECT '*', province, city, district, surcharge, is_active
+                FROM remote_areas AS src
+                WHERE src.template_id = 'zto_standard'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM remote_areas AS t
+                      WHERE t.template_id = '*'
+                        AND COALESCE(t.province, '') = COALESCE(src.province, '')
+                        AND COALESCE(t.city, '')     = COALESCE(src.city, '')
+                        AND COALESCE(t.district, '') = COALESCE(src.district, '')
+                  )
+            )SQL");
+            if (!qmig.exec())
+                qCritical() << "remote_areas migrate failed:" << qmig.lastError().text();
+            else
+                qInfo() << "  remote_areas 迁移" << qmig.numRowsAffected() << "行 → 模板=*";
+        }
+        {
+            QSqlQuery qmig(db_);
+            qmig.prepare(R"SQL(
+                INSERT OR IGNORE INTO fuel_surcharge
+                    (template_id, effective_date, rate, is_active)
+                SELECT '*', effective_date, rate, is_active
+                FROM fuel_surcharge AS src
+                WHERE src.template_id = 'zto_standard'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM fuel_surcharge AS t
+                      WHERE t.template_id = '*'
+                        AND t.effective_date = src.effective_date
+                  )
+            )SQL");
+            if (!qmig.exec())
+                qCritical() << "fuel_surcharge migrate failed:" << qmig.lastError().text();
+            else
+                qInfo() << "  fuel_surcharge 迁移" << qmig.numRowsAffected() << "行 → 模板=*";
+        }
+    }
+
     // 更新 schema 版本
-    int new_version = 12;
+    int new_version = 13;
     if (current_version < new_version) {
         vq.exec("DELETE FROM schema_version");
         vq.prepare("INSERT INTO schema_version VALUES (?)");
@@ -416,7 +477,7 @@ bool SqliteRuleRepository::CreateDefaultSurcharges() {
                 "global", "percentage", 0.10, 5,
                 "旺季运费上浮10%（暂未启用日期限制）");
 
-    QString tpl_id = "zto_standard";
+    QString tpl_id = "*";
 
     q.prepare("INSERT OR IGNORE INTO fuel_surcharge (template_id, effective_date, rate, is_active) VALUES (?,?,?,1)");
     QList<QPair<QString, double>> fuel_list = {

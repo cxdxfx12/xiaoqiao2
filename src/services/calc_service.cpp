@@ -93,23 +93,54 @@ base_fee_calc AS (
 fuel_surcharge_calc AS (
     SELECT
         bfc.base_fee,
-        COALESCE(fs.rate, 0) * bfc.base_fee AS fuel_surcharge
+        COALESCE((
+            SELECT fs.rate
+            FROM fuel_surcharge fs
+            WHERE fs.template_id = '%1'
+              AND fs.is_active = 1
+              AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
+                                         WHERE template_id = '%1'
+                                           AND is_active = 1
+                                           AND effective_date <= CURRENT_DATE)
+            LIMIT 1
+        ), (
+            SELECT fs.rate
+            FROM fuel_surcharge fs
+            WHERE fs.template_id = '*'
+              AND fs.is_active = 1
+              AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
+                                         WHERE template_id = '*'
+                                           AND is_active = 1
+                                           AND effective_date <= CURRENT_DATE)
+            LIMIT 1
+        ), 0) * bfc.base_fee AS fuel_surcharge
     FROM base_fee_calc bfc
-    LEFT JOIN fuel_surcharge fs
-        ON fs.template_id IN ('%1', '*')
-       AND fs.is_active = 1
-       AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
-                                 WHERE template_id IN ('%1', '*')
-                                   AND is_active = 1
-                                   AND effective_date <= CURRENT_DATE)
 ),
 remote_area_calc AS (
     SELECT
         fsc.*,
-        COALESCE((
+        COALESCE(NULLIF((
             SELECT SUM(ra.surcharge)
             FROM remote_areas ra
-            WHERE ra.template_id IN ('%1', '*')
+            WHERE ra.template_id = '%1'
+              AND ra.is_active = 1
+              AND (
+                  (ra.province IS NOT NULL AND ra.province <> ''
+                   AND REGEXP_REPLACE(ra.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2'
+                   AND (ra.city IS NULL OR ra.city = ''
+                        OR REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                           = REGEXP_REPLACE('%4', '(市|区|县|旗|自治县|林区)$', ''))
+                   AND (ra.district IS NULL OR ra.district = ''))
+                  OR
+                  (ra.city IS NOT NULL AND ra.city <> ''
+                   AND REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                       = REGEXP_REPLACE('%4', '(市|区|县|旗|自治县|林区)$', '')
+                   AND (ra.district IS NULL OR ra.district = ''))
+              )
+        ), 0), (
+            SELECT SUM(ra.surcharge)
+            FROM remote_areas ra
+            WHERE ra.template_id = '*'
               AND ra.is_active = 1
               AND (
                   (ra.province IS NOT NULL AND ra.province <> ''
@@ -373,23 +404,55 @@ base_fee_calc AS (
 fuel_surcharge_calc AS (
     SELECT
         bfc.*,
-        COALESCE(fs.rate, 0) * bfc.base_fee AS fuel_surcharge
+        COALESCE((
+            SELECT fs.rate
+            FROM fuel_surcharge fs
+            WHERE fs.template_id = bfc.template_id
+              AND fs.is_active = 1
+              AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
+                                         WHERE template_id = bfc.template_id
+                                           AND is_active = 1
+                                           AND effective_date <= CURRENT_DATE)
+            LIMIT 1
+        ), (
+            SELECT fs.rate
+            FROM fuel_surcharge fs
+            WHERE fs.template_id = '*'
+              AND fs.is_active = 1
+              AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
+                                         WHERE template_id = '*'
+                                           AND is_active = 1
+                                           AND effective_date <= CURRENT_DATE)
+            LIMIT 1
+        ), 0) * bfc.base_fee AS fuel_surcharge
     FROM base_fee_calc bfc
-    LEFT JOIN fuel_surcharge fs
-        ON fs.template_id IN (bfc.template_id, '*')
-       AND fs.is_active = 1
-       AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
-                                 WHERE template_id IN (bfc.template_id, '*')
-                                   AND is_active = 1
-                                   AND effective_date <= CURRENT_DATE)
 ),
 remote_area_calc AS (
     SELECT
         fsc.*,
-        COALESCE((
+        COALESCE(NULLIF((
             SELECT SUM(ra.surcharge)
             FROM remote_areas ra
-            WHERE ra.template_id IN (fsc.template_id, '*')
+            WHERE ra.template_id = fsc.template_id
+              AND ra.is_active = 1
+              AND (
+                  (ra.province IS NOT NULL AND ra.province <> ''
+                   AND REGEXP_REPLACE(ra.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                       = REGEXP_REPLACE(fsc.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                   AND (ra.city IS NULL OR ra.city = ''
+                        OR REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                           = REGEXP_REPLACE(fsc.dest_city, '(市|区|县|旗|自治县|林区)$', ''))
+                   AND (ra.district IS NULL OR ra.district = ''))
+                  OR
+                  (ra.city IS NOT NULL AND ra.city <> ''
+                   AND REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                       = REGEXP_REPLACE(fsc.dest_city, '(市|区|县|旗|自治县|林区)$', '')
+                   AND (ra.district IS NULL OR ra.district = ''))
+              )
+        ), 0), (
+            SELECT SUM(ra.surcharge)
+            FROM remote_areas ra
+            WHERE ra.template_id = '*'
               AND ra.is_active = 1
               AND (
                   (ra.province IS NOT NULL AND ra.province <> ''
