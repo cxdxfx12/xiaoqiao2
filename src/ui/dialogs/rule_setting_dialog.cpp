@@ -492,6 +492,8 @@ void RuleSettingDialog::LoadData() {
             amount_text = "¥ " + QString::number(s["amount"].toDouble(), 'f', 2);
         } else if (type == "per_weight") {
             amount_text = "¥ " + QString::number(s["amount"].toDouble(), 'f', 2) + "/kg";
+        } else if (type == "per_volume") {
+            amount_text = "¥ " + QString::number(s["amount"].toDouble(), 'f', 2) + "/kg 体积重";
         } else {
             amount_text = QString::number(s["amount"].toDouble(), 'f', 2);
         }
@@ -564,7 +566,6 @@ void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
 
     auto *scope_combo = new QComboBox();
     scope_combo->addItem("全局", "global");
-    scope_combo->addItem("模板级", "template");
     scope_combo->addItem("省份级", "province");
     scope_combo->addItem("客户级", "customer");
 
@@ -572,6 +573,7 @@ void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
     type_combo->addItem("固定加价(元)", "fixed");
     type_combo->addItem("比例加价(%)", "percentage");
     type_combo->addItem("按重量(元/kg)", "per_weight");
+    type_combo->addItem("按体积(元/kg 体积重)", "per_volume");
 
     auto *amount_spin = new QDoubleSpinBox();
     amount_spin->setRange(0, 99999);

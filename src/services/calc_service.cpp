@@ -142,9 +142,9 @@ strategy_surcharge_calc AS (
             LEFT JOIN surcharge_customers sc ON sc.strategy_id = s.strategy_id
             LEFT JOIN surcharge_date_ranges sd ON sd.strategy_id = s.strategy_id
             WHERE s.is_active = 1
-              AND s.template_id = '%1'
+              AND (s.strategy_scope IN ('global', 'template') OR s.template_id = '%1')
               AND (
-                  s.strategy_scope = 'global'
+                  s.strategy_scope IN ('global', 'template')
                   OR (s.strategy_scope = 'province'
                       AND REGEXP_REPLACE(sp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2')
                   OR (s.strategy_scope = 'customer' AND sc.customer_id = '%5')
@@ -420,9 +420,9 @@ strategy_surcharge_calc AS (
             LEFT JOIN surcharge_customers sc ON sc.strategy_id = s.strategy_id
             LEFT JOIN surcharge_date_ranges sd ON sd.strategy_id = s.strategy_id
             WHERE s.is_active = 1
-              AND s.template_id = rac.template_id
+              AND (s.strategy_scope IN ('global', 'template') OR s.template_id = rac.template_id)
               AND (
-                  s.strategy_scope = 'global'
+                  s.strategy_scope IN ('global', 'template')
                   OR (s.strategy_scope = 'province'
                       AND REGEXP_REPLACE(sp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
                         = REGEXP_REPLACE(rac.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', ''))
