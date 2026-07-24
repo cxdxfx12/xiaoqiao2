@@ -100,8 +100,43 @@ bool SqliteRuleRepository::Init() {
         }
     }
 
+    // ============================================================
+    // Schema 11→12 数据一致性迁移：
+    // 早期 AddCustomer 创建完『cust_{customer_id}』专属报价模板后，
+    // 忘记 UPDATE customers.default_template = tpl_id，导致批量结算
+    // COALESCE(c.default_template, 'zto_standard') 全回退到中通标准，
+    // 燃油/加价策略/地区加价全部按中通而不是客户专属算。
+    // 这里自动回填：template_id = 'cust_' + customer_id，且模板存在就回填。
+    // ============================================================
+    {
+        QSqlQuery qsel(db_);
+        qsel.exec("SELECT customer_id FROM customers WHERE default_template IS NULL OR default_template = ''");
+        QVariantList custs_to_fix;
+        while (qsel.next()) custs_to_fix << qsel.value(0);
+
+        if (!custs_to_fix.isEmpty()) {
+            qInfo() << "[data-fix] 检测到" << custs_to_fix.size() << "条 customers.default_template 空记录，尝试按 cust_{id} 匹配专属模板回填";
+            QSqlQuery qexists(db_);
+            QSqlQuery qupdate(db_);
+            qexists.prepare("SELECT 1 FROM freight_templates WHERE template_id = ? LIMIT 1");
+            qupdate.prepare("UPDATE customers SET default_template = ?, updated_at = CURRENT_TIMESTAMP WHERE customer_id = ?");
+            int fixed = 0;
+            for (const auto &cidv : custs_to_fix) {
+                QString cid = cidv.toString();
+                QString tpl_id = "cust_" + cid;
+                qexists.addBindValue(tpl_id);
+                if (qexists.exec() && qexists.next()) {
+                    qupdate.addBindValue(tpl_id);
+                    qupdate.addBindValue(cid);
+                    if (qupdate.exec()) fixed++;
+                }
+            }
+            qInfo() << "[data-fix] 成功回填" << fixed << "条 customers.default_template";
+        }
+    }
+
     // 更新 schema 版本
-    int new_version = 11;
+    int new_version = 12;
     if (current_version < new_version) {
         vq.exec("DELETE FROM schema_version");
         vq.prepare("INSERT INTO schema_version VALUES (?)");
@@ -856,6 +891,19 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
     q.prepare("INSERT INTO fuel_surcharge (template_id, effective_date, rate) VALUES (?,?,?)");
     q.addBindValue(tpl_id); q.addBindValue("2026-01-01"); q.addBindValue(0.0);
     q.exec();
+
+    // ============================================================
+    // Bug fix: 创建完客户专属报价表后，把 default_template 回写到 customers
+    // 否则批量结算 COALESCE(c.default_template, 'zto_standard') 会回退到中通标准，
+    // 燃油/区域加价/加价策略 全部按中通算而不是客户专属算
+    // ============================================================
+    QSqlQuery q_upd(db_);
+    q_upd.prepare("UPDATE customers SET default_template = ?, updated_at = CURRENT_TIMESTAMP WHERE customer_id = ?");
+    q_upd.addBindValue(tpl_id);
+    q_upd.addBindValue(cust_id);
+    if (!q_upd.exec()) {
+        qWarning() << "[SqliteRuleRepository::AddCustomer] 回写 default_template 失败:" << q_upd.lastError().text();
+    }
 
     return true;
 }

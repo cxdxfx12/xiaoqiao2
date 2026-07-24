@@ -20,6 +20,7 @@ public:
 private slots:
     void OnCalc();
     void OnClear();
+    void OnCustomerTextChanged(const QString &text);
 
 private:
     void SetupUI();
