@@ -12,7 +12,15 @@
 #include <QJsonObject>
 #include <QByteArray>
 #include <QRandomGenerator>
+#include <QProcess>
+#include <QSysInfo>
+#include <QRegularExpression>
 #include <algorithm>
+
+#if defined(Q_OS_WIN)
+#  include <windows.h>
+#  pragma comment(lib, "version.lib")
+#endif
 
 namespace freight::core {
 
@@ -24,6 +32,162 @@ constexpr const char kSeg2[] = "Freight2026";
 constexpr const char kSeg3[] = "@#$";
 constexpr const char kSeg4[] = "SecretKey";
 constexpr const char kSeg5[] = "888";
+
+// 跨平台执行命令获取单行输出，失败返回空
+QString RunCmd(const QString &program, const QStringList &args, int timeout_ms = 3000) {
+    QProcess proc;
+    proc.start(program, args);
+    if (!proc.waitForFinished(timeout_ms)) return QString();
+    if (proc.exitCode() != 0) return QString();
+    return QString::fromLocal8Bit(proc.readAllStandardOutput()).trimmed();
+}
+
+#if defined(Q_OS_MACOS)
+QString MacPlatformSerial() {
+    // 主板序列号（IOPlatformExpertDevice 下 IOPlatformSerialNumber）
+    QString out = RunCmd("ioreg", {"-rd1", "-c", "IOPlatformExpertDevice"});
+    if (out.isEmpty()) return QString();
+    // 找 "IOPlatformSerialNumber" = "xxxxxxxxxx"
+    QString key = "\"IOPlatformSerialNumber\"";
+    int p = out.indexOf(key);
+    if (p < 0) return QString();
+    int eq = out.indexOf('=', p);
+    if (eq < 0) return QString();
+    int q1 = out.indexOf('"', eq);
+    if (q1 < 0) return QString();
+    int q2 = out.indexOf('"', q1 + 1);
+    if (q2 < 0) return QString();
+    QString sn = out.mid(q1 + 1, q2 - q1 - 1).trimmed();
+    return sn;
+}
+QString MacCpuSignature() {
+    // machdep.cpu.signature 是每个 CPU 型号唯一的 family/model/stepping 签名；
+    // 再加上 machdep.cpu.brand_string 作为第二重保险（品牌名+主频字符串）
+    QString sig = RunCmd("sysctl", {"-n", "machdep.cpu.signature"});
+    QString brand = RunCmd("sysctl", {"-n", "machdep.cpu.brand_string"});
+    if (sig.isEmpty() && brand.isEmpty()) return QString();
+    return sig + "|" + brand;
+}
+QString MacBootVolumeUuid() {
+    // 系统根分区 VolumeUUID（系统盘安装后基本不变）
+    QString out = RunCmd("/usr/sbin/diskutil", {"info", "/"});
+    if (out.isEmpty()) return QString();
+    static const QRegularExpression re("Volume UUID:\\s*([A-F0-9\\-]{36})",
+        QRegularExpression::CaseInsensitiveOption);
+    auto m = re.match(out);
+    if (m.hasMatch()) return m.captured(1);
+    return QString();
+}
+#endif
+
+QString GetFirstStableMac() {
+    QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
+    QList<QNetworkInterface> eth_list, wifi_list;
+    for (const auto &iface : ifaces) {
+        if (!iface.isValid() || iface.hardwareAddress().isEmpty()) continue;
+        if (iface.type() == QNetworkInterface::Loopback
+            || iface.type() == QNetworkInterface::Virtual
+            || iface.type() == QNetworkInterface::Ppp
+            || iface.type() == QNetworkInterface::Slip) continue;
+        if (iface.flags().testFlag(QNetworkInterface::IsLoopBack)) continue;
+        QString hw = iface.hardwareAddress();
+        if (hw.isEmpty() || hw == "00:00:00:00:00:00") continue;
+        if (iface.type() == QNetworkInterface::Ethernet) eth_list << iface;
+        else if (iface.type() == QNetworkInterface::Wifi) wifi_list << iface;
+    }
+    auto pickFirst = [](QList<QNetworkInterface> &lst) -> QString {
+        if (lst.isEmpty()) return QString();
+        std::sort(lst.begin(), lst.end(), [](const QNetworkInterface &a, const QNetworkInterface &b) {
+            return a.humanReadableName() < b.humanReadableName();
+        });
+        return lst.first().hardwareAddress();
+    };
+    QString r = pickFirst(eth_list);
+    if (r.isEmpty()) r = pickFirst(wifi_list);
+    return r;
+}
+
+#if defined(Q_OS_WIN)
+QString WinMotherboardSerial() {
+    // wmic baseboard get serialnumber
+    QString out = RunCmd("wmic", {"baseboard", "get", "serialnumber"});
+    QStringList lines = out.split('\n', Qt::SkipEmptyParts);
+    if (lines.size() < 2) return QString();
+    QString sn = lines[1].trimmed();
+    if (sn.isEmpty() || sn.toLower().startsWith("to be filled")) return QString();
+    return sn;
+}
+QString WinProcessorId() {
+    QString out = RunCmd("wmic", {"cpu", "get", "processorid"});
+    QStringList lines = out.split('\n', Qt::SkipEmptyParts);
+    if (lines.size() < 2) return QString();
+    return lines[1].trimmed();
+}
+QString WinCVolumeSerial() {
+    DWORD serial = 0;
+    if (!GetVolumeInformationA("C:\\", nullptr, 0, &serial, nullptr, nullptr, nullptr, 0)) return QString();
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%08X", serial);
+    return QString::fromLatin1(buf);
+}
+#endif
+
+#if defined(Q_OS_LINUX)
+QString LinDmiSystemSerial() {
+    QFile f("/sys/class/dmi/id/product_serial");
+    if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QString s = QString::fromUtf8(f.readAll()).trimmed();
+        f.close();
+        if (!s.isEmpty() && s.toLower() != "none" && s.toLower() != "to be filled by o.e.m.") return s;
+    }
+    QFile f2("/sys/class/dmi/id/board_serial");
+    if (f2.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QString s = QString::fromUtf8(f2.readAll()).trimmed();
+        f2.close();
+        if (!s.isEmpty() && s.toLower() != "none") return s;
+    }
+    return QString();
+}
+QString LinCpuInfo() {
+    // 拼 model name + cpu family + model + stepping（稳定唯一）
+    QFile f("/proc/cpuinfo");
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return QString();
+    QString text = QString::fromUtf8(f.readAll());
+    f.close();
+    QString model, fam, mod, stepping;
+    for (const auto &line : text.split('\n')) {
+        int colon = line.indexOf(':');
+        if (colon < 0) continue;
+        QString k = line.left(colon).trimmed().toLower();
+        QString v = line.mid(colon + 1).trimmed();
+        if (k == "model name" && model.isEmpty()) model = v;
+        else if (k == "cpu family" && fam.isEmpty()) fam = v;
+        else if (k == "model" && mod.isEmpty()) mod = v;
+        else if (k == "stepping" && stepping.isEmpty()) stepping = v;
+    }
+    if (model.isEmpty() && fam.isEmpty()) return QString();
+    return model + "|" + fam + "|" + mod + "|" + stepping;
+}
+QString LinRootFsUuid() {
+    // 直接读 /etc/mtab / findmnt 找 / 对应的块设备，再 blkid 拿 UUID
+    QString mnt = RunCmd("findmnt", {"-no", "SOURCE", "/"});
+    if (mnt.isEmpty()) {
+        QFile f("/etc/mtab");
+        if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QString all = QString::fromUtf8(f.readAll());
+            f.close();
+            for (const auto &ln : all.split('\n')) {
+                QStringList cols = ln.split(' ', Qt::SkipEmptyParts);
+                if (cols.size() >= 2 && cols[1] == "/") { mnt = cols[0]; break; }
+            }
+        }
+    }
+    if (mnt.isEmpty()) return QString();
+    QString uuid = RunCmd("blkid", {"-s", "UUID", "-o", "value", mnt});
+    return uuid.trimmed();
+}
+#endif
+
 } // namespace
 
 const QByteArray LicenseManager::SECRET_KEY = "";  // 占位，实际通过 GetSecretKey() 还原
@@ -53,38 +217,42 @@ QByteArray LicenseManager::DefaultSecretKey() {
 }
 
 QString LicenseManager::GenerateMachineCode() {
-    QString raw;
+    QStringList parts;
 
-    QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
-    // Ethernet 优先，Wifi 次之。稳定排序，避免 OS 枚举顺序随机导致机器码跳动
-    QList<QNetworkInterface> eth_list, wifi_list;
-    for (const auto &iface : ifaces) {
-        if (!iface.isValid() || iface.hardwareAddress().isEmpty()) continue;
-        // 跳过明显的虚拟/loopback/点对点拨号
-        if (iface.type() == QNetworkInterface::Loopback
-            || iface.type() == QNetworkInterface::Virtual
-            || iface.type() == QNetworkInterface::Ppp
-            || iface.type() == QNetworkInterface::Slip) continue;
-        if (iface.flags().testFlag(QNetworkInterface::IsLoopBack)) continue;
-        QString hw = iface.hardwareAddress();
-        if (hw.isEmpty() || hw == "00:00:00:00:00:00") continue;
-        if (iface.type() == QNetworkInterface::Ethernet) eth_list << iface;
-        else if (iface.type() == QNetworkInterface::Wifi) wifi_list << iface;
-    }
-    // 先按名称排序，取第一个 Ethernet；没有就取第一个 Wifi；再没有就回退兜底串
-    auto pickFirstStable = [](QList<QNetworkInterface> &lst) -> QString {
-        if (lst.isEmpty()) return QString();
-        std::sort(lst.begin(), lst.end(), [](const QNetworkInterface &a, const QNetworkInterface &b) {
-            return a.humanReadableName() < b.humanReadableName();
-        });
-        return lst.first().hardwareAddress();
-    };
-    raw = pickFirstStable(eth_list);
-    if (raw.isEmpty()) raw = pickFirstStable(wifi_list);
+#if defined(Q_OS_MACOS)
+    parts << MacPlatformSerial();
+    parts << MacCpuSignature();
+    parts << MacBootVolumeUuid();
+    parts << GetFirstStableMac();
+#elif defined(Q_OS_WIN)
+    parts << WinMotherboardSerial();
+    parts << WinProcessorId();
+    parts << WinCVolumeSerial();
+    parts << GetFirstStableMac();
+#else
+    parts << LinDmiSystemSerial();
+    parts << LinCpuInfo();
+    parts << LinRootFsUuid();
+    parts << GetFirstStableMac();
+#endif
 
-    if (raw.isEmpty()) {
-        raw = "XIAOQIAO_DEFAULT_MACHINE";
+    // 过滤空项，并按 OS 名兜底 QSysInfo::prettyProductName() + bootUniqueId() 保底
+    QStringList cleaned;
+    for (const auto &p : parts) {
+        QString s = p.trimmed();
+        if (!s.isEmpty()) cleaned << s;
     }
+    if (cleaned.size() < 2) {
+        // 前面硬件读不到就退一层兜底：QSysInfo 信息 + 系统 kernel UUID
+        QString boot = QSysInfo::bootUniqueId();
+        if (boot.isEmpty()) boot = QSysInfo::machineHostName();
+        cleaned << QSysInfo::prettyProductName()
+                << QSysInfo::currentCpuArchitecture()
+                << boot
+                << GetFirstStableMac();
+    }
+    QString raw = cleaned.join("|");
+    if (raw.isEmpty()) raw = "XIAOQIAO_DEFAULT_MACHINE";
 
     QString machine_id = QString::fromStdString(
         QCryptographicHash::hash(raw.toUtf8(), QCryptographicHash::Md5).toHex().toStdString()
