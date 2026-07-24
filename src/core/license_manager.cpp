@@ -12,6 +12,7 @@
 #include <QJsonObject>
 #include <QByteArray>
 #include <QRandomGenerator>
+#include <algorithm>
 
 namespace freight::core {
 
@@ -55,13 +56,31 @@ QString LicenseManager::GenerateMachineCode() {
     QString raw;
 
     QList<QNetworkInterface> ifaces = QNetworkInterface::allInterfaces();
+    // Ethernet 优先，Wifi 次之。稳定排序，避免 OS 枚举顺序随机导致机器码跳动
+    QList<QNetworkInterface> eth_list, wifi_list;
     for (const auto &iface : ifaces) {
-        if (iface.isValid() && !iface.hardwareAddress().isEmpty()
-            && (iface.type() == QNetworkInterface::Ethernet
-                || iface.type() == QNetworkInterface::Wifi)) {
-            raw += iface.hardwareAddress();
-        }
+        if (!iface.isValid() || iface.hardwareAddress().isEmpty()) continue;
+        // 跳过明显的虚拟/loopback/点对点拨号
+        if (iface.type() == QNetworkInterface::Loopback
+            || iface.type() == QNetworkInterface::Virtual
+            || iface.type() == QNetworkInterface::Ppp
+            || iface.type() == QNetworkInterface::Slip) continue;
+        if (iface.flags().testFlag(QNetworkInterface::IsLoopBack)) continue;
+        QString hw = iface.hardwareAddress();
+        if (hw.isEmpty() || hw == "00:00:00:00:00:00") continue;
+        if (iface.type() == QNetworkInterface::Ethernet) eth_list << iface;
+        else if (iface.type() == QNetworkInterface::Wifi) wifi_list << iface;
     }
+    // 先按名称排序，取第一个 Ethernet；没有就取第一个 Wifi；再没有就回退兜底串
+    auto pickFirstStable = [](QList<QNetworkInterface> &lst) -> QString {
+        if (lst.isEmpty()) return QString();
+        std::sort(lst.begin(), lst.end(), [](const QNetworkInterface &a, const QNetworkInterface &b) {
+            return a.humanReadableName() < b.humanReadableName();
+        });
+        return lst.first().hardwareAddress();
+    };
+    raw = pickFirstStable(eth_list);
+    if (raw.isEmpty()) raw = pickFirstStable(wifi_list);
 
     if (raw.isEmpty()) {
         raw = "XIAOQIAO_DEFAULT_MACHINE";
@@ -165,15 +184,42 @@ LicenseInfo LicenseManager::VerifyLicenseKey(const QString &license_key,
 }
 
 bool LicenseManager::Init() {
+    // 1. 先加载/创建试用授权（防止试用无限续期）
     if (!LoadLicense()) {
         qWarning() << "License load failed, using trial mode";
     }
+    // 2. 读取 time_record.dat（含 tamper 标记 + adjusted_expire_override）
+    QDateTime out_last;
+    qint64 out_secs = 0;
+    bool out_tamper = false;
+    QDateTime out_adj_exp;
+    if (LoadTimeRecord(out_last, out_secs, out_tamper, out_adj_exp)) {
+        last_start_time_ = out_last;
+        total_run_secs_ = out_secs;
+        if (out_adj_exp.isValid()) adjusted_expire_override_ = out_adj_exp;
+    }
+    // 3. 把 adjusted_expire_override 应用到 current_license_
+    if (adjusted_expire_override_.isValid() && current_license_.type != LicenseType::Permanent) {
+        current_license_.adjusted_expire_override = adjusted_expire_override_;
+    }
+    // 4. 检查 license.dat 尾部的 TAMPER 持久化标记
+    if (IsLicenseTamperFlagPersisted() && current_license_.type != LicenseType::Permanent) {
+        out_tamper = true;
+        time_tampered_ = true;
+    }
+    // 5. 时间篡改检测（会更新 adjusted_expire_override_ / time_tampered_）
     CheckTimeTampering();
+    // 6. 更新时间记录文件
     UpdateTimeRecord();
     return true;
 }
 
 LicenseInfo LicenseManager::GetLicenseInfo() {
+    if (adjusted_expire_override_.isValid()
+        && current_license_.valid
+        && current_license_.type != LicenseType::Permanent) {
+        current_license_.adjusted_expire_override = adjusted_expire_override_;
+    }
     return current_license_;
 }
 
@@ -185,6 +231,19 @@ bool LicenseManager::ActivateLicense(const QString &license_key) {
         current_license_ = info;
         activated_ = false;
         return false;
+    }
+
+    // 激活：重置时间篡改记录（之前的试用版篡改痕迹如果是永久版就清掉）
+    if (info.type == LicenseType::Permanent) {
+        time_tampered_ = false;
+        adjusted_expire_override_ = QDateTime();
+        current_license_.adjusted_expire_override = QDateTime();
+        ClearPersistedLicenseTamperFlagForPerm();
+    } else {
+        // 付费版有过期日：如果 time_rec 里之前有篡改扣减的 adjusted_expire 且比新授权 expire 更早，保留扣减
+        if (adjusted_expire_override_.isValid() && adjusted_expire_override_ < info.expire_date) {
+            info.adjusted_expire_override = adjusted_expire_override_;
+        }
     }
 
     if (info.IsExpired()) {
@@ -207,13 +266,25 @@ bool LicenseManager::LoadLicense() {
     QFile file(file_path);
 
     if (!file.exists()) {
-        current_license_.type = LicenseType::Trial;
-        current_license_.valid = true;
-        current_license_.machine_code = GenerateMachineCode();
-        current_license_.issue_date = QDateTime::currentDateTime();
-        current_license_.expire_date = QDateTime::currentDateTime().addDays(30);
-        current_license_.error_msg.clear();
+        // ========= Bug1 Fix: 试用版也要落盘，避免每次启动都是新的 30 天 =========
+        QString mc = GenerateMachineCode();
+        QDateTime issue = QDateTime::currentDateTime();
+        QDateTime expire = issue.addDays(30);
+        QString trial_license_key = GenerateLicenseKey(mc, LicenseType::Trial, expire, GetSecretKey());
+
+        LicenseInfo info;
+        info.valid = true;
+        info.type = LicenseType::Trial;
+        info.machine_code = mc;
+        info.issue_date = issue;
+        info.expire_date = expire;
+        info.license_key = trial_license_key;
+        info.error_msg.clear();
+        current_license_ = info;
         activated_ = false;
+
+        SaveLicense(trial_license_key);
+        qDebug() << "Trial license created and persisted, expire:" << expire.toString();
         return true;
     }
 
@@ -222,18 +293,24 @@ bool LicenseManager::LoadLicense() {
         return false;
     }
 
-    QString license_key = QString::fromUtf8(file.readAll()).trimmed();
+    QString raw = QString::fromUtf8(file.readAll()).trimmed();
     file.close();
+
+    // license.dat 可能附加多行：第 1 行 = 授权码；后续行是持久化标记（如 TAMPER=1）
+    QStringList lines = raw.split('\n', Qt::SkipEmptyParts);
+    QString license_key;
+    if (!lines.isEmpty()) license_key = lines.first().trimmed();
 
     QString machine_code = GenerateMachineCode();
     LicenseInfo info = VerifyLicenseKey(license_key, machine_code, GetSecretKey());
 
     if (info.valid && !info.IsExpired()) {
         current_license_ = info;
-        activated_ = true;
+        activated_ = (info.type != LicenseType::Trial);  // Trial = 未购买激活
         return true;
     }
 
+    // 即使 key 无效/过期，也写入 current_license_（方便显示错误）
     current_license_ = info;
     activated_ = false;
     return false;
@@ -247,14 +324,66 @@ bool LicenseManager::SaveLicense(const QString &license_key) {
         dir.mkpath(".");
     }
 
+    // 保留原来的 TAMPER 标记行（除非是永久版 ClearPersistedLicenseTamperFlagForPerm 已经覆盖）
     QFile file(file_path);
+    QString tamper_line;
+    if (file.exists() && file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        QString raw = QString::fromUtf8(file.readAll()).trimmed();
+        file.close();
+        QStringList lines = raw.split('\n', Qt::SkipEmptyParts);
+        for (int i = 1; i < lines.size(); i++) {
+            if (lines[i].startsWith("TAMPER=")) {
+                tamper_line = lines[i];
+                break;
+            }
+        }
+    }
+
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) {
         return false;
     }
 
     file.write(license_key.toUtf8());
+    file.write("\n", 1);
+    if (!tamper_line.isEmpty()) {
+        file.write(tamper_line.toUtf8());
+        file.write("\n", 1);
+    }
     file.close();
     return true;
+}
+
+bool LicenseManager::IsLicenseTamperFlagPersisted() {
+    QString file_path = GetLicenseFilePath();
+    QFile file(file_path);
+    if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) return false;
+    QString raw = QString::fromUtf8(file.readAll()).trimmed();
+    file.close();
+    return raw.contains("\nTAMPER=1") || raw.endsWith("TAMPER=1");
+}
+
+void LicenseManager::PersistLicenseTamperFlag() {
+    QString file_path = GetLicenseFilePath();
+    if (IsLicenseTamperFlagPersisted()) return;
+    QFile file(file_path);
+    if (!file.open(QIODevice::Append | QIODevice::Text)) return;
+    file.write("\nTAMPER=1", 9);
+    file.close();
+}
+
+void LicenseManager::ClearPersistedLicenseTamperFlagForPerm() {
+    QString file_path = GetLicenseFilePath();
+    QFile file(file_path);
+    if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+    QString raw = QString::fromUtf8(file.readAll()).trimmed();
+    file.close();
+    QStringList lines = raw.split('\n', Qt::SkipEmptyParts);
+    if (lines.isEmpty()) return;
+    QString cleaned = lines.first();
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate)) return;
+    file.write(cleaned.toUtf8());
+    file.write("\n", 1);
+    file.close();
 }
 
 QString LicenseManager::GetLicenseFilePath() const {
@@ -275,7 +404,7 @@ bool LicenseManager::IsExpired() const {
 
 bool LicenseManager::IsNearExpiry(int days) const {
     if (current_license_.type == LicenseType::Permanent) return false;
-    if (!current_license_.valid) return true;
+    if (!current_license_.valid) return false;
     int remaining = current_license_.DaysRemaining();
     return remaining >= 0 && remaining <= days;
 }
@@ -290,6 +419,7 @@ void LicenseManager::CheckStartupReminder(bool &show_expired, bool &show_near_ex
     show_expired = false;
     show_near_expiry = false;
     remaining_days = current_license_.DaysRemaining();
+    if (remaining_days < 0) remaining_days = 0;
 
     if (time_tampered_) {
         show_expired = true;
@@ -319,51 +449,47 @@ void LicenseManager::CheckStartupReminder(bool &show_expired, bool &show_near_ex
     }
 }
 
-bool LicenseManager::CheckTimeTampering() {
+bool LicenseManager::LoadTimeRecord(QDateTime &out_last_start, qint64 &out_total_secs,
+                                    bool &out_tampered, QDateTime &out_adjusted_expire) {
     QString file_path = GetTimeRecordPath();
     QFile file(file_path);
-
-    QDateTime current = QDateTime::currentDateTime();
-    bool file_has_tamper_flag = false;
-    bool stored_tampered = false;
-    qint64 total_run_secs = 0;
-
-    if (!file.exists()) {
-        last_start_time_ = current;
-        time_tampered_ = false;
-        return false;
-    }
-
-    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        time_tampered_ = false;
-        return false;
-    }
+    if (!file.exists() || !file.open(QIODevice::ReadOnly | QIODevice::Text)) return false;
 
     QString data = QString::fromUtf8(file.readAll()).trimmed();
     file.close();
-
     QStringList parts = data.split("|");
-    if (parts.size() < 2) {
-        time_tampered_ = false;
-        last_start_time_ = current;
-        return false;
-    }
+    if (parts.size() < 2) return false;
 
-    last_start_time_ = QDateTime::fromString(parts[0], "yyyyMMddHHmmss");
-    total_run_secs = parts[1].toLongLong();
+    out_last_start = QDateTime::fromString(parts[0], "yyyyMMddHHmmss");
+    out_total_secs = parts[1].toLongLong();
+    out_tampered = false;
+    out_adjusted_expire = QDateTime();
     if (parts.size() >= 3) {
-        file_has_tamper_flag = true;
-        stored_tampered = (parts[2] == "1");
+        out_tampered = (parts[2] == "1");
     }
+    if (parts.size() >= 4 && !parts[3].trimmed().isEmpty()) {
+        out_adjusted_expire = QDateTime::fromString(parts[3], "yyyyMMddHHmmss");
+    }
+    return out_last_start.isValid();
+}
 
-    if (!last_start_time_.isValid()) {
-        time_tampered_ = false;
+bool LicenseManager::CheckTimeTampering() {
+    QDateTime current = QDateTime::currentDateTime();
+    bool stored_tampered = false;
+    QDateTime stored_adj_exp;
+    qint64 stored_secs = 0;
+    QDateTime stored_last_start;
+
+    if (last_start_time_.isNull()) {
+        // 没有历史记录：设为现在
         last_start_time_ = current;
+        time_tampered_ = false;
         return false;
     }
+    stored_last_start = last_start_time_;
 
-    if (current < last_start_time_) {
-        // 永久版不触发时间篡改失效逻辑（机器码绑定的永久授权，无需靠时间限制）
+    if (current < stored_last_start) {
+        // 永久版不触发时间篡改失效
         if (current_license_.type == LicenseType::Permanent) {
             last_start_time_ = current;
             time_tampered_ = false;
@@ -371,37 +497,51 @@ bool LicenseManager::CheckTimeTampering() {
         }
 
         time_tampered_ = true;
-        qint64 back_seconds = last_start_time_.secsTo(current) * -1;
+        qint64 back_seconds = stored_last_start.secsTo(current) * -1;
         int back_days = static_cast<int>(back_seconds / 86400) + 1;
 
-        current_license_.expire_date = current_license_.expire_date.addDays(-back_days);
-        if (current_license_.expire_date < current) {
-            current_license_.expire_date = current.addDays(-1);
+        QDateTime base_expire = current_license_.expire_date;
+        if (adjusted_expire_override_.isValid()) base_expire = adjusted_expire_override_;
+        QDateTime new_expire = base_expire.addDays(-back_days);
+        if (new_expire < current) {
+            new_expire = current.addDays(-1);
         }
+        adjusted_expire_override_ = new_expire;
+        current_license_.adjusted_expire_override = new_expire;
 
         qWarning() << "Time tampering detected! Back by" << back_days << "days";
-        qWarning() << "Adjusted expire date to:" << current_license_.expire_date.toString();
+        qWarning() << "Adjusted expire date to:" << new_expire.toString();
 
-        // 已激活用户：把调整后的授权写回 license.dat（持久化），避免重启后恢复
-        if (activated_) {
-            SaveLicense(current_license_.license_key);
-        }
-        // 把 tampered 状态写入 time_record.dat，下次启动即使调回时间也继续保留篡改标记
-        WriteTimeRecord(true);
+        // 把 tampered=1 同时写入 license.dat（TAMPER=1 标记行）和 time_record.dat（双保险）
+        PersistLicenseTamperFlag();
+        WriteTimeRecord(true, total_run_secs_, new_expire);
         return true;
     }
 
-    // 如果历史记录里已经被标记篡改，且非永久版，则持续保持时间篡改状态（防止用户"改回到之前时间"逃避）
-    if (file_has_tamper_flag && stored_tampered && current_license_.type != LicenseType::Permanent) {
+    // 如果历史任一文件有篡改标记且非永久版，持续保留篡改状态
+    bool license_tamper_flag = (current_license_.type != LicenseType::Permanent) && IsLicenseTamperFlagPersisted();
+    if (license_tamper_flag) {
         time_tampered_ = true;
+        // 如果之前已经有 adjusted_expire 记录但这次 current>=last_start，也要继续用覆盖
+        return true;
+    }
+    // 读取到的 out_tamper=true 且非永久版
+    if (time_tampered_ && current_license_.type != LicenseType::Permanent) {
         return true;
     }
 
+    // 正常：累加累计运行秒（粗略：本次启动到 now 的秒数，这里简化处理）
+    qint64 delta = stored_last_start.secsTo(current);
+    if (delta > 0) total_run_secs_ = stored_secs + delta;
     time_tampered_ = false;
     return false;
 }
 
 void LicenseManager::WriteTimeRecord(bool tampered) {
+    WriteTimeRecord(tampered, total_run_secs_, adjusted_expire_override_);
+}
+
+void LicenseManager::WriteTimeRecord(bool tampered, qint64 total_run_secs, const QDateTime &adjusted_expire) {
     QString file_path = GetTimeRecordPath();
     QFileInfo fi(file_path);
     QDir dir = fi.dir();
@@ -415,7 +555,10 @@ void LicenseManager::WriteTimeRecord(bool tampered) {
     }
 
     QDateTime current = QDateTime::currentDateTime();
-    QString record = current.toString("yyyyMMddHHmmss") + "|0|" + QString(tampered ? "1" : "0");
+    QString record = current.toString("yyyyMMddHHmmss") + "|"
+                   + QString::number(total_run_secs) + "|"
+                   + QString(tampered ? "1" : "0") + "|"
+                   + (adjusted_expire.isValid() ? adjusted_expire.toString("yyyyMMddHHmmss") : QString());
     file.write(record.toUtf8());
     file.close();
 }
