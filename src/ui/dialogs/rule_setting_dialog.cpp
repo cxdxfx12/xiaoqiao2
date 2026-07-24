@@ -113,8 +113,17 @@ void RuleSettingDialog::SetupUI() {
     // ====== 加价策略 ======
     auto *surcharge_tab = new QWidget();
     auto *surcharge_layout = new QVBoxLayout(surcharge_tab);
-    surcharge_table_ = new QTableWidget(0, 7);
-    surcharge_table_->setHorizontalHeaderLabels({"ID", "策略名称", "范围", "类型", "金额/比例", "优先级", "启用"});
+    auto *s_filter_layout = new QHBoxLayout();
+    s_filter_layout->addWidget(new QLabel("模板筛选:"));
+    cb_surcharge_filter_ = new QComboBox();
+    cb_surcharge_filter_->addItem("全部模板", "");
+    cb_surcharge_filter_->setMinimumWidth(180);
+    s_filter_layout->addWidget(cb_surcharge_filter_);
+    s_filter_layout->addStretch();
+    surcharge_layout->addLayout(s_filter_layout);
+
+    surcharge_table_ = new QTableWidget(0, 8);
+    surcharge_table_->setHorizontalHeaderLabels({"ID", "策略名称", "范围", "绑定模板", "类型", "金额/比例", "优先级", "启用"});
     surcharge_table_->setColumnHidden(0, true);
     surcharge_table_->horizontalHeader()->setStretchLastSection(true);
     surcharge_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -138,6 +147,8 @@ void RuleSettingDialog::SetupUI() {
 
     tab_widget_->addTab(surcharge_tab, "加价策略");
 
+    connect(cb_surcharge_filter_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &RuleSettingDialog::OnSurchargeFilterChanged);
     connect(btn_add_s, &QPushButton::clicked, this, [this]() {
         ShowSurchargeDialog(true);
     });
@@ -170,6 +181,15 @@ void RuleSettingDialog::SetupUI() {
     // ====== 燃油附加费 ======
     auto *fuel_tab = new QWidget();
     auto *fuel_layout = new QVBoxLayout(fuel_tab);
+    auto *fuel_filter_layout = new QHBoxLayout();
+    fuel_filter_layout->addWidget(new QLabel("模板筛选:"));
+    cb_fuel_filter_ = new QComboBox();
+    cb_fuel_filter_->addItem("全部模板", "");
+    cb_fuel_filter_->setMinimumWidth(180);
+    fuel_filter_layout->addWidget(cb_fuel_filter_);
+    fuel_filter_layout->addStretch();
+    fuel_layout->addLayout(fuel_filter_layout);
+
     fuel_table_ = new QTableWidget(0, 5);
     fuel_table_->setHorizontalHeaderLabels({"ID", "生效日期", "费率(%)", "模板", "启用"});
     fuel_table_->setColumnHidden(0, true);
@@ -195,6 +215,8 @@ void RuleSettingDialog::SetupUI() {
 
     tab_widget_->addTab(fuel_tab, "燃油附加费");
 
+    connect(cb_fuel_filter_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &RuleSettingDialog::OnFuelFilterChanged);
     connect(btn_add_fuel, &QPushButton::clicked, this, [this]() {
         ShowFuelDialog(true);
     });
@@ -225,8 +247,17 @@ void RuleSettingDialog::SetupUI() {
     // ====== 地区加价 ======
     auto *remote_tab = new QWidget();
     auto *remote_layout = new QVBoxLayout(remote_tab);
-    remote_table_ = new QTableWidget(0, 6);
-    remote_table_->setHorizontalHeaderLabels({"ID", "省份", "城市", "区县", "加价(元)", "启用"});
+    auto *remote_filter_layout = new QHBoxLayout();
+    remote_filter_layout->addWidget(new QLabel("模板筛选:"));
+    cb_remote_filter_ = new QComboBox();
+    cb_remote_filter_->addItem("全部模板", "");
+    cb_remote_filter_->setMinimumWidth(180);
+    remote_filter_layout->addWidget(cb_remote_filter_);
+    remote_filter_layout->addStretch();
+    remote_layout->addLayout(remote_filter_layout);
+
+    remote_table_ = new QTableWidget(0, 7);
+    remote_table_->setHorizontalHeaderLabels({"ID", "省份", "城市", "区县", "加价(元)", "模板", "启用"});
     remote_table_->setColumnHidden(0, true);
     remote_table_->horizontalHeader()->setStretchLastSection(true);
     remote_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
@@ -250,6 +281,8 @@ void RuleSettingDialog::SetupUI() {
 
     tab_widget_->addTab(remote_tab, "地区加价");
 
+    connect(cb_remote_filter_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &RuleSettingDialog::OnRemoteFilterChanged);
     connect(btn_add_remote, &QPushButton::clicked, this, [this]() {
         ShowRemoteDialog(true);
     });
@@ -385,6 +418,31 @@ void RuleSettingDialog::LoadData() {
     // 加载模板
     auto templates = repo.ListTemplates();
     tpl_table_->setRowCount(templates.size());
+
+    // 刷新三个模板筛选下拉框（保持当前选中值）
+    auto refresh_filter = [](QComboBox *cb, const QVariantList &tpls) {
+        QString cur = cb->currentData().toString();
+        cb->blockSignals(true);
+        cb->clear();
+        cb->addItem("全部模板", "");
+        for (const auto &tv : tpls) {
+            const auto &t = tv.toMap();
+            QString label = QString("%1 (%2)").arg(t["template_name"].toString(), t["template_id"].toString());
+            cb->addItem(label, t["template_id"].toString());
+        }
+        int idx = cb->findData(cur);
+        if (idx < 0) {
+            // 默认选中第一个非"全部"（也就是第一个模板）
+            if (cb->count() > 1) idx = 1;
+            else idx = 0;
+        }
+        cb->setCurrentIndex(idx);
+        cb->blockSignals(false);
+    };
+    refresh_filter(cb_fuel_filter_, templates);
+    refresh_filter(cb_remote_filter_, templates);
+    refresh_filter(cb_surcharge_filter_, templates);
+
     for (int i = 0; i < templates.size(); i++) {
         const auto &t = templates[i].toMap();
         tpl_table_->setItem(i, 0, new QTableWidgetItem(t["template_id"].toString()));
@@ -393,8 +451,20 @@ void RuleSettingDialog::LoadData() {
         tpl_table_->setItem(i, 3, new QTableWidgetItem(t["is_default"].toBool() ? "是" : "否"));
     }
 
-    // 加载加价策略
-    auto strategies = repo.ListSurchargeStrategies();
+    // 加价策略：按筛选模板过滤（或全部），列表列从7→8，多一列绑定模板
+    QString surcharge_filter = cb_surcharge_filter_ ? cb_surcharge_filter_->currentData().toString() : "";
+    QVariantList strategies_all = repo.ListSurchargeStrategies();
+    QVariantList strategies;
+    if (surcharge_filter.isEmpty()) {
+        strategies = strategies_all;
+    } else {
+        for (const auto &sv : strategies_all) {
+            const auto &s = sv.toMap();
+            if (s["template_id"].toString() == surcharge_filter) {
+                strategies << s;
+            }
+        }
+    }
     surcharge_table_->setRowCount(strategies.size());
     for (int i = 0; i < strategies.size(); i++) {
         const auto &s = strategies[i].toMap();
@@ -429,14 +499,16 @@ void RuleSettingDialog::LoadData() {
         surcharge_table_->setItem(i, 0, new QTableWidgetItem(s["strategy_id"].toString()));
         surcharge_table_->setItem(i, 1, new QTableWidgetItem(s["strategy_name"].toString()));
         surcharge_table_->setItem(i, 2, new QTableWidgetItem(scope_text));
-        surcharge_table_->setItem(i, 3, new QTableWidgetItem(type_text));
-        surcharge_table_->setItem(i, 4, new QTableWidgetItem(amount_text));
-        surcharge_table_->setItem(i, 5, new QTableWidgetItem(QString::number(s["priority"].toInt())));
-        surcharge_table_->setItem(i, 6, new QTableWidgetItem(s["is_active"].toBool() ? "✅ 启用" : "❌ 停用"));
+        surcharge_table_->setItem(i, 3, new QTableWidgetItem(s["template_id"].toString()));
+        surcharge_table_->setItem(i, 4, new QTableWidgetItem(type_text));
+        surcharge_table_->setItem(i, 5, new QTableWidgetItem(amount_text));
+        surcharge_table_->setItem(i, 6, new QTableWidgetItem(QString::number(s["priority"].toInt())));
+        surcharge_table_->setItem(i, 7, new QTableWidgetItem(s["is_active"].toBool() ? "✅ 启用" : "❌ 停用"));
     }
 
-    // 加载燃油附加费
-    auto fuels = repo.ListFuelSurcharges("zto_standard");
+    // 燃油附加费：按筛选模板过滤
+    QString fuel_filter = cb_fuel_filter_ ? cb_fuel_filter_->currentData().toString() : "";
+    auto fuels = repo.ListFuelSurcharges(fuel_filter);
     fuel_table_->setRowCount(fuels.size());
     for (int i = 0; i < fuels.size(); i++) {
         const auto &f = fuels[i].toMap();
@@ -450,8 +522,9 @@ void RuleSettingDialog::LoadData() {
         fuel_table_->setItem(i, 4, status_item);
     }
 
-    // 加载地区加价
-    auto remotes = repo.ListRemoteAreas("zto_standard");
+    // 地区加价：按筛选模板过滤，列数从6→7（加了模板列）
+    QString remote_filter = cb_remote_filter_ ? cb_remote_filter_->currentData().toString() : "";
+    auto remotes = repo.ListRemoteAreas(remote_filter);
     remote_table_->setRowCount(remotes.size());
     for (int i = 0; i < remotes.size(); i++) {
         const auto &r = remotes[i].toMap();
@@ -460,10 +533,11 @@ void RuleSettingDialog::LoadData() {
         remote_table_->setItem(i, 2, new QTableWidgetItem(r["city"].toString()));
         remote_table_->setItem(i, 3, new QTableWidgetItem(r["district"].toString()));
         remote_table_->setItem(i, 4, new QTableWidgetItem("¥ " + QString::number(r["surcharge"].toDouble(), 'f', 2)));
+        remote_table_->setItem(i, 5, new QTableWidgetItem(r["template_id"].toString()));
         bool active = r["is_active"].toBool();
         auto *status_item = new QTableWidgetItem(active ? "✅ 启用" : "❌ 停用");
         status_item->setForeground(active ? QColor("#67c23a") : QColor("#909399"));
-        remote_table_->setItem(i, 5, status_item);
+        remote_table_->setItem(i, 6, status_item);
     }
 
     LoadMappingTable();
@@ -526,6 +600,17 @@ void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
     auto *desc_edit = new QLineEdit();
     desc_edit->setPlaceholderText("选填");
 
+    auto *tpl_combo = new QComboBox();
+    auto tpls = repo.ListTemplates();
+    QString default_tpl = cb_surcharge_filter_ && !cb_surcharge_filter_->currentData().toString().isEmpty()
+                              ? cb_surcharge_filter_->currentData().toString()
+                              : (tpls.isEmpty() ? QString() : tpls.first().toMap()["template_id"].toString());
+    for (const auto &tv : tpls) {
+        const auto &t = tv.toMap();
+        tpl_combo->addItem(QString("%1 (%2)").arg(t["template_name"].toString(), t["template_id"].toString()),
+                           t["template_id"].toString());
+    }
+
     QString sid_to_edit;
     if (!is_add && surcharge_table_->currentRow() >= 0) {
         sid_to_edit = surcharge_table_->item(surcharge_table_->currentRow(), 0)->text();
@@ -544,9 +629,17 @@ void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
         min_weight_spin->setValue(s["min_weight"].toDouble());
         max_weight_spin->setValue(s["max_weight"].toDouble());
         desc_edit->setText(s["description"].toString());
+
+        int ti = tpl_combo->findData(s["template_id"].toString());
+        if (ti >= 0) tpl_combo->setCurrentIndex(ti);
+    } else {
+        // 新增：默认选当前筛选模板
+        int ti = tpl_combo->findData(default_tpl);
+        if (ti >= 0) tpl_combo->setCurrentIndex(ti);
     }
 
     form->addRow("策略名称:", name_edit);
+    form->addRow("绑定模板:", tpl_combo);
     form->addRow("适用范围:", scope_combo);
     form->addRow("策略类型:", type_combo);
     form->addRow("金额/比例:", amount_spin);
@@ -570,9 +663,14 @@ void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
             QMessageBox::warning(this, "提示", "策略名称不能为空");
             return;
         }
+        if (tpl_combo->currentData().toString().isEmpty()) {
+            QMessageBox::warning(this, "提示", "请先添加运费模板，再创建加价策略");
+            return;
+        }
 
         QVariantMap strategy;
         strategy["strategy_name"] = name_edit->text().trimmed();
+        strategy["template_id"] = tpl_combo->currentData().toString();
         strategy["strategy_scope"] = scope_combo->currentData().toString();
         strategy["strategy_type"] = type_combo->currentData().toString();
         strategy["amount"] = amount_spin->value();
@@ -581,7 +679,6 @@ void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
         strategy["min_weight"] = min_weight_spin->value();
         strategy["max_weight"] = max_weight_spin->value();
         strategy["description"] = desc_edit->text().trimmed();
-        strategy["template_id"] = "zto_standard";
 
         bool ok = false;
         if (is_add) {
@@ -615,15 +712,19 @@ void RuleSettingDialog::OnFuelItemClicked(int row, int col) {
 }
 
 void RuleSettingDialog::OnRemoteItemClicked(int row, int col) {
-    if (col != 5) return; // 只响应"启用"列
+    if (col != 6) return; // 启用列在第6列（ID/省/市/区/加价/模板/启用 → 第7列，索引6）
     int id = remote_table_->item(row, 0)->text().toInt();
-    bool current_active = remote_table_->item(row, 5)->text().contains("启用");
+    bool current_active = remote_table_->item(row, 6)->text().contains("启用");
     auto &cfg = core::AppConfig::Instance();
     db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
     repo.Init();
     repo.SetRemoteAreaActive(id, !current_active);
     LoadData();
 }
+
+void RuleSettingDialog::OnFuelFilterChanged(int) { LoadData(); }
+void RuleSettingDialog::OnRemoteFilterChanged(int) { LoadData(); }
+void RuleSettingDialog::OnSurchargeFilterChanged(int) { LoadData(); }
 
 void RuleSettingDialog::OpenMappingTab() {
     if (mapping_tab_idx_ >= 0) {
@@ -1013,7 +1114,7 @@ void RuleSettingDialog::OnApplyMappingKeywords() {
 void RuleSettingDialog::ShowFuelDialog(bool is_add) {
     QDialog dlg(this);
     dlg.setWindowTitle(is_add ? "新增燃油附加费" : "编辑燃油附加费");
-    dlg.resize(380, 200);
+    dlg.resize(420, 230);
     dlg.setModal(true);
 
     auto &cfg = core::AppConfig::Instance();
@@ -1024,7 +1125,18 @@ void RuleSettingDialog::ShowFuelDialog(bool is_add) {
     auto *form = new QFormLayout();
     form->setLabelAlignment(Qt::AlignRight);
 
-    auto *date_edit = new QLineEdit("2026-01-01");
+    auto *tpl_combo = new QComboBox();
+    auto tpls = repo.ListTemplates();
+    QString default_tpl = cb_fuel_filter_ && !cb_fuel_filter_->currentData().toString().isEmpty()
+                              ? cb_fuel_filter_->currentData().toString()
+                              : (tpls.isEmpty() ? QString() : tpls.first().toMap()["template_id"].toString());
+    for (const auto &tv : tpls) {
+        const auto &t = tv.toMap();
+        tpl_combo->addItem(QString("%1 (%2)").arg(t["template_name"].toString(), t["template_id"].toString()),
+                           t["template_id"].toString());
+    }
+
+    auto *date_edit = new QLineEdit(QDate::currentDate().toString("yyyy-MM-dd"));
     auto *rate_spin = new QDoubleSpinBox();
     rate_spin->setRange(0, 100);
     rate_spin->setDecimals(2);
@@ -1033,18 +1145,27 @@ void RuleSettingDialog::ShowFuelDialog(bool is_add) {
     rate_spin->setValue(0.0);
 
     int id_to_edit = -1;
+    QString orig_tpl;
     if (!is_add && fuel_table_->currentRow() >= 0) {
         id_to_edit = fuel_table_->item(fuel_table_->currentRow(), 0)->text().toInt();
-        auto fuels = repo.ListFuelSurcharges("zto_standard");
+        // 用空串查所有模板，不管筛选结果
+        auto fuels = repo.ListFuelSurcharges("");
         for (const auto &f : fuels) {
             if (f.toMap()["id"].toInt() == id_to_edit) {
                 date_edit->setText(f.toMap()["effective_date"].toString());
                 rate_spin->setValue(f.toMap()["rate"].toDouble() * 100);
+                orig_tpl = f.toMap()["template_id"].toString();
                 break;
             }
         }
+        int ti = tpl_combo->findData(orig_tpl);
+        if (ti >= 0) tpl_combo->setCurrentIndex(ti);
+    } else {
+        int ti = tpl_combo->findData(default_tpl);
+        if (ti >= 0) tpl_combo->setCurrentIndex(ti);
     }
 
+    form->addRow("模板:", tpl_combo);
     form->addRow("生效日期:", date_edit);
     form->addRow("费率:", rate_spin);
     layout->addLayout(form);
@@ -1056,8 +1177,12 @@ void RuleSettingDialog::ShowFuelDialog(bool is_add) {
     connect(btn_box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
 
     if (dlg.exec() == QDialog::Accepted) {
+        if (tpl_combo->currentData().toString().isEmpty()) {
+            QMessageBox::warning(this, "提示", "请先添加运费模板，再设置燃油附加费");
+            return;
+        }
         QVariantMap fuel;
-        fuel["template_id"] = "zto_standard";
+        fuel["template_id"] = tpl_combo->currentData().toString();
         fuel["effective_date"] = date_edit->text().trimmed();
         fuel["rate"] = rate_spin->value() / 100.0;
 
@@ -1080,7 +1205,7 @@ void RuleSettingDialog::ShowFuelDialog(bool is_add) {
 void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
     QDialog dlg(this);
     dlg.setWindowTitle(is_add ? "新增地区加价" : "编辑地区加价");
-    dlg.resize(380, 260);
+    dlg.resize(420, 300);
     dlg.setModal(true);
 
     auto &cfg = core::AppConfig::Instance();
@@ -1090,6 +1215,17 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
     auto *layout = new QVBoxLayout(&dlg);
     auto *form = new QFormLayout();
     form->setLabelAlignment(Qt::AlignRight);
+
+    auto *tpl_combo = new QComboBox();
+    auto tpls = repo.ListTemplates();
+    QString default_tpl = cb_remote_filter_ && !cb_remote_filter_->currentData().toString().isEmpty()
+                              ? cb_remote_filter_->currentData().toString()
+                              : (tpls.isEmpty() ? QString() : tpls.first().toMap()["template_id"].toString());
+    for (const auto &tv : tpls) {
+        const auto &t = tv.toMap();
+        tpl_combo->addItem(QString("%1 (%2)").arg(t["template_name"].toString(), t["template_id"].toString()),
+                           t["template_id"].toString());
+    }
 
     auto *prov_edit = new QLineEdit();
     auto *city_edit = new QLineEdit();
@@ -1102,20 +1238,28 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
     surcharge_spin->setValue(5.0);
 
     int id_to_edit = -1;
+    QString orig_tpl;
     if (!is_add && remote_table_->currentRow() >= 0) {
         id_to_edit = remote_table_->item(remote_table_->currentRow(), 0)->text().toInt();
-        auto remotes = repo.ListRemoteAreas("zto_standard");
+        auto remotes = repo.ListRemoteAreas("");
         for (const auto &r : remotes) {
             if (r.toMap()["id"].toInt() == id_to_edit) {
                 prov_edit->setText(r.toMap()["province"].toString());
                 city_edit->setText(r.toMap()["city"].toString());
                 district_edit->setText(r.toMap()["district"].toString());
                 surcharge_spin->setValue(r.toMap()["surcharge"].toDouble());
+                orig_tpl = r.toMap()["template_id"].toString();
                 break;
             }
         }
+        int ti = tpl_combo->findData(orig_tpl);
+        if (ti >= 0) tpl_combo->setCurrentIndex(ti);
+    } else {
+        int ti = tpl_combo->findData(default_tpl);
+        if (ti >= 0) tpl_combo->setCurrentIndex(ti);
     }
 
+    form->addRow("模板:", tpl_combo);
     form->addRow("省份:", prov_edit);
     form->addRow("城市:", city_edit);
     form->addRow("区县:", district_edit);
@@ -1129,13 +1273,18 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
     connect(btn_box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
 
     if (dlg.exec() == QDialog::Accepted) {
-        if (prov_edit->text().trimmed().isEmpty()) {
-            QMessageBox::warning(this, "提示", "省份不能为空");
+        if (tpl_combo->currentData().toString().isEmpty()) {
+            QMessageBox::warning(this, "提示", "请先添加运费模板，再设置地区加价");
+            return;
+        }
+        if (prov_edit->text().trimmed().isEmpty() && city_edit->text().trimmed().isEmpty()
+            && district_edit->text().trimmed().isEmpty()) {
+            QMessageBox::warning(this, "提示", "省份/城市/区县 至少填一个");
             return;
         }
 
         QVariantMap area;
-        area["template_id"] = "zto_standard";
+        area["template_id"] = tpl_combo->currentData().toString();
         area["province"] = prov_edit->text().trimmed();
         area["city"] = city_edit->text().trimmed();
         area["district"] = district_edit->text().trimmed();

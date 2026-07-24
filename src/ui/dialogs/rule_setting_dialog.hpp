@@ -25,6 +25,9 @@ private slots:
     void OnEditMappingRow(int row);
     void OnResetMappingRow(int row);
     void OnQuickAddKeyword();
+    void OnFuelFilterChanged(int idx);
+    void OnRemoteFilterChanged(int idx);
+    void OnSurchargeFilterChanged(int idx);
 
 private:
     void SetupUI();
@@ -44,6 +47,10 @@ private:
     QTableWidget *mapping_table_ = nullptr;
     QPushButton *btn_close_ = nullptr;
     QPushButton *btn_apply_ = nullptr;
+
+    QComboBox *cb_fuel_filter_ = nullptr;
+    QComboBox *cb_remote_filter_ = nullptr;
+    QComboBox *cb_surcharge_filter_ = nullptr;
 
     QPushButton *btn_mapping_reset_ = nullptr;
     QPushButton *btn_mapping_apply_ = nullptr;

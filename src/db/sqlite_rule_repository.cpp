@@ -883,8 +883,15 @@ bool SqliteRuleRepository::DeleteCustomer(const QString &customer_id) {
 QVariantList SqliteRuleRepository::ListFuelSurcharges(const QString &template_id) {
     QVariantList result;
     QSqlQuery q(db_);
-    q.prepare("SELECT id, template_id, effective_date, rate, is_active FROM fuel_surcharge WHERE template_id = ? ORDER BY effective_date DESC");
-    q.addBindValue(template_id);
+    QString sql = "SELECT id, template_id, effective_date, rate, is_active FROM fuel_surcharge WHERE 1=1";
+    QVariantList binds;
+    if (!template_id.isEmpty()) {
+        sql += " AND template_id = ?";
+        binds << template_id;
+    }
+    sql += " ORDER BY template_id, effective_date DESC";
+    q.prepare(sql);
+    for (const auto &b : binds) q.addBindValue(b);
     q.exec();
     while (q.next()) {
         QVariantMap m;
@@ -938,8 +945,15 @@ bool SqliteRuleRepository::SetFuelSurchargeActive(int id, bool active) {
 QVariantList SqliteRuleRepository::ListRemoteAreas(const QString &template_id) {
     QVariantList result;
     QSqlQuery q(db_);
-    q.prepare("SELECT id, template_id, province, city, district, surcharge, is_active FROM remote_areas WHERE template_id = ? ORDER BY province, city, district");
-    q.addBindValue(template_id);
+    QString sql = "SELECT id, template_id, province, city, district, surcharge, is_active FROM remote_areas WHERE 1=1";
+    QVariantList binds;
+    if (!template_id.isEmpty()) {
+        sql += " AND template_id = ?";
+        binds << template_id;
+    }
+    sql += " ORDER BY template_id, province, city, district";
+    q.prepare(sql);
+    for (const auto &b : binds) q.addBindValue(b);
     q.exec();
     while (q.next()) {
         QVariantMap m;
