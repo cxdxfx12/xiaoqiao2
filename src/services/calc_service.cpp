@@ -114,11 +114,14 @@ remote_area_calc AS (
               AND (
                   (ra.province IS NOT NULL AND ra.province <> ''
                    AND REGEXP_REPLACE(ra.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2'
-                   AND (ra.city IS NULL OR ra.city = '' OR ra.city = '%4')
+                   AND (ra.city IS NULL OR ra.city = ''
+                        OR REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                           = REGEXP_REPLACE('%4', '(市|区|县|旗|自治县|林区)$', ''))
                    AND (ra.district IS NULL OR ra.district = ''))
                   OR
                   (ra.city IS NOT NULL AND ra.city <> ''
-                   AND ra.city = '%4'
+                   AND REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                       = REGEXP_REPLACE('%4', '(市|区|县|旗|自治县|林区)$', '')
                    AND (ra.district IS NULL OR ra.district = ''))
               )
         ), 0) AS remote_surcharge
@@ -392,11 +395,14 @@ remote_area_calc AS (
                   (ra.province IS NOT NULL AND ra.province <> ''
                    AND REGEXP_REPLACE(ra.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
                        = REGEXP_REPLACE(fsc.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
-                   AND (ra.city IS NULL OR ra.city = '' OR ra.city = fsc.dest_city)
+                   AND (ra.city IS NULL OR ra.city = ''
+                        OR REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                           = REGEXP_REPLACE(fsc.dest_city, '(市|区|县|旗|自治县|林区)$', ''))
                    AND (ra.district IS NULL OR ra.district = ''))
                   OR
                   (ra.city IS NOT NULL AND ra.city <> ''
-                   AND ra.city = fsc.dest_city
+                   AND REGEXP_REPLACE(ra.city, '(市|区|县|旗|自治县|林区)$', '')
+                       = REGEXP_REPLACE(fsc.dest_city, '(市|区|县|旗|自治县|林区)$', '')
                    AND (ra.district IS NULL OR ra.district = ''))
               )
         ), 0) AS remote_surcharge

@@ -1229,7 +1229,17 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
                            t["template_id"].toString());
     }
 
-    auto *prov_edit = new QLineEdit();
+    auto *prov_combo = new QComboBox();
+    prov_combo->setEditable(true);
+    prov_combo->addItem(""); // 空=不限制（配合仅填城市用）
+    const QStringList provinces = {
+        "北京","天津","上海","重庆",
+        "河北","山西","辽宁","吉林","黑龙江","江苏","浙江","安徽","福建","江西","山东",
+        "河南","湖北","湖南","广东","海南","四川","贵州","云南","陕西","甘肃","青海","台湾",
+        "内蒙古","广西","西藏","宁夏","新疆",
+        "香港","澳门"
+    };
+    prov_combo->addItems(provinces);
     auto *city_edit = new QLineEdit();
     auto *district_edit = new QLineEdit();
     auto *surcharge_spin = new QDoubleSpinBox();
@@ -1241,14 +1251,29 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
 
     int id_to_edit = -1;
     QString orig_tpl;
+    QRegularExpression suffix_re(R"((省|市|维吾尔自治区|回族自治区|壮族自治区|自治区|自治州|地区|盟)$)");
+    QRegularExpression city_suffix_re(R"((市|区|县|旗|自治县|林区)$)");
+    auto normalize_prov = [&](QString s) -> QString {
+        s = s.trimmed();
+        s.remove(suffix_re);
+        return s.trimmed();
+    };
+    auto normalize_city = [&](QString s) -> QString {
+        s = s.trimmed();
+        s.remove(city_suffix_re);
+        return s.trimmed();
+    };
     if (!is_add && remote_table_->currentRow() >= 0) {
         id_to_edit = remote_table_->item(remote_table_->currentRow(), 0)->text().toInt();
         auto remotes = repo.ListRemoteAreas("");
         for (const auto &r : remotes) {
             if (r.toMap()["id"].toInt() == id_to_edit) {
-                prov_edit->setText(r.toMap()["province"].toString());
-                city_edit->setText(r.toMap()["city"].toString());
-                district_edit->setText(r.toMap()["district"].toString());
+                QString prov_val = normalize_prov(r.toMap()["province"].toString());
+                int idx = prov_combo->findText(prov_val);
+                if (idx >= 0) prov_combo->setCurrentIndex(idx);
+                else prov_combo->setCurrentText(prov_val);
+                city_edit->setText(normalize_city(r.toMap()["city"].toString()));
+                district_edit->setText(r.toMap()["district"].toString().trimmed());
                 surcharge_spin->setValue(r.toMap()["surcharge"].toDouble());
                 orig_tpl = r.toMap()["template_id"].toString();
                 break;
@@ -1262,7 +1287,7 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
     }
 
     form->addRow("模板:", tpl_combo);
-    form->addRow("省份:", prov_edit);
+    form->addRow("省份:", prov_combo);
     form->addRow("城市:", city_edit);
     form->addRow("区县:", district_edit);
     form->addRow("附加费:", surcharge_spin);
@@ -1279,17 +1304,22 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
             QMessageBox::warning(this, "提示", "请先添加运费模板，再设置地区加价");
             return;
         }
-        if (prov_edit->text().trimmed().isEmpty() && city_edit->text().trimmed().isEmpty()
-            && district_edit->text().trimmed().isEmpty()) {
+        QString prov_norm = normalize_prov(prov_combo->currentText());
+        QString city_norm = normalize_city(city_edit->text());
+        QString dist_norm = district_edit->text().trimmed();
+        if (prov_norm.isEmpty() && city_norm.isEmpty() && dist_norm.isEmpty()) {
             QMessageBox::warning(this, "提示", "省份/城市/区县 至少填一个");
             return;
+        }
+        if (!prov_norm.isEmpty() && !city_norm.isEmpty() && prov_norm == city_norm) {
+            city_norm.clear();
         }
 
         QVariantMap area;
         area["template_id"] = tpl_combo->currentData().toString();
-        area["province"] = prov_edit->text().trimmed();
-        area["city"] = city_edit->text().trimmed();
-        area["district"] = district_edit->text().trimmed();
+        area["province"] = prov_norm;
+        area["city"] = city_norm;
+        area["district"] = dist_norm;
         area["surcharge"] = surcharge_spin->value();
 
         bool ok = false;
