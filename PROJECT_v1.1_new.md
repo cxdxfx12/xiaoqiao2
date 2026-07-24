@@ -381,18 +381,25 @@ else:
 |----|----------|
 | fixed | 固定 `amount` 元 |
 | percentage | `base_fee × amount` |
-| per_weight | `charge_weight × amount`（每公斤金额） |
+| per_weight | `charge_weight × amount`（每公斤金额，按计费重量实重） |
+| per_volume | `vol_weight × amount`（每公斤体积重金额，仅当体积重 > 0 且 > 实重时生效，否则 0） |
+
+**模板绑定与作用范围的特殊规则（极其重要）**：
+- `strategy_scope = 'global'` 或 `'template'`：**忽略 template_id 绑定**，对所有模板/所有客户专属模板均生效
+  - 例：全局包装费 1 元、全局旺季加价 10%，即使"蜜丝婷专属报价"等客户模板也会被命中
+- `strategy_scope = 'province' / 'customer'`：仍需 `s.template_id = 当前订单.template_id` 才匹配
+- 历史兼容：SQL 层仍支持 `'template'` scope 值（与 global 等价），**新 UI 已移除该选项避免混淆**
 
 **其他属性**：
 - `priority`：优先级（目前仅排序，金额是 SUM 叠加）
-- `min_weight / max_weight`：重量门槛（0 或 NULL 表示不限）
+- `min_weight / max_weight`：重量门槛（0 或 NULL 表示不限，数据库存 0 时加载为 NULL）
 - `is_active`：启用开关
 - `surcharge_date_ranges`：预留的日期范围 + 周几生效机制（暂未接入计算 SQL）
 
 **内置默认策略 3 条**：
-1. `packing_fee`：包装服务费，全局固定 1 元
+1. `packing_fee`：包装服务费，全局固定 1 元（template_id=zto_standard，因 global scope 忽略模板绑定对所有模板生效）
 2. `remote_xz_xj`：新疆西藏地区加价，按重量 2 元/KG
-3. `peak_season`：旺季附加费，全局 10%（可随时开关）
+3. `peak_season`：旺季附加费，全局 10%（可随时开关，因 global scope 忽略模板绑定对所有模板生效）
 
 ---
 
@@ -451,18 +458,19 @@ main()
 
 批量计算的文件输入表头千变万化，映射机制保证正确关联到标准列。
 
-#### 标准列定义（6 列）
+#### 标准列定义（7 列）
 
 | 标准列 | 中文名 | 必填 | 映射失败兜底 |
 |--------|--------|:----:|------------|
 | order_id | 订单号 | 否 | '' |
-| customer_id | 客户编号 | 否 | '' |
+| customer_id | 客户编号/结算主体 | 否 | '' |
+| shop_id | 店铺/结算店铺 | 否 | '' |
 | dest_province | 目的省份 | ✅ 是 | 报错，弹手动映射对话框 |
 | dest_city | 目的城市 | 否 | '' |
 | weight | 实际重量 | ✅ 是 | 报错，弹手动映射对话框 |
 | vol_weight | 体积重量 | 否 | 0 |
 
-#### 映射关键字（每列多关键字，中英文混合）
+#### 映射关键字（每列多关键字，中英文混合，精确匹配优先防误伤）
 
 | 标准列 | 关键字列表 |
 |--------|-----------|
@@ -471,7 +479,10 @@ main()
 | dest_city | dest_city, to_city, city, 目的城市, 城市, 收件城市, 到达城市, 收货城市 |
 | weight | weight, actual_weight, gross_weight, real_weight, 结算重量, 重量, 实际重量, 实重, 毛重, 计费重量 |
 | vol_weight | vol_weight, volume_weight, volumetric_weight, 体积重量, 体积重, 体积, 抛重 |
-| customer_id | customer_id, cust_id, customer, 客户id, 客户编号, 客户, 客户名称, 客户名 |
+| customer_id | customer_id, cust_id, customer, 客户id, 客户编号, 客户, 客户名称, 客户名, **结算对象, 结算主体, 结算公司** |
+| shop_id | **shop_id, shop, store, 订单客户, 店铺, 结算店铺, 门店, 分公司** |
+
+> **关键规则**：customer_id 的映射**不做"订单客户"子串匹配**，避免误伤；精确匹配轮次中 "订单客户" 只会命中 shop_id。客户模板匹配时，若 customer_id 为空则**兜底使用 shop_id** 匹配 customers 表的 default_template。
 
 #### 两轮匹配策略（防误伤）
 
@@ -562,8 +573,8 @@ macOS 下实际路径：`~/Library/Application Support/xiaoqiao_freight/`
 | `GetResultsDir()` | `<data>/results/` |
 | `GetCacheDir()` | `<data>/cache/` |
 | `GetLogsDir()` | `<data>/logs/` |
-| `GetLicenseFilePath()` | `<data>/license.dat`（授权文件） |
-| `GetTimeRecordPath()` | `<data>/time_rec.dat`（防篡改时间戳） |
+| `GetLicenseFilePath()` | `<data>/license.dat`（授权码+TAMPER 持久化标记，多行） |
+| `GetTimeRecordPath()` | `<data>/time_record.dat`（四段格式 last_start\|total_secs\|tampered\|adjusted_expire） |
 
 #### 公司信息常量
 
@@ -872,19 +883,32 @@ CASE s.strategy_type
     WHEN 'fixed'      THEN s.amount
     WHEN 'percentage' THEN base_fee * s.amount
     WHEN 'per_weight' THEN charge_weight * s.amount
+    WHEN 'per_volume' THEN CASE WHEN vol_weight > 0 AND vol_weight > weight
+                                THEN vol_weight * s.amount ELSE 0 END
     ELSE 0
 END
 ```
 
-策略匹配条件（AND）：
-1. `is_active = 1`
-2. `template_id = 订单.template_id`
-3. 作用范围匹配：
-   - `strategy_scope = 'global'`
-   - 或 `strategy_scope = 'province' AND (surcharge_provinces 中存在该省份)`
-4. 重量范围匹配：
-   - `min_weight IS NULL OR charge_weight >= min_weight`
-   - `max_weight IS NULL OR max_weight = 0 OR charge_weight <= max_weight`
+**策略匹配条件（2026-07-25 修复，极其重要）**：
+
+```sql
+WHERE s.is_active = 1
+  -- 条件A：global/template scope 忽略模板绑定，对所有模板生效（包装费、旺季加价等）
+  AND (s.strategy_scope IN ('global', 'template') OR s.template_id = rac.template_id)
+  -- 条件B：作用范围二级匹配（省/客户级需要进一步命中关联表）
+  AND (
+      s.strategy_scope IN ('global', 'template')
+      OR (s.strategy_scope = 'province' AND 归一化省份匹配)
+      OR (s.strategy_scope = 'customer' AND sc.customer_id = rac.customer_id)
+  )
+  -- 条件C：重量范围
+  AND (s.min_weight IS NULL OR charge_weight >= s.min_weight)
+  AND (s.max_weight IS NULL OR s.max_weight = 0 OR charge_weight <= s.max_weight)
+```
+
+> ❌ 旧 bug：条件A 写成 `s.template_id = rac.template_id`，导致"蜜丝婷专属报价"等客户模板无法命中 zto_standard 模板下的包装费/旺季加价（因为 template_id 不同）。修复后 global/template scope 跳过模板绑定。
+
+单条计算 SQL 同逻辑，参数化后分别使用 `'%1'=template_id`、`'%2'=省份归一化`、`'%5'=customer_id` 占位。
 
 ---
 
@@ -940,7 +964,7 @@ END
 | **BatchCalcDialog** | batch_calc_dialog.* | QStackedWidget 两页：(1) 文件选择页 — 选输入输出文件、进度条、开始按钮（白底+灰边框+悬停变蓝，padding 12px×36px，字号 14px，尺寸大于关闭按钮）；(2) 结果预览页 — QTableWidget 前 N 行、结果汇总（总行数/总运费/耗时）、导出、返回。计算结束自动调用 HistoryService.AddHistory()。 |
 | **CompareDialog** | compare_dialog.* | 选省份/实重/体积重，点击"对比"后遍历所有模板计算，表格展示各模板的基础运费/燃油费/地区加价/附加费/总运费对比。 |
 | **HistoryDialog** | history_dialog.* | 顶部：关键字搜索框 + 起始日期（默认一个月前）+ 结束日期（默认今天）+ 搜索按钮。中部：QTableWidget 任务列表（任务名/输入文件/输出文件/行数/总运费/耗时/状态/创建时间）。底部：打开文件/导出/选中删除/清理旧数据(90天)/关闭。 |
-| **RuleSettingDialog** | rule_setting_dialog.* | QTabWidget 5 个 Tab：(1) 运费模板列表（增删改→打开 TemplateEditDialog）；(2) 加价策略表格（增删改，作用域/类型/金额/优先级/启用开关）；(3) 燃油附加费表格（含"启用"切换列 toggle，点击行弹编辑）；(4) 地区加价表格（含"启用"toggle，省/市/区三级）；(5) 预留。 |
+| **RuleSettingDialog** | rule_setting_dialog.* | QTabWidget 5 个 Tab：(1) 运费模板列表（增删改→打开 TemplateEditDialog）；(2) **加价策略**：顶部模板筛选下拉（默认当前模板），表格列含策略ID/名称/作用范围/类型/金额/优先级/启用；新增/编辑对话框：作用范围下拉保留「全局/省份级/客户级」三项（**已移除「模板级」**，与全局语义重复易混淆；历史 template scope 数据编辑时自动降级为 global）；策略类型下拉含「固定加价/比例加价/按重量/**按体积(元/kg 体积重)**」四项；金额显示格式：fixed=¥xx.xx / percentage=xx.x% / per_weight=¥xx/kg / per_volume=¥xx/kg 体积重；(3) **燃油附加费**：顶部模板筛选下拉，表格含模板/生效日期/费率/启用 toggle，新增/编辑对话框含模板 ComboBox 选择；(4) **地区加价**：顶部模板筛选下拉，省/市/区三级匹配，新增/编辑对话框含模板 ComboBox 选择（至少填写省/市/区之一即可）；(5) 预留。 |
 | **TemplateEditDialog** | template_edit_dialog.* | 编辑单个模板的完整配置：Tab1 基本信息（名称/快递/首重/续重/体积系数/无重量默认费/默认/描述）；Tab2 阶梯价格表（编辑各分区各阶梯价格）；Tab3 分区-省份关联（调整分区包含哪些省）；Tab4 燃油附加费（同规则设置中的 Tab）。 |
 | **CustomerSettingDialog** | customer_setting_dialog.* | 左侧 QListWidget 客户列表（增删改/批量导入）；右侧客户专属报价矩阵表格：10 列表头（报价区域/目的省份/0-0.5KG/0.5-1KG/1-2KG/2-3KG/3-30KG/30KG+/其他/备注）。报价区域列合并单元格，同分区省份连续排列；区域名和省份名只读，价格列双击可编辑；编辑某省份价格时自动同步同分区其他省份；保存时按分区去重写入 tiered_pricing。底部：保存报价按钮。 |
 | **SystemSettingDialog** | system_setting_dialog.* | Tab1 性能设置：☑ 自动优化性能（使用系统90%资源）默认勾选；系统信息展示（总内存/CPU核数/自动计算后的内存限制和线程数）；手动内存 MB + 线程数 SpinBox（自动模式下禁用）；Tab2 预留。确定/取消按钮。 |
@@ -958,11 +982,13 @@ END
 ```
 ┌─────────────────────────────────────────────────────┐
 │  LicenseManager（主程序内单例）                       │
-│    ├─ 机器码生成（MAC 地址 → MD5 → 格式化）          │
+│    ├─ 四维机器码生成（主板+CPU+系统盘+网卡 → MD5）   │
 │    ├─ 授权码验证（Base64 JSON + HMAC-SHA256 签名）   │
-│    ├─ 加密存储（license.dat 保存授权码原文）         │
+│    ├─ 加密存储（license.dat 保存授权码+篡改标记）    │
+│    ├─ 首次启动自动创建30天试用版授权码并落盘          │
 │    ├─ 启动验证 + 过期/临期弹窗提醒                   │
-│    └─ 防时间篡改检测（time_rec.dat 记录上次启动时间） │
+│    ├─ 防时间篡改双文件校验（license.dat+time_record.dat）│
+│    └─ 时间篡改扣减有效期持久化（重启仍生效）          │
 └─────────────────────────────────────────────────────┘
                            ↕ 相同算法
 ┌─────────────────────────────────────────────────────┐
@@ -973,18 +999,30 @@ END
 └─────────────────────────────────────────────────────┘
 ```
 
-### 8.2 机器码生成
+### 8.2 机器码生成（四维硬件组合，抗漂移）
 
-**算法**：
+**跨平台采集优先级**（主板→CPU→系统盘→网卡）：
+
+| 维度 | macOS 实现 | Windows/Linux 兜底 |
+|------|-----------|-------------------|
+| 主板 UUID | `ioreg -c IOPlatformExpertDevice -d 2 \| grep IOPlatformUUID` | WMI Win32_BaseBoard / DMI /sys/class/dmi/id |
+| CPU ID | `sysctl -n machdep.cpu.signature` + brand | WMI Win32_Processor / /proc/cpuinfo |
+| 系统盘卷 UUID | `diskutil info / \| grep "Volume UUID"`（根分区） | WMI Win32_LogicalDisk(C:) / lsblk -f |
+| 网卡 MAC | 只取**第一张稳定**的有线(Ethernet)/WiFi硬件地址，跳过虚拟/网桥/隧道 | 同左，取 en0/eth0 第一张非虚拟 |
+
+**算法流程**：
 ```
-1. 遍历所有 QNetworkInterface，取 type=Ethernet 或 Wifi 的硬件地址
-2. 拼接所有 MAC 地址字符串
-3. 若为空，兜底为 "XIAOQIAO_DEFAULT_MACHINE"
-4. QCryptographicHash::Md5(raw) → 32 位 HEX → 大写
-5. 按每 4 字符加分隔符：XXXX-XXXX-XXXX-XXXX（共 35 字符）
+1. 依次采集四个维度的硬件字符串（每维读取失败则用该维的常量兜底值）
+2. 若前四维全部失败：使用保底值 = 系统信息(OS名+版本) + CPU架构 + 所有非回环MAC
+3. 若仍全空：最终保底 = "XIAOQIAO_DEFAULT_MACHINE"
+4. raw = 主板串 + "|" + CPU串 + "|" + 盘串 + "|" + MAC串
+5. QCryptographicHash::Md5(UTF8(raw)) → 32 位 HEX → 大写
+6. 按每 4 字符加分隔符：XXXX-XXXX-XXXX-XXXX（共 35 字符）
 ```
 
 例：`A1B2-C3D4-E5F6-7890`
+
+> **授权生成器同步要求**：机器码算法变更后，必须同步重新编译打包 `license_generator.app`，确保与主程序使用同一套源码；**旧算法生成的授权码无法在新版客户端使用**，老用户升级需基于新机器码重新生成。
 
 ### 8.3 授权码结构（HMAC-SHA256 签名 + Base64）
 
@@ -1036,28 +1074,53 @@ combined = Base64(JSON_payload) + "." + HMAC_HEX
             保存到 license.dat → activated_=true
 ```
 
-### 8.6 防时间篡改
+### 8.6 首次启动试用版授权自动落盘（防无限续期）
 
-每次启动写入 `time_rec.dat`，内容格式：
+行为：当 `license.dat` 不存在时（首次安装或用户手动删除），**立即生成**：
 ```
-<上次启动时间 yyyyMMddHHmmss>|<累计运行秒>
+试用授权 = GenerateLicenseKey(本机机器码, Trial, 今日+30天)
 ```
+并**立刻写入** `license.dat`。授权码自带 HMAC 签名，用户无法通过删除缓存/重启重复获取试用。
 
-下次启动检查：
-- 如果 `当前时间 < 上次启动时间` → 判定时间回拨
-- 按回拨天数扣减授权有效期（天数=⌈秒数/86400⌉）
-- 永久版不扣减
-- `time_tampered_ = true` 会使下一次启动提醒直接判过期
+> ❌ 旧 bug 修复：此前仅在内存中设置 expire 而不落盘，用户可通过删除 `license.dat` 反复获取 30 天试用。
 
-### 8.7 启动提醒分级（CheckStartupReminder）
+### 8.7 防时间篡改（双文件交叉校验 + 扣减持久化）
+
+**双文件存储策略**：
+
+| 文件 | 内容 | 作用 |
+|------|------|------|
+| `license.dat` | 第1行=授权码；第2行起=持久化标记行（如 `TAMPER=1`） | 授权本体 + 永久篡改锁 |
+| `time_record.dat` | 四段格式：`<last_start>|<total_run_secs>|<tampered(0/1)>|<adjusted_expire>` | 上次启动时间 + 篡改状态 + **扣减后的有效期覆盖值** |
+
+向后兼容：支持 2-3 段旧格式（缺 tampered 设 0，缺 adjusted_expire 设空）。
+
+**时间篡改判定**：
+- `当前时间 < last_start` → 判定回拨，`tampered=1`
+- 篡改双写：`time_record.dat` 中 `tampered=1` **同时**在 `license.dat` 末尾追加 `TAMPER=1` 行（双文件，删一个另一个仍锁死）
+- 若只删 `time_record.dat`，下次启动读取 `license.dat` 的 `TAMPER=1` 行仍判定篡改，**重新写回** `time_record.dat tampered=1`
+
+**有效期扣减与持久化（关键）**：
+- 非永久版：按回拨天数（⌈秒数/86400⌉）扣减 `expire_date`，**扣减结果存入 `adjusted_expire` 字段** → 写回 `time_record.dat`
+- 重启后读取：若 `adjusted_expire` 存在且比新授权更紧，**保留扣减后的有效期**（防止用户改时间→白嫖→激活新授权重置）
+- 永久版激活：清除 `TAMPER=1` 锁 + 篡改状态 + adjusted_expire，恢复干净状态
+
+> ❌ 旧 bug 修复：此前 SaveLicense 只写回原 license_key，adjusted_expire 未持久化导致重启恢复；删除 time_record.dat 可清零篡改痕迹。
+
+### 8.8 授权有效性与剩余天数
+
+- `DaysRemaining()`：**无效授权返回 -1**（非 0），避免误判"剩余 0 天即将到期"
+- `IsNearExpiry(remaining<=7)`：仅对 `valid=true` 且 `remaining>=0` 生效，无效授权直接返回 false
+
+### 8.9 启动提醒分级（CheckStartupReminder）
 
 | 状态 | show_expired | show_near_expiry | 提示内容 |
 |------|:-----------:|:---------------:|---------|
-| time_tampered | ✅ | - | 检测到系统时间被篡改 + 购买正版提示 |
-| 授权已过期（已激活） | ✅ | - | 授权已过期 + 续费电话 |
-| 试用期结束（未激活） | ✅ | - | 试用期结束 + 购买电话 |
-| 剩余天数 ≤ 7（已激活） | - | ✅ | N 天后到期 + 续费电话 |
-| 剩余天数 ≤ 7（未激活） | - | ✅ | 试用期还剩 N 天 + 购买电话 |
+| time_tampered（双文件任一命中） | ✅ | - | 检测到系统时间被篡改 + 购买正版提示 |
+| 授权已过期（已激活 + adjusted_expire 生效） | ✅ | - | 授权已过期 + 续费电话 |
+| 试用期结束（未激活，落盘的 Trial 过期） | ✅ | - | 试用期结束 + 购买电话 |
+| 剩余天数 ≤ 7（已激活，valid=true, remaining>=0） | - | ✅ | N 天后到期 + 续费电话 |
+| 剩余天数 ≤ 7（未激活的 Trial） | - | ✅ | 试用期还剩 N 天 + 购买电话 |
 
 ---
 
@@ -1127,6 +1190,32 @@ combined = Base64(JSON_payload) + "." + HMAC_HEX
 
 #### ❌ 坑 13：COPY 导出默认无表头
 **解决**：导出 SQL 一律加 `HEADER TRUE`。
+
+### 9.6 授权系统相关（2026-07-25 集中修复 6 项）
+
+#### ❌ 坑 14：试用版授权不落盘 → 无限续期漏洞
+**现象**：首次启动无 license.dat 时仅在内存设置 expire=30 天未写文件，用户删缓存/重启重复获取试用。  
+**修复**：无 license.dat 时立即生成 Trial 授权码（带 HMAC 签名）写入 license.dat，重启后验证签名合法不重发。
+
+#### ❌ 坑 15：时间篡改扣减有效期不持久化
+**现象**：时间回拨扣减 expire_date 只在内存，SaveLicense 只写回原 license_key，重启后扣减失效恢复。  
+**修复**：time_record.dat 新增第 4 段 `adjusted_expire` 保存扣减后的到期日；非永久版激活新授权时若已有扣减且更紧，保留扣减值。
+
+#### ❌ 坑 16：单文件篡改记录可清除
+**现象**：time_record.dat 存篡改标记，用户手动删除该文件即清零篡改痕迹。  
+**修复**：双文件交叉校验，篡改时同时写入 `license.dat TAMPER=1` + `time_record.dat tampered=1`；删 time_record 后读 license.dat 的 TAMPER=1 仍判篡改并重建。
+
+#### ❌ 坑 17：多网卡/虚拟网卡导致机器码跳变 → 激活失效
+**现象**：机器码算法遍历所有网络接口拼 MAC，VPN/TAP/网桥等虚拟网卡增删导致机器码变化，授权码不匹配。  
+**修复**：仅取第一张 Ethernet/WiFi 稳定网卡（跳过 Loopback/Docker/Bridge/TUN/TAP/空 MAC）；四维硬件组合（主板+CPU+盘+MAC）整体 MD5，任一维稳定即保持机器码稳定。
+
+#### ❌ 坑 18：无效授权 DaysRemaining 返回 0 → 误报即将到期
+**现象**：无效授权/过期授权 DaysRemaining 返回 0，IsNearExpiry(≤7) 误弹"还有 0 天到期"提示。  
+**修复**：无效授权 DaysRemaining 返回 -1；IsNearExpiry 仅对 valid=true 且 remaining≥0 时返回 true。
+
+#### ❌ 坑 19：机器码算法变更不同步授权生成器
+**现象**：主程序升级四维机器码算法后，发行商仍用旧算法生成的授权码全部不匹配。  
+**修复**：机器码/授权算法变更后**强制同步重新编译打包 license_generator.app**，与主程序同源；文档明确提醒旧算法授权码新版无法使用，老客户需重新采集机器码。
 
 ---
 
@@ -1235,10 +1324,12 @@ bash xiaoqiao_freight/scripts/deploy_mac.sh build/bin/license_generator.app
 | 自动性能调优 | [app_config.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/app_config.hpp#L90-L95) | `ApplyAutoPerformance()` |
 | 系统内存/CPU 采集 | [app_config.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/app_config.hpp#L49-L64) | `GetTotalMemoryMB()/GetCpuCoreCount()` |
 | 数据结构定义 | [freight_types.hpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/freight_types.hpp) | `StrategyScope/Type, SurchargeStrategy, CalcResult` |
-| 机器码生成 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp#L37-L63) | `GenerateMachineCode()` |
-| 授权码生成 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp#L65-L95) | `GenerateLicenseKey()` |
-| 授权码验证 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp#L97-L148) | `VerifyLicenseKey()` |
-| 防时间篡改检测 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp#L303-L358) | `CheckTimeTampering()` |
+| 四维机器码生成(主板+CPU+盘+网卡，跨平台) | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp#L37-L180) | `GenerateMachineCode() + ReadBoardId/ReadCpuId/ReadDiskUuid/ReadFirstStableMac()` |
+| 试用版授权自动落盘(防无限续期) | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp) | `LoadLicense() 无文件时 CreateAndSaveTrialLicense()` |
+| 授权码生成 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp) | `GenerateLicenseKey()` |
+| 授权码验证 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp) | `VerifyLicenseKey() + LoadLicense() 多行解析(授权码+TAMPER=1)` |
+| 双文件防时间篡改+有效期扣减持久化 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp) | `CheckTimeTampering() + WriteTimeRecord(四段) + SaveLicense(保留TAMPER行)` |
+| 无效授权 DaysRemaining=-1 防误报 | [license_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/core/license_manager.cpp) | `DaysRemaining() + IsNearExpiry(valid&&remaining>=0)` |
 | DuckDB 初始化+性能配置 | [duckdb_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/duckdb_manager.cpp#L17-L50) | `DuckDBManager::Init()` |
 | 从 SQLite 同步 12 张规则表到 DuckDB | [duckdb_manager.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/duckdb_manager.cpp#L52-L247) | `LoadRulesFromSQLite()` |
 | 规则库 schema 版本升级(v10→v11) | [sqlite_rule_repository.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/sqlite_rule_repository.cpp#L38-L94) | `SqliteRuleRepository::Init()` |
@@ -1246,10 +1337,12 @@ bash xiaoqiao_freight/scripts/deploy_mac.sh build/bin/license_generator.app
 | 6 个重量阶梯定义列表 | [sqlite_rule_repository.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/sqlite_rule_repository.cpp#L299-L306) | `tiers` 局部变量 |
 | 6 个分区定义 | [sqlite_rule_repository.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/sqlite_rule_repository.cpp#L263-L276) | `zones` 局部变量 |
 | 新增客户时自动创建专属报价 | [sqlite_rule_repository.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/sqlite_rule_repository.cpp#L718-L820) | `AddCustomer()` |
-| 单条运费计算 SQL | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L33-L157) | `CalcSingle()` |
-| 10 层 CTE 批量计算 SQL | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L240-L413) | `BuildCalcSQL()` |
-| 两轮表头自动映射 | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L450-L498) | `AutoMapColumns()` |
-| TRY_CAST + COALESCE 创建标准化表 | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L500-L529) | `CreateNormalizedTable()` |
+| 单条运费计算 SQL(global/template scope 忽略模板绑定) | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L130-L160) | `CalcSingle() strategy_surcharge_calc 条件A` |
+| 10 层 CTE 批量计算 SQL(global/template scope+per_volume CASE) | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L410-L450) | `BuildCalcSQL() strategy_surcharge_calc WHERE 条件A/B/C` |
+| 7 标准列(含 shop_id)+两轮表头自动映射(精确优先+子串防误伤) | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L450-L510) | `AutoMapColumns() + shop_id 映射 + customer_id 空用 shop_id 兜底` |
+| TRY_CAST + COALESCE 创建标准化表(含 shop_id 列) | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L515-L545) | `CreateNormalizedTable(_input_normalized 含 shop_id)` |
+| 规则设置-加价策略 UI(per_volume下拉+移除模板级scope+金额格式) | [rule_setting_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/rule_setting_dialog.cpp#L468-L575) | `LoadSurchargeTable() 显示 + ShowSurchargeDialog() 增改` |
+| 规则设置-燃油/地区/加价 顶部模板筛选下拉 | [rule_setting_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/rule_setting_dialog.cpp) | 三个 Tab 的顶部 ComboBox 模板筛选 |
 | 历史记录 CRUD | [history_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/history_service.cpp) | `AddHistory/QueryHistory/DeleteHistory/CleanupOldData` |
 | 主窗口布局 + QSS 样式 | [main_window.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/main_window.cpp#L31-L229) | `SetupUI()/SetupStyles()` |
 | 页脚官网链接（外链+下划线） | [main_window.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/main_window.cpp#L133-L142) | footer_label_ |
@@ -1268,6 +1361,6 @@ bash xiaoqiao_freight/scripts/deploy_mac.sh build/bin/license_generator.app
 
 ---
 
-*文档版本：1.1*  
-*最后更新：2026-07-24*  
+*文档版本：1.2*  
+*最后更新：2026-07-25（v1.2 更新要点：授权系统6项修复、加价策略global跨模板、per_volume新增、shop_id列+客户兜底、7标准列、模板级scope移除、燃油/地区模板筛选、四维机器码+双文件篡改校验）*  
 *版权所有 © 2026 杭州喵喵至家网络有限公司 www.hbdxm.com*
