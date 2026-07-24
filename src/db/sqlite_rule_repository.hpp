@@ -18,6 +18,8 @@ public:
 
     bool CreateDefaultTemplate();
     bool CreateDefaultSurcharges();
+    bool CreateDefaultCustomers();
+    bool ValidateIntegrity();
 
     QVariantList ListTemplates();
     QVariantMap GetTemplate(const QString &template_id);

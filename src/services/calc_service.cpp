@@ -1,9 +1,15 @@
 #include "services/calc_service.hpp"
+#include "core/freight_types.hpp"
+#include "core/app_config.hpp"
 #include "db/duckdb_manager.hpp"
 #include <QDebug>
+#include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
 #include <QVariantList>
+#include <QMap>
+#include <QSet>
+#include <QStringList>
 
 namespace freight::services {
 
@@ -44,7 +50,7 @@ matched_zone AS (
         ON zg.template_id = zgp.template_id
        AND zg.group_code = zgp.group_code
     WHERE zgp.template_id = '%1'
-      AND zgp.province = '%2'
+      AND REGEXP_REPLACE(zgp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2'
     LIMIT 1
 ),
 matched_tier AS (
@@ -107,7 +113,7 @@ remote_area_calc AS (
               AND ra.is_active = 1
               AND (
                   (ra.province IS NOT NULL AND ra.province <> ''
-                   AND ra.province = '%2'
+                   AND REGEXP_REPLACE(ra.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2'
                    AND (ra.city IS NULL OR ra.city = '' OR ra.city = '%4')
                    AND (ra.district IS NULL OR ra.district = ''))
                   OR
@@ -127,17 +133,24 @@ strategy_surcharge_calc AS (
                     WHEN 'fixed' THEN s.amount
                     WHEN 'percentage' THEN rac.base_fee * s.amount
                     WHEN 'per_weight' THEN %3 * s.amount
+                    WHEN 'per_volume' THEN COALESCE(NULLIF(%6, 0), %3) * s.amount
                     ELSE 0
                 END
             )
             FROM surcharge_strategies s
             LEFT JOIN surcharge_provinces sp ON sp.strategy_id = s.strategy_id
+            LEFT JOIN surcharge_customers sc ON sc.strategy_id = s.strategy_id
+            LEFT JOIN surcharge_date_ranges sd ON sd.strategy_id = s.strategy_id
             WHERE s.is_active = 1
-              AND s.template_id = '%1'
+              AND (s.strategy_scope IN ('global', 'template') OR s.template_id = '%1')
               AND (
-                  s.strategy_scope = 'global'
-                  OR (s.strategy_scope = 'province' AND sp.province = '%2')
+                  s.strategy_scope IN ('global', 'template')
+                  OR (s.strategy_scope = 'province'
+                      AND REGEXP_REPLACE(sp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2')
+                  OR (s.strategy_scope = 'customer' AND sc.customer_id = '%5')
               )
+              AND (sd.strategy_id IS NULL
+                   OR (CURRENT_DATE BETWEEN sd.start_date AND sd.end_date))
               AND (s.min_weight IS NULL OR %3 >= s.min_weight)
               AND (s.max_weight IS NULL OR s.max_weight = 0 OR %3 <= s.max_weight)
         ), 0) AS strategy_surcharge
@@ -153,8 +166,10 @@ SELECT
 FROM strategy_surcharge_calc
         )SQL")
         .arg(template_id, norm_province)
-        .arg(charge_weight)
-        .arg(city);
+        .arg(charge_weight, 0, 'f', 6)
+        .arg(city)
+        .arg(customer_id)
+        .arg(vol_weight, 0, 'f', 6);
 
         qDebug() << "Calculating:" << province << weight << "kg, charge_weight:" << charge_weight;
 
@@ -191,15 +206,20 @@ FROM strategy_surcharge_calc
 bool CalcService::CalcBatch(const QString &input_table,
                             const QString &output_table) {
     try {
+        emit ProgressChanged(5);
         auto &dbm = db::DuckDBManager::Instance();
         auto con = dbm.CreateConnection();
 
         QString sql = BuildCalcSQL(input_table, output_table);
+        emit ProgressChanged(15);
         con.Query(sql.toStdString());
 
+        emit ProgressChanged(100);
+        emit CalcFinished(true, QStringLiteral("计算完成"));
         return true;
     } catch (const std::exception &e) {
         qCritical() << "CalcBatch failed:" << e.what();
+        emit CalcFinished(false, QString::fromStdString(e.what()));
         return false;
     }
 }
@@ -207,32 +227,46 @@ bool CalcService::CalcBatch(const QString &input_table,
 bool CalcService::CalcFromFile(const QString &input_file,
                                const QString &output_file) {
     try {
+        emit ProgressChanged(0);
         auto &dbm = db::DuckDBManager::Instance();
 
         QFileInfo fi(input_file);
         QString input_table = "_input_tmp";
         QString output_table = "_output_tmp";
 
+        emit ProgressChanged(5);
         if (!dbm.ImportFromFile(input_table, input_file)) {
+            emit CalcFinished(false, QStringLiteral("文件导入失败"));
             return false;
         }
 
+        emit ProgressChanged(25);
         QString normalized_table = NormalizeColumns(input_table);
         if (normalized_table.isEmpty()) {
+            emit CalcFinished(false, QStringLiteral("列归一化失败，请检查列名"));
             return false;
         }
 
+        emit ProgressChanged(45);
         if (!CalcBatch(normalized_table, output_table)) {
             return false;
         }
 
+        emit ProgressChanged(85);
         if (!dbm.ExportToFile(output_table, output_file)) {
+            QString native_path = QDir::toNativeSeparators(QFileInfo(output_file).absoluteFilePath());
+            emit CalcFinished(false,
+                QStringLiteral("结果导出失败\n路径：%1\n\n请检查：\n1. 输出目录是否可写\n2. 文件是否被 Excel/WPS 占用\n3. 磁盘是否已满")
+                    .arg(native_path));
             return false;
         }
 
+        emit ProgressChanged(100);
+        emit CalcFinished(true, QStringLiteral("计算完成"));
         return true;
     } catch (const std::exception &e) {
         qCritical() << "CalcFromFile failed:" << e.what();
+        emit CalcFinished(false, QString::fromStdString(e.what()));
         return false;
     }
 }
@@ -279,7 +313,8 @@ matched_zone AS (
     FROM template_info ti
     LEFT JOIN zone_group_provinces zgp
         ON zgp.template_id = ti.template_id
-       AND zgp.province = REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+       AND REGEXP_REPLACE(zgp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+         = REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
     LEFT JOIN zone_groups zg
         ON zg.template_id = zgp.template_id
        AND zg.group_code = zgp.group_code
@@ -355,7 +390,8 @@ remote_area_calc AS (
               AND ra.is_active = 1
               AND (
                   (ra.province IS NOT NULL AND ra.province <> ''
-                   AND ra.province = REGEXP_REPLACE(fsc.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                   AND REGEXP_REPLACE(ra.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                       = REGEXP_REPLACE(fsc.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
                    AND (ra.city IS NULL OR ra.city = '' OR ra.city = fsc.dest_city)
                    AND (ra.district IS NULL OR ra.district = ''))
                   OR
@@ -375,17 +411,25 @@ strategy_surcharge_calc AS (
                     WHEN 'fixed' THEN s.amount
                     WHEN 'percentage' THEN rac.base_fee * s.amount
                     WHEN 'per_weight' THEN rac.charge_weight * s.amount
+                    WHEN 'per_volume' THEN COALESCE(NULLIF(rac.vol_weight, 0), rac.charge_weight) * s.amount
                     ELSE 0
                 END
             )
             FROM surcharge_strategies s
             LEFT JOIN surcharge_provinces sp ON sp.strategy_id = s.strategy_id
+            LEFT JOIN surcharge_customers sc ON sc.strategy_id = s.strategy_id
+            LEFT JOIN surcharge_date_ranges sd ON sd.strategy_id = s.strategy_id
             WHERE s.is_active = 1
-              AND s.template_id = rac.template_id
+              AND (s.strategy_scope IN ('global', 'template') OR s.template_id = rac.template_id)
               AND (
-                  s.strategy_scope = 'global'
-                  OR (s.strategy_scope = 'province' AND sp.province = REGEXP_REPLACE(rac.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', ''))
+                  s.strategy_scope IN ('global', 'template')
+                  OR (s.strategy_scope = 'province'
+                      AND REGEXP_REPLACE(sp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                        = REGEXP_REPLACE(rac.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', ''))
+                  OR (s.strategy_scope = 'customer' AND sc.customer_id = rac.customer_id)
               )
+              AND (sd.strategy_id IS NULL
+                   OR (CURRENT_DATE BETWEEN sd.start_date AND sd.end_date))
               AND (s.min_weight IS NULL OR rac.charge_weight >= s.min_weight)
               AND (s.max_weight IS NULL OR s.max_weight = 0 OR rac.charge_weight <= s.max_weight)
         ), 0) AS strategy_surcharge
@@ -448,22 +492,22 @@ QString CalcService::NormalizeColumns(const QString &input_table) {
 }
 
 QMap<QString, QString> CalcService::AutoMapColumns(const QStringList &actual_cols) {
+    auto &cfg = core::AppConfig::Instance();
+    const auto eff_map = cfg.GetEffectiveMappingKeywords();
+    const auto &order = core::AppConfig::StandardColumnOrder();
+
     struct ColumnMapping {
         QString standard_name;
         QStringList keywords;
     };
-
-    QList<ColumnMapping> mappings = {
-        {"order_id",     {"order_id", "order_no", "waybill", "订单号", "订单编号", "运单号", "快递单号", "单号"}},
-        {"dest_province",{"dest_province", "to_province", "province", "目的省份", "省份", "收件省份", "到达省份", "收货省份"}},
-        {"dest_city",    {"dest_city", "to_city", "city", "目的城市", "城市", "收件城市", "到达城市", "收货城市"}},
-        {"weight",       {"weight", "actual_weight", "gross_weight", "real_weight", "结算重量", "重量", "实际重量", "实重", "毛重", "计费重量"}},
-        {"vol_weight",   {"vol_weight", "volume_weight", "volumetric_weight", "体积重量", "体积重", "体积", "抛重"}},
-        {"customer_id",  {"customer_id", "cust_id", "customer", "客户id", "客户编号", "客户", "客户名称", "客户名"}},
-    };
+    QList<ColumnMapping> mappings;
+    mappings.reserve(order.size());
+    for (const QString &std_name : order) {
+        ColumnMapping m{std_name, eff_map.value(std_name)};
+        mappings.append(std::move(m));
+    }
 
     QMap<QString, QString> col_map;
-    // 第1轮：完全相等匹配（精确优先，避免 "订单客户" 误匹配 "客户"）
     for (const auto &m : mappings) {
         for (const auto &actual : actual_cols) {
             QString actual_lower = actual.toLower();
@@ -478,7 +522,6 @@ QMap<QString, QString> CalcService::AutoMapColumns(const QStringList &actual_col
             }
         }
     }
-    // 第2轮：子串匹配（仅对未匹配的标准列）
     for (const auto &m : mappings) {
         if (col_map.contains(m.standard_name)) continue;
         for (const auto &actual : actual_cols) {
@@ -497,16 +540,43 @@ QMap<QString, QString> CalcService::AutoMapColumns(const QStringList &actual_col
     return col_map;
 }
 
+void CalcService::RememberMapping(const QMap<QString, QString> &confirmed,
+                                  const QStringList &actual_cols) {
+    QSet<QString> actual_set;
+    for (const QString &c : actual_cols) actual_set.insert(c);
+    auto &cfg = core::AppConfig::Instance();
+    for (auto it = confirmed.begin(); it != confirmed.end(); ++it) {
+        const QString &std_col = it.key();
+        const QString &actual = it.value();
+        if (actual.isEmpty()) continue;
+        if (!actual_set.contains(actual)) continue;
+        if (actual.compare(std_col, Qt::CaseInsensitive) == 0) continue;
+        cfg.AddMappingKeyword(std_col, actual);
+    }
+}
+
 QString CalcService::CreateNormalizedTable(const QString &input_table,
                                             const QMap<QString, QString> &col_map) {
     QStringList select_parts;
-    select_parts << QString("COALESCE(\"%1\", '') AS order_id").arg(col_map.value("order_id", ""));
-    select_parts << QString("COALESCE(\"%1\", '') AS customer_id").arg(col_map.value("customer_id", ""));
+    // 如果用户 Excel 没有某列（col_map 中为空字符串），用常量空串/0 兜底，不要 COALESCE("") 触发标识符错误
+    auto col_or_literal_str = [&](const QString &key) {
+        QString c = col_map.value(key, "");
+        if (c.isEmpty()) return QString("''");
+        return QString("COALESCE(\"%1\", '')").arg(c);
+    };
+    auto col_or_literal_num = [&](const QString &key) {
+        QString c = col_map.value(key, "");
+        if (c.isEmpty()) return QString("0.0");
+        // 用 TRY_CAST 处理空字符串/非数字字符（COALESCE 不能捕获 CAST 错误）
+        return QString("COALESCE(TRY_CAST(\"%1\" AS DOUBLE), 0)").arg(c);
+    };
+
+    select_parts << QString("%1 AS order_id").arg(col_or_literal_str("order_id"));
+    select_parts << QString("%1 AS customer_id").arg(col_or_literal_str("customer_id"));
     select_parts << QString("COALESCE(\"%1\", '') AS dest_province").arg(col_map.value("dest_province"));
-    select_parts << QString("COALESCE(\"%1\", '') AS dest_city").arg(col_map.value("dest_city", ""));
-    // 用 TRY_CAST 处理空字符串/非数字字符（COALESCE 不能捕获 CAST 错误）
-    select_parts << QString("COALESCE(TRY_CAST(\"%1\" AS DOUBLE), 0) AS weight").arg(col_map.value("weight"));
-    select_parts << QString("COALESCE(TRY_CAST(\"%1\" AS DOUBLE), 0) AS vol_weight").arg(col_map.value("vol_weight", ""));
+    select_parts << QString("%1 AS dest_city").arg(col_or_literal_str("dest_city"));
+    select_parts << QString("%1 AS weight").arg(col_or_literal_num("weight"));
+    select_parts << QString("%1 AS vol_weight").arg(col_or_literal_num("vol_weight"));
 
     QString normalized_table = "_input_normalized";
     QString sql = QString("CREATE OR REPLACE TABLE %1 AS SELECT %2 FROM %3")

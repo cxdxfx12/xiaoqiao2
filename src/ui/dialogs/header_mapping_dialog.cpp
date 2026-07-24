@@ -1,4 +1,8 @@
 #include "ui/dialogs/header_mapping_dialog.hpp"
+#include "ui/dialogs/rule_setting_dialog.hpp"
+#include "ui/icon_manager.hpp"
+#include "services/calc_service.hpp"
+#include "core/app_config.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QPainter>
@@ -9,6 +13,7 @@
 #include <QLabel>
 #include <QPushButton>
 #include <QMessageBox>
+#include <QCheckBox>
 #include <cmath>
 
 namespace freight::ui::dialogs {
@@ -53,7 +58,7 @@ protected:
         p.setFont(QFont(QString::fromUtf8("PingFang SC"), 12, QFont::DemiBold));
         p.setPen(QColor(96, 98, 102));
         p.drawText(QRect(left_x, 6, COL_WIDTH, 24), Qt::AlignCenter, QString::fromUtf8("导入文件表头"));
-        p.drawText(QRect(right_x, 6, COL_WIDTH, 24), Qt::AlignCenter, QString::fromUtf8("系统标准列名"));
+        p.drawText(QRect(right_x, 6, COL_WIDTH, 24), Qt::AlignCenter, QString::fromUtf8("标准列（中文）"));
 
         // 绘制连线
         for (auto it = mapping_.begin(); it != mapping_.end(); ++it) {
@@ -129,9 +134,10 @@ protected:
             p.setBrush(bg);
             p.drawRoundedRect(r, radius, radius);
 
+            QString disp = core::AppConfig::StandardColumnToCn(standard_[i]);
             p.setPen(is_required && !mapped ? QColor(245, 108, 108) : QColor(48, 49, 51));
-            QString text = standard_[i];
-            if (is_required) text += " *";
+            QString text = disp;
+            if (is_required) text.prepend("★ ");
             p.drawText(r.adjusted(8, 0, -8, 0), Qt::AlignLeft | Qt::AlignVCenter, text);
         }
     }
@@ -287,8 +293,9 @@ HeaderMappingDialog::HeaderMappingDialog(const QStringList& imported_headers,
     , mapping_(auto_mapping)
     , preview_headers_(preview_headers)
     , preview_rows_(preview_rows) {
-    standard_names_ = {"order_id", "dest_province", "dest_city", "weight", "vol_weight", "customer_id"};
-    required_ = {"dest_province", "weight"};
+    standard_names_ = core::AppConfig::StandardColumnOrder();
+    required_.clear();
+    for (const auto &s : core::AppConfig::RequiredStandardColumns()) required_ += s;
     SetupUI();
 }
 
@@ -311,6 +318,17 @@ void HeaderMappingDialog::SetupUI() {
     hint_label_->setStyleSheet("font-size: 13px; color: #E64545; background: #FEF0F0; padding: 10px 14px; border-radius: 8px;");
     hint_label_->setWordWrap(true);
     layout->addWidget(hint_label_);
+
+    auto *toolbar = new QHBoxLayout();
+    toolbar->setSpacing(8);
+    auto *btn_reset_auto = new QPushButton(QString::fromUtf8(" 🔄 重置自动映射"));
+    btn_reset_auto->setCursor(Qt::PointingHandCursor);
+    toolbar->addWidget(btn_reset_auto);
+    btn_settings_ = new QPushButton(QString::fromUtf8(" 🧭 自定义识别关键字…"));
+    btn_settings_->setCursor(Qt::PointingHandCursor);
+    toolbar->addWidget(btn_settings_);
+    toolbar->addStretch();
+    layout->addLayout(toolbar);
 
     // 映射视图
     view_ = new MappingView();
@@ -403,6 +421,15 @@ QPushButton:hover { background: #66b1ff; }
     )QSS");
     connect(btn_ok, &QPushButton::clicked, this, &HeaderMappingDialog::OnConfirm);
     btn_layout->addWidget(btn_ok);
+    connect(btn_settings_, &QPushButton::clicked, this, &HeaderMappingDialog::OnOpenMappingSettings);
+    connect(btn_reset_auto, &QPushButton::clicked, this, [this]() {
+        services::CalcService svc(this);
+        auto re = svc.AutoMapColumns(imported_headers_);
+        for (auto it = re.cbegin(); it != re.cend(); ++it) {
+            if (!mapping_.contains(it.key())) mapping_.insert(it.key(), it.value());
+        }
+        view_->SetData(imported_headers_, standard_names_, required_, mapping_);
+    });
 
     layout->addLayout(btn_layout);
 
@@ -413,16 +440,43 @@ QWidget { font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-se
 }
 
 void HeaderMappingDialog::OnConfirm() {
-    // 检查必填列
+    mapping_ = view_->GetMapping();
     for (const auto& req : required_) {
         if (!mapping_.contains(req) || mapping_[req].isEmpty()) {
+            QString cn = core::AppConfig::StandardColumnToCn(req);
             QMessageBox::warning(this, QString::fromUtf8("提示"),
-                QString::fromUtf8("必填列 \"%1\" 尚未映射，请先完成映射").arg(req));
+                QString::fromUtf8("必填列「%1」尚未映射，请先完成映射").arg(cn));
             return;
         }
     }
-    mapping_ = view_->GetMapping();
+
+    QStringList lines;
+    for (auto it = mapping_.cbegin(); it != mapping_.cend(); ++it) {
+        if (it.value().isEmpty()) continue;
+        lines += QString("「%1 → %2」")
+            .arg(it.value()).arg(core::AppConfig::StandardColumnToCn(it.key()));
+    }
+    auto ret = QMessageBox::question(
+        this, QString::fromUtf8("确认映射"),
+        QString::fromUtf8("已完成以下映射：\n%1\n\n是否记住这些对应关系，下次自动识别？")
+            .arg(lines.join("、\n")),
+        QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+    remember_ = (ret == QMessageBox::Yes);
+
     accept();
+}
+
+void HeaderMappingDialog::OnOpenMappingSettings() {
+    RuleSettingDialog dlg(this);
+    dlg.OpenMappingTab();
+    int r = dlg.exec();
+    Q_UNUSED(r);
+    services::CalcService svc(this);
+    auto re = svc.AutoMapColumns(imported_headers_);
+    for (auto it = re.cbegin(); it != re.cend(); ++it) {
+        if (!mapping_.contains(it.key())) mapping_.insert(it.key(), it.value());
+    }
+    view_->SetData(imported_headers_, standard_names_, required_, mapping_);
 }
 
 QMap<QString, QString> HeaderMappingDialog::GetMapping() const {

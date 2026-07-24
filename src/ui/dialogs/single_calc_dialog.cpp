@@ -51,6 +51,10 @@ void SingleCalcDialog::SetupUI() {
     edt_city_->setPlaceholderText("选填");
     form_layout->addRow("目的城市：", edt_city_);
 
+    edt_customer_ = new QLineEdit();
+    edt_customer_->setPlaceholderText("选填，用于客户级加价策略匹配");
+    form_layout->addRow("客户：", edt_customer_);
+
     spn_weight_ = new QDoubleSpinBox();
     spn_weight_->setRange(0.01, 99999.0);
     spn_weight_->setDecimals(3);
@@ -139,6 +143,8 @@ void SingleCalcDialog::SetupUI() {
     connect(btn_calc_, &QPushButton::clicked, this, &SingleCalcDialog::OnCalc);
     connect(btn_clear_, &QPushButton::clicked, this, &SingleCalcDialog::OnClear);
     connect(btn_close_, &QPushButton::clicked, this, &QDialog::accept);
+    // 客户名输入变更 → 自动匹配客户 default_template 并切换模板下拉
+    connect(edt_customer_, &QLineEdit::textChanged, this, &SingleCalcDialog::OnCustomerTextChanged);
 
     setStyleSheet(R"QSS(
 QDialog { background-color: #f5f7fa; }
@@ -194,12 +200,13 @@ QPushButton#normalBtn:hover {
 void SingleCalcDialog::OnCalc() {
     QString province = cbo_province_->currentText();
     QString city = edt_city_->text().trimmed();
+    QString customer = edt_customer_->text().trimmed();
     double weight = spn_weight_->value();
     double vol_weight = spn_vol_weight_->value();
     QString tpl_id = cbo_template_->currentData().toString();
 
     services::CalcService calc_svc;
-    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id, city);
+    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id, city, customer);
 
     if (result.success) {
         lbl_result_charge_weight_->setText(QString::number(result.charge_weight, 'f', 3) + " kg");
@@ -220,8 +227,11 @@ void SingleCalcDialog::OnClear() {
     edt_order_id_->clear();
     cbo_province_->setCurrentIndex(0);
     edt_city_->clear();
+    edt_customer_->clear();
     spn_weight_->setValue(1.0);
     spn_vol_weight_->setValue(0.0);
+    // 模板切回第一个默认项（中通标准或首项）
+    if (cbo_template_->count() > 0) cbo_template_->setCurrentIndex(0);
     lbl_result_charge_weight_->setText("—");
     lbl_result_base_fee_->setText("—");
     lbl_result_fuel_->setText("—");
@@ -230,6 +240,62 @@ void SingleCalcDialog::OnClear() {
     lbl_result_total_->setText("—");
     lbl_result_status_->setText("请输入信息后点击计算");
     lbl_result_status_->setStyleSheet("color: #909399; font-size: 12px;");
+}
+
+void SingleCalcDialog::OnCustomerTextChanged(const QString &text) {
+    QString name = text.trimmed();
+    if (name.isEmpty()) {
+        // 清空客户：把模板重置回下拉第一项，但不弹错误
+        if (cbo_template_->count() > 0 && cbo_template_->currentIndex() != 0) {
+            cbo_template_->setCurrentIndex(0);
+        }
+        return;
+    }
+
+    auto &cfg = core::AppConfig::Instance();
+    db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
+    if (!repo.Init()) return;
+
+    QString matched_tpl_id;
+    QString matched_tpl_name;
+    QString matched_cust_name;
+    // 1) 优先 exact name match
+    // 2) 再 contains 模糊匹配
+    QVariantList all = repo.ListCustomers();
+    QVariantList fuzzy_candidates;
+    for (const auto &cv : all) {
+        auto m = cv.toMap();
+        QString n = m["customer_name"].toString();
+        QString tpl = m["default_template"].toString();
+        if (tpl.isEmpty()) continue;
+        if (n.compare(name, Qt::CaseInsensitive) == 0) {
+            matched_tpl_id = tpl;
+            matched_tpl_name = n;
+            matched_cust_name = n;
+            break;
+        }
+        if (n.contains(name, Qt::CaseInsensitive) || name.contains(n, Qt::CaseInsensitive)) {
+            fuzzy_candidates << m;
+        }
+    }
+    if (matched_tpl_id.isEmpty() && !fuzzy_candidates.isEmpty()) {
+        auto m = fuzzy_candidates.first().toMap();
+        matched_tpl_id = m["default_template"].toString();
+        matched_tpl_name = m["customer_name"].toString();
+        matched_cust_name = matched_tpl_name;
+    }
+    if (matched_tpl_id.isEmpty()) return;
+
+    // 切模板
+    int idx = cbo_template_->findData(matched_tpl_id);
+    if (idx >= 0) {
+        if (cbo_template_->currentIndex() != idx) {
+            cbo_template_->setCurrentIndex(idx);
+            lbl_result_status_->setText(QString("💡 已根据客户『%1』自动切换到模板：%2")
+                .arg(matched_cust_name).arg(cbo_template_->currentText()));
+            lbl_result_status_->setStyleSheet("color: #409eff; font-size: 12px;");
+        }
+    }
 }
 
 } // namespace freight::ui::dialogs

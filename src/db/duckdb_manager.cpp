@@ -1,11 +1,14 @@
 #include "db/duckdb_manager.hpp"
 #include "core/app_config.hpp"
 #include <QDebug>
+#include <QDir>
 #include <QFileInfo>
 #include <QSqlDatabase>
 #include <QSqlQuery>
 #include <QSqlRecord>
 #include <QSqlError>
+#include <QMetaObject>
+#include <QTimer>
 
 namespace freight::db {
 
@@ -32,12 +35,17 @@ bool DuckDBManager::Init(const QString &db_path) {
             qWarning() << "Set DuckDB performance config warning:" << e.what();
         }
 
-        // 加载 Excel 扩展（DuckDB 1.5 中 read_xlsx 来自 excel 扩展）
+        // 加载 Excel 扩展（先尝试 LOAD 跳过不必要的重复 INSTALL；LOAD 失败再 INSTALL）
         try {
             auto con = CreateConnection();
-            con.Query("INSTALL excel");
-            con.Query("LOAD excel");
-            qDebug() << "Excel extension loaded";
+            try {
+                con.Query("LOAD excel");
+                qDebug() << "Excel extension loaded (pre-installed)";
+            } catch (...) {
+                con.Query("INSTALL excel");
+                con.Query("LOAD excel");
+                qDebug() << "Excel extension installed & loaded";
+            }
         } catch (const std::exception &e) {
             qWarning() << "Excel extension load warning:" << e.what();
         }
@@ -59,11 +67,19 @@ bool DuckDBManager::LoadRulesFromSQLite(const QString &rules_db_path) {
             return false;
         }
 
+        // 唯一化连接名，避免多次 ReloadRules 时 duplicate connection 警告
+        static int import_conn_counter = 0;
+        QString conn_name = QString("duckdb_import_%1").arg(++import_conn_counter);
+        if (QSqlDatabase::contains(conn_name)) {
+            QSqlDatabase::removeDatabase(conn_name);
+        }
+
         // 用 Qt 打开 SQLite 数据库
-        QSqlDatabase sqlite_db = QSqlDatabase::addDatabase("QSQLITE", "duckdb_import");
+        QSqlDatabase sqlite_db = QSqlDatabase::addDatabase("QSQLITE", conn_name);
         sqlite_db.setDatabaseName(rules_db_path);
         if (!sqlite_db.open()) {
             qCritical() << "Failed to open SQLite db for import:" << sqlite_db.lastError().text();
+            QSqlDatabase::removeDatabase(conn_name);
             return false;
         }
 
@@ -205,42 +221,77 @@ bool DuckDBManager::LoadRulesFromSQLite(const QString &rules_db_path) {
 
         // 从 SQLite 读取数据并插入到 DuckDB
         for (const auto &t : tables) {
-            QSqlQuery q(sqlite_db);
-            q.exec(QString("SELECT * FROM %1").arg(t.name));
-            
             int count = 0;
-            while (q.next()) {
-                QStringList values;
-                for (int i = 0; i < q.record().count(); i++) {
-                    QVariant v = q.value(i);
-                    if (v.isNull()) {
-                        values << "NULL";
-                    } else if (v.type() == QVariant::Int || v.type() == QVariant::LongLong) {
-                        values << v.toString();
-                    } else if (v.type() == QVariant::Double) {
-                        values << v.toString();
-                    } else {
+            {   // QSqlQuery 作用域：结束后立即释放 prepared statement，避免 close 时 "still in use"
+                QSqlQuery q(sqlite_db);
+                q.exec(QString("SELECT * FROM %1").arg(t.name));
+
+                while (q.next()) {
+                    QStringList values;
+                    for (int i = 0; i < q.record().count(); i++) {
+                        QVariant v = q.value(i);
+                        if (v.isNull()) {
+                            values << "NULL";
+                            continue;
+                        }
+                        // 覆盖所有数值类型，避免 UInt/Bool/Float 被当作字符串插入数值列导致错位
+                        const auto mt = v.metaType();
+                        const int id = mt.id();
+                        bool is_numeric = false;
+                        switch (id) {
+                            case QMetaType::Bool:
+                                values << (v.toBool() ? "1" : "0");
+                                is_numeric = true;
+                                break;
+                            case QMetaType::Int:
+                            case QMetaType::UInt:
+                            case QMetaType::LongLong:
+                            case QMetaType::ULongLong:
+                            case QMetaType::Float:
+                            case QMetaType::Double:
+                                values << v.toString();
+                                is_numeric = true;
+                                break;
+                            default:
+                                is_numeric = false;
+                                break;
+                        }
+                        if (is_numeric) continue;
+
                         QString s = v.toString();
                         s.replace("'", "''");
                         values << QString("'%1'").arg(s);
                     }
+
+                    QString insert_sql = QString("INSERT INTO %1 VALUES (%2)")
+                        .arg(t.name, values.join(", "));
+                    con.Query(insert_sql.toStdString());
+                    count++;
                 }
-                
-                QString insert_sql = QString("INSERT INTO %1 VALUES (%2)")
-                    .arg(t.name, values.join(", "));
-                con.Query(insert_sql.toStdString());
-                count++;
             }
-            
+
             qDebug() << "  Loaded rule table:" << t.name << "(" << count << "rows)";
         }
 
+        // 关闭 SQLite 句柄；延迟到下一事件循环再 removeDatabase，避免 QSqlDatabase/驱动内部仍持有引用导致 "still in use" 告警
         sqlite_db.close();
-        QSqlDatabase::removeDatabase("duckdb_import");
+        const QString cn = conn_name;
+        QTimer::singleShot(0, [cn]() {
+            if (QSqlDatabase::contains(cn)) {
+                QSqlDatabase::removeDatabase(cn);
+            }
+        });
 
         qDebug() << "Rules loaded from SQLite";
         return true;
     } catch (const std::exception &e) {
+        // 异常路径同样用延迟删除兜底
+        for (int i = 1; i <= 16; i++) {
+            QString cn = QString("duckdb_import_%1").arg(i);
+            if (QSqlDatabase::contains(cn)) {
+                QSqlDatabase::removeDatabase(cn);
+            }
+        }
         qCritical() << "Load rules failed:" << e.what();
         return false;
     }
@@ -287,26 +338,45 @@ bool DuckDBManager::ExportToFile(const QString &table_name, const QString &file_
     try {
         auto con = CreateConnection();
         QFileInfo fi(file_path);
-        QString suffix = fi.suffix().toLower();
+        QString abs_path = fi.absoluteFilePath();
 
-        QString sql;
-        if (suffix == "csv") {
-            sql = QString("COPY %1 TO '%2' (FORMAT CSV, HEADER TRUE)")
-                .arg(table_name, file_path);
-        } else if (suffix == "parquet") {
-            sql = QString("COPY %1 TO '%2' (FORMAT PARQUET)")
-                .arg(table_name, file_path);
-        } else if (suffix == "xlsx") {
-            sql = QString("COPY %1 TO '%2' (FORMAT xlsx, HEADER TRUE)")
-                .arg(table_name, file_path);
-        } else {
+        // 1. 保证父目录存在
+        QDir().mkpath(fi.absolutePath());
+        if (!QDir(fi.absolutePath()).exists()) {
+            qCritical() << "Export failed: cannot create parent dir:" << fi.absolutePath();
             return false;
         }
 
+        // 2. 路径中的单引号需要双写（DuckDB SQL 字符串标准转义），否则会 Parser syntax error
+        QString escaped_path = abs_path;
+        escaped_path.replace("'", "''");
+
+        QString suffix = fi.suffix().toLower();
+        QString sql;
+        if (suffix == "csv") {
+            sql = QString("COPY %1 TO '%2' (FORMAT CSV, HEADER TRUE)")
+                .arg(table_name, escaped_path);
+        } else if (suffix == "parquet") {
+            sql = QString("COPY %1 TO '%2' (FORMAT PARQUET)")
+                .arg(table_name, escaped_path);
+        } else if (suffix == "xlsx" || suffix == "xls") {
+            // .xls 输出按 xlsx 格式（DuckDB xlsx 写在 Excel 里可正常打开）
+            sql = QString("COPY %1 TO '%2' (FORMAT xlsx, HEADER TRUE)")
+                .arg(table_name, escaped_path);
+        } else {
+            qCritical() << "Export failed: unsupported suffix:" << suffix;
+            return false;
+        }
+
+        qDebug() << "ExportToFile:" << sql;
         con.Query(sql.toStdString());
+        if (!QFileInfo::exists(abs_path) || QFileInfo(abs_path).size() == 0) {
+            qCritical() << "Export failed: output file missing or empty:" << abs_path;
+            return false;
+        }
         return true;
     } catch (const std::exception &e) {
-        qCritical() << "Export failed:" << e.what();
+        qCritical() << "Export failed: table=" << table_name << "path=" << file_path << "err=" << e.what();
         return false;
     }
 }
@@ -322,14 +392,21 @@ int64_t DuckDBManager::GetRowCount(const QString &table_name) {
 }
 
 bool DuckDBManager::TableExists(const QString &table_name) {
+    // 用 SHOW TABLES LIKE 替代 information_schema（DuckDB 偶发 information_schema 查不到的坑）
     try {
         auto con = CreateConnection();
         auto result = con.Query(
-            QString("SELECT 1 FROM information_schema.tables WHERE table_name = '%1'")
-                .arg(table_name.toLower()).toStdString());
+            QString("SHOW TABLES LIKE '%1'").arg(table_name.toLower()).toStdString());
         return result->RowCount() > 0;
     } catch (...) {
-        return false;
+        // 兜底：尝试 DESCRIBE 表，若不抛错则存在
+        try {
+            auto con = CreateConnection();
+            con.Query(QString("DESCRIBE SELECT * FROM %1 LIMIT 1").arg(table_name).toStdString());
+            return true;
+        } catch (...) {
+            return false;
+        }
     }
 }
 

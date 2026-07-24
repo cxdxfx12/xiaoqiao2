@@ -74,16 +74,69 @@ bool SqliteRuleRepository::Init() {
         aq.exec("ALTER TABLE freight_templates ADD COLUMN default_no_weight_fee REAL DEFAULT 0");
     }
 
-    // schema 升级后强制重新生成默认数据
-    if (current_version < 10) {
+    // 默认数据统一只初始化一次
+    // （旧版本 schema 升级 <10 必须初始化，新版本第一次运行也初始化）
+    bool need_init_default = (current_version < 10) || IsFirstRun();
+    if (need_init_default) {
+        if (current_version < 10) {
+            qInfo() << "Schema upgrade init: generating default data";
+        } else {
+            qInfo() << "First run: generating default data";
+        }
         InitDefaultData();
         // 修复前4个一口价阶梯的 additional_price 为0
+        // （新版 CreateDefaultTemplate 已正确写入 add_price=0，此修复主要兼容旧数据残留的情况）
         QSqlQuery fix_q(db_);
         fix_q.exec("UPDATE tiered_pricing SET additional_price = 0 WHERE tier_code IN ('tier_0_0.5', 'tier_0.5_1', 'tier_1_2', 'tier_2_3')");
     }
 
+    // 完整性兜底校验：即使 schema_version=11，但核心空表也视为损坏，全量补全默认数据
+    if (!need_init_default) {
+        if (!ValidateIntegrity()) {
+            qWarning() << "Integrity check failed: core tables empty, reinitializing default data...";
+            InitDefaultData();
+            QSqlQuery fix_q(db_);
+            fix_q.exec("UPDATE tiered_pricing SET additional_price = 0 WHERE tier_code IN ('tier_0_0.5', 'tier_0.5_1', 'tier_1_2', 'tier_2_3')");
+        }
+    }
+
+    // ============================================================
+    // Schema 11→12 数据一致性迁移：
+    // 早期 AddCustomer 创建完『cust_{customer_id}』专属报价模板后，
+    // 忘记 UPDATE customers.default_template = tpl_id，导致批量结算
+    // COALESCE(c.default_template, 'zto_standard') 全回退到中通标准，
+    // 燃油/加价策略/地区加价全部按中通而不是客户专属算。
+    // 这里自动回填：template_id = 'cust_' + customer_id，且模板存在就回填。
+    // ============================================================
+    {
+        QSqlQuery qsel(db_);
+        qsel.exec("SELECT customer_id FROM customers WHERE default_template IS NULL OR default_template = ''");
+        QVariantList custs_to_fix;
+        while (qsel.next()) custs_to_fix << qsel.value(0);
+
+        if (!custs_to_fix.isEmpty()) {
+            qInfo() << "[data-fix] 检测到" << custs_to_fix.size() << "条 customers.default_template 空记录，尝试按 cust_{id} 匹配专属模板回填";
+            QSqlQuery qexists(db_);
+            QSqlQuery qupdate(db_);
+            qexists.prepare("SELECT 1 FROM freight_templates WHERE template_id = ? LIMIT 1");
+            qupdate.prepare("UPDATE customers SET default_template = ?, updated_at = CURRENT_TIMESTAMP WHERE customer_id = ?");
+            int fixed = 0;
+            for (const auto &cidv : custs_to_fix) {
+                QString cid = cidv.toString();
+                QString tpl_id = "cust_" + cid;
+                qexists.addBindValue(tpl_id);
+                if (qexists.exec() && qexists.next()) {
+                    qupdate.addBindValue(tpl_id);
+                    qupdate.addBindValue(cid);
+                    if (qupdate.exec()) fixed++;
+                }
+            }
+            qInfo() << "[data-fix] 成功回填" << fixed << "条 customers.default_template";
+        }
+    }
+
     // 更新 schema 版本
-    int new_version = 11;
+    int new_version = 12;
     if (current_version < new_version) {
         vq.exec("DELETE FROM schema_version");
         vq.prepare("INSERT INTO schema_version VALUES (?)");
@@ -210,10 +263,6 @@ bool SqliteRuleRepository::CreateTables() {
            "end_date DATE NOT NULL,"
            "week_days VARCHAR(20))");
 
-    if (IsFirstRun()) {
-        InitDefaultData();
-    }
-
     return true;
 }
 
@@ -221,6 +270,7 @@ void SqliteRuleRepository::InitDefaultData() {
     qDebug() << "Initializing default data...";
 
     CreateDefaultTemplate();
+    CreateDefaultCustomers();
     CreateDefaultSurcharges();
     qDebug() << "Default data initialized.";
 }
@@ -298,7 +348,7 @@ bool SqliteRuleRepository::CreateDefaultTemplate() {
 
         QList<Tier> tiers = {
             {"tier_0_0.5", "0-0.5KG", 0, 0.5, 0.5, z.t05_first, 0.5, 0, 1},
-            {"tier_0.5_1", "0.51KG-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
+            {"tier_0.5_1", "0.5-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
             {"tier_1_2", "1-2KG", 1.0, 2.0, 1.0, z.t2_first, 1.0, 0, 3},
             {"tier_2_3", "2-3KG", 2.0, 3.0, 1.0, z.t3_first, 1.0, 0, 4},
             {"tier_3_30", "3-30KG", 3.0, 30.0, 1.0, z.mid_first, 1.0, z.mid_add, 5},
@@ -365,6 +415,32 @@ bool SqliteRuleRepository::CreateDefaultSurcharges() {
     addStrategy("peak_season", "旺季附加费",
                 "global", "percentage", 0.10, 5,
                 "旺季运费上浮10%（暂未启用日期限制）");
+
+    QString tpl_id = "zto_standard";
+
+    q.prepare("INSERT OR IGNORE INTO fuel_surcharge (template_id, effective_date, rate, is_active) VALUES (?,?,?,1)");
+    QList<QPair<QString, double>> fuel_list = {
+        {"2026-01-01", 0.00},
+        {"2026-02-01", 0.02},
+        {"2026-03-01", 0.03},
+        {"2026-04-01", 0.025},
+        {"2026-05-01", 0.015},
+    };
+    for (const auto &f : fuel_list) {
+        q.addBindValue(tpl_id); q.addBindValue(f.first); q.addBindValue(f.second);
+        q.exec();
+    }
+
+    q.prepare("INSERT OR IGNORE INTO remote_areas (template_id, province, city, district, surcharge, is_active) VALUES (?,?,?,?,?,1)");
+    QList<QPair<QString, double>> remote_list = {
+        {"新疆", 15.0},
+        {"西藏", 20.0},
+    };
+    for (const auto &r : remote_list) {
+        q.addBindValue(tpl_id); q.addBindValue(r.first);
+        q.addBindValue(""); q.addBindValue(""); q.addBindValue(r.second);
+        q.exec();
+    }
 
     return true;
 }
@@ -466,7 +542,7 @@ bool SqliteRuleRepository::AddTemplate(const QVariantMap &tpl) {
 
         QList<Tier> tiers = {
             {"tier_0_0.5", "0-0.5KG", 0, 0.5, 0.5, z.t05_first, 0.5, 0, 1},
-            {"tier_0.5_1", "0.51KG-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
+            {"tier_0.5_1", "0.5-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
             {"tier_1_2", "1-2KG", 1.0, 2.0, 1.0, z.t2_first, 1.0, 0, 3},
             {"tier_2_3", "2-3KG", 2.0, 3.0, 1.0, z.t3_first, 1.0, 0, 4},
             {"tier_3_30", "3-30KG", 3.0, 30.0, 1.0, z.mid_first, 1.0, z.mid_add, 5},
@@ -790,7 +866,7 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
 
         QList<Tier> tiers = {
             {"tier_0_0.5", "0-0.5KG", 0, 0.5, 0.5, z.t05_first, 0.5, 0, 1},
-            {"tier_0.5_1", "0.51KG-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
+            {"tier_0.5_1", "0.5-1KG", 0.5, 1.0, 1.0, z.t1_first, 0.5, 0, 2},
             {"tier_1_2", "1-2KG", 1.0, 2.0, 1.0, z.t2_first, 1.0, 0, 3},
             {"tier_2_3", "2-3KG", 2.0, 3.0, 1.0, z.t3_first, 1.0, 0, 4},
             {"tier_3_30", "3-30KG", 3.0, 30.0, 1.0, z.mid_first, 1.0, z.mid_add, 5},
@@ -815,6 +891,19 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
     q.prepare("INSERT INTO fuel_surcharge (template_id, effective_date, rate) VALUES (?,?,?)");
     q.addBindValue(tpl_id); q.addBindValue("2026-01-01"); q.addBindValue(0.0);
     q.exec();
+
+    // ============================================================
+    // Bug fix: 创建完客户专属报价表后，把 default_template 回写到 customers
+    // 否则批量结算 COALESCE(c.default_template, 'zto_standard') 会回退到中通标准，
+    // 燃油/区域加价/加价策略 全部按中通算而不是客户专属算
+    // ============================================================
+    QSqlQuery q_upd(db_);
+    q_upd.prepare("UPDATE customers SET default_template = ?, updated_at = CURRENT_TIMESTAMP WHERE customer_id = ?");
+    q_upd.addBindValue(tpl_id);
+    q_upd.addBindValue(cust_id);
+    if (!q_upd.exec()) {
+        qWarning() << "[SqliteRuleRepository::AddCustomer] 回写 default_template 失败:" << q_upd.lastError().text();
+    }
 
     return true;
 }
@@ -842,8 +931,15 @@ bool SqliteRuleRepository::DeleteCustomer(const QString &customer_id) {
 QVariantList SqliteRuleRepository::ListFuelSurcharges(const QString &template_id) {
     QVariantList result;
     QSqlQuery q(db_);
-    q.prepare("SELECT id, template_id, effective_date, rate, is_active FROM fuel_surcharge WHERE template_id = ? ORDER BY effective_date DESC");
-    q.addBindValue(template_id);
+    QString sql = "SELECT id, template_id, effective_date, rate, is_active FROM fuel_surcharge WHERE 1=1";
+    QVariantList binds;
+    if (!template_id.isEmpty()) {
+        sql += " AND template_id = ?";
+        binds << template_id;
+    }
+    sql += " ORDER BY template_id, effective_date DESC";
+    q.prepare(sql);
+    for (const auto &b : binds) q.addBindValue(b);
     q.exec();
     while (q.next()) {
         QVariantMap m;
@@ -897,8 +993,15 @@ bool SqliteRuleRepository::SetFuelSurchargeActive(int id, bool active) {
 QVariantList SqliteRuleRepository::ListRemoteAreas(const QString &template_id) {
     QVariantList result;
     QSqlQuery q(db_);
-    q.prepare("SELECT id, template_id, province, city, district, surcharge, is_active FROM remote_areas WHERE template_id = ? ORDER BY province, city, district");
-    q.addBindValue(template_id);
+    QString sql = "SELECT id, template_id, province, city, district, surcharge, is_active FROM remote_areas WHERE 1=1";
+    QVariantList binds;
+    if (!template_id.isEmpty()) {
+        sql += " AND template_id = ?";
+        binds << template_id;
+    }
+    sql += " ORDER BY template_id, province, city, district";
+    q.prepare(sql);
+    for (const auto &b : binds) q.addBindValue(b);
     q.exec();
     while (q.next()) {
         QVariantMap m;
@@ -953,6 +1056,91 @@ bool SqliteRuleRepository::SetRemoteAreaActive(int id, bool active) {
     q.addBindValue(active ? 1 : 0);
     q.addBindValue(id);
     return q.exec();
+}
+
+bool SqliteRuleRepository::CreateDefaultCustomers() {
+    QSqlQuery q(db_);
+
+    struct DefaultCustomer {
+        QString id;
+        QString name;
+        double discount;
+        QString def_tpl;
+        QString contact;
+        QString phone;
+    };
+    QList<DefaultCustomer> custs = {
+        {"C001", "华东电商客户A", 1.00, "zto_standard", "张经理", "13800000001"},
+        {"C002", "华南批发客户B", 0.95, "zto_standard", "李主管", "13800000002"},
+        {"C003", "华北零售客户C", 1.00, "zto_standard", "王总",   "13800000003"},
+    };
+
+    for (const auto &c : custs) {
+        q.prepare("INSERT OR IGNORE INTO customers "
+                  "(customer_id, customer_name, discount_rate, default_template, contact_person, contact_phone, address) "
+                  "VALUES (?,?,?,?,?,?,?)");
+        q.addBindValue(c.id);
+        q.addBindValue(c.name);
+        q.addBindValue(c.discount);
+        q.addBindValue(c.def_tpl);
+        q.addBindValue(c.contact);
+        q.addBindValue(c.phone);
+        q.addBindValue("");
+        if (!q.exec()) {
+            qCritical() << "CreateDefaultCustomers failed for" << c.id << ":" << q.lastError().text();
+            return false;
+        }
+    }
+
+    qDebug() << "Default customers initialized:" << custs.size() << "records";
+    return true;
+}
+
+bool SqliteRuleRepository::ValidateIntegrity() {
+    QSqlQuery q(db_);
+
+    q.exec("SELECT COUNT(*) FROM freight_templates");
+    int tpl_count = q.next() ? q.value(0).toInt() : 0;
+    if (tpl_count == 0) {
+        qWarning() << "Integrity: freight_templates is EMPTY";
+        return false;
+    }
+
+    q.exec("SELECT COUNT(*) FROM customers");
+    int cust_count = q.next() ? q.value(0).toInt() : 0;
+    if (cust_count == 0) {
+        qWarning() << "Integrity: customers is EMPTY";
+        return false;
+    }
+
+    q.exec("SELECT COUNT(*) FROM tiered_pricing");
+    int tier_count = q.next() ? q.value(0).toInt() : 0;
+    if (tier_count == 0) {
+        qWarning() << "Integrity: tiered_pricing is EMPTY";
+        return false;
+    }
+
+    q.exec("SELECT COUNT(*) FROM fuel_surcharge WHERE is_active = 1");
+    int fs_count = q.next() ? q.value(0).toInt() : 0;
+    if (fs_count == 0) {
+        qWarning() << "Integrity: fuel_surcharge has NO active records";
+        return false;
+    }
+
+    q.exec("SELECT COUNT(*) FROM zone_group_provinces");
+    int zp_count = q.next() ? q.value(0).toInt() : 0;
+    if (zp_count == 0) {
+        qWarning() << "Integrity: zone_group_provinces is EMPTY";
+        return false;
+    }
+
+    qDebug() << "Integrity check passed:"
+             << "templates=" << tpl_count
+             << "customers=" << cust_count
+             << "tiers=" << tier_count
+             << "fuel_active=" << fs_count
+             << "zone_provinces=" << zp_count;
+    return true;
 }
 
 } // namespace freight::db

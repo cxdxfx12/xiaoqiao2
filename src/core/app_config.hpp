@@ -1,16 +1,26 @@
 #pragma once
 #include <QString>
-#include <QStandardPaths>
-#include <QDir>
+#include <QStringList>
+#include <QMap>
+#include <QSet>
 #include <QSettings>
-#include <QThread>
 #include <memory>
 
-#ifdef Q_OS_MAC
-#include <sys/sysctl.h>
-#endif
-
 namespace freight::core {
+
+struct TemplateFingerprint {
+    QString template_id;
+    QString display_name;
+    QString courier_name;
+    QStringList required_keywords;
+    QMap<QString, QString> column_mapping;
+    bool enabled = true;
+    bool is_builtin = false;
+};
+
+inline bool operator==(const TemplateFingerprint &a, const TemplateFingerprint &b) {
+    return a.template_id == b.template_id;
+}
 
 class AppConfig {
 public:
@@ -19,106 +29,107 @@ public:
         return instance;
     }
 
-    bool Init() {
-        QString data_dir = QStandardPaths::writableLocation(
-            QStandardPaths::AppDataLocation);
-        QDir().mkpath(data_dir);
-        QDir().mkpath(data_dir + "/results");
-        QDir().mkpath(data_dir + "/cache");
-        QDir().mkpath(data_dir + "/logs");
-        data_dir_ = data_dir;
+    bool Init();
 
-        settings_ = std::make_unique<QSettings>(data_dir_ + "/config.ini", QSettings::IniFormat);
-        LoadPerformanceSettings();
-        return true;
-    }
+    QString GetDataDir() const;
+    QString GetRulesDbPath() const;
+    QString GetHistoryDbPath() const;
+    QString GetResultsDir() const;
+    QString GetCacheDir() const;
+    QString GetLogsDir() const;
 
-    QString GetDataDir() const { return data_dir_; }
-    QString GetRulesDbPath() const { return data_dir_ + "/rules.db"; }
-    QString GetHistoryDbPath() const { return data_dir_ + "/history.db"; }
-    QString GetResultsDir() const { return data_dir_ + "/results"; }
-    QString GetCacheDir() const { return data_dir_ + "/cache"; }
-    QString GetLogsDir() const { return data_dir_ + "/logs"; }
+    QString GetCompanyName() const;
+    QString GetAppName() const;
+    QString GetWebsite() const;
+    QString GetServicePhone() const;
+    QString GetVersion() const;
 
-    QString GetCompanyName() const { return "杭州喵喵至家网络有限公司"; }
-    QString GetAppName() const { return "小乔运费结算"; }
-    QString GetWebsite() const { return "www.hbdxm.com"; }
-    QString GetServicePhone() const { return "17771300068 / 19171045360"; }
-    QString GetVersion() const { return "1.0.0"; }
+    static int GetTotalMemoryMB();
+    static int GetCpuCoreCount();
 
-    static int GetTotalMemoryMB() {
-#ifdef Q_OS_MAC
-        int64_t mem = 0;
-        size_t len = sizeof(mem);
-        if (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) {
-            return static_cast<int>(mem / (1024 * 1024));
-        }
-        return 8192;
-#else
-        return 8192;
-#endif
-    }
+    int GetMemoryLimitMB() const;
+    int GetThreadCount() const;
+    bool GetAutoPerformance() const;
 
-    static int GetCpuCoreCount() {
-        return QThread::idealThreadCount() > 0 ? QThread::idealThreadCount() : 4;
-    }
+    void SetMemoryLimitMB(int mb);
+    void SetThreadCount(int count);
+    void SetAutoPerformance(bool auto_perf);
 
-    int GetMemoryLimitMB() const { return memory_limit_mb_; }
-    int GetThreadCount() const { return thread_count_; }
-    bool GetAutoPerformance() const { return auto_performance_; }
+    void ApplyAutoPerformance();
 
-    void SetMemoryLimitMB(int mb) {
-        memory_limit_mb_ = mb;
-        auto_performance_ = false;
-        SavePerformanceSettings();
-    }
+    static const QMap<QString, QString>& StandardColumnChinese();
+    static const QStringList& StandardColumnOrder();
+    static QString StandardColumnToCn(const QString &en_name);
+    static QString CnToStandardColumn(const QString &cn_name);
+    static const QMap<QString, QStringList>& DefaultMappingKeywords();
+    static const QSet<QString>& RequiredStandardColumns();
 
-    void SetThreadCount(int count) {
-        thread_count_ = count;
-        auto_performance_ = false;
-        SavePerformanceSettings();
-    }
+    QMap<QString, QStringList> GetMappingKeywords() const;
+    void SetMappingKeywords(const QMap<QString, QStringList>& map);
+    void AddMappingKeyword(const QString& standard_col, const QString& keyword);
+    void RemoveMappingKeyword(const QString& standard_col, const QString& keyword);
+    void ResetMappingKeywords();
+    QMap<QString, QStringList> GetEffectiveMappingKeywords() const;
 
-    void SetAutoPerformance(bool auto_perf) {
-        auto_performance_ = auto_perf;
-        if (auto_perf) {
-            ApplyAutoPerformance();
-        }
-        SavePerformanceSettings();
-    }
+    // ========== S5 记住常用目录 ==========
+    QString GetLastInputDir() const;
+    void SetLastInputDir(const QString &dir);
+    QString GetLastOutputDir() const;
+    void SetLastOutputDir(const QString &dir);
+    QStringList GetRecentFiles() const;
+    void AddRecentFile(const QString &file);
+    void ClearRecentFiles();
 
-    void ApplyAutoPerformance() {
-        int total_mem = GetTotalMemoryMB();
-        memory_limit_mb_ = static_cast<int>(total_mem * 0.9);
-        int cores = GetCpuCoreCount();
-        thread_count_ = std::max(1, static_cast<int>(cores * 0.9));
-    }
+    // ========== S6 金额染色阈值 ==========
+    double GetFeeLowThreshold() const;
+    void SetFeeLowThreshold(double v);
+    double GetFeeHighThreshold() const;
+    void SetFeeHighThreshold(double v);
+
+    // ========== 功能7 快递模板指纹库 ==========
+    static const QList<TemplateFingerprint>& BuiltinTemplateFingerprints();
+    QList<TemplateFingerprint> GetCustomTemplateFingerprints() const;
+    void AddCustomTemplateFingerprint(const TemplateFingerprint &fp);
+    void RemoveCustomTemplateFingerprint(const QString &template_id);
+    void UpdateCustomTemplateFingerprint(const TemplateFingerprint &fp);
+    QList<TemplateFingerprint> GetAllTemplateFingerprints(bool enabled_only = false) const;
+    bool IsTemplateEnabled(const QString &template_id) const;
+    void SetTemplateEnabled(const QString &template_id, bool enabled);
+    bool GetTemplateAutoDetectGlobal() const;
+    void SetTemplateAutoDetectGlobal(bool enabled);
 
 private:
     AppConfig() = default;
+    ~AppConfig() = default;
+    AppConfig(const AppConfig&) = delete;
+    AppConfig& operator=(const AppConfig&) = delete;
 
-    void LoadPerformanceSettings() {
-        auto_performance_ = settings_->value("performance/auto", true).toBool();
-        if (auto_performance_) {
-            ApplyAutoPerformance();
-        } else {
-            memory_limit_mb_ = settings_->value("performance/memory_limit_mb", 4096).toInt();
-            thread_count_ = settings_->value("performance/thread_count", 4).toInt();
-        }
-    }
-
-    void SavePerformanceSettings() {
-        settings_->setValue("performance/auto", auto_performance_);
-        settings_->setValue("performance/memory_limit_mb", memory_limit_mb_);
-        settings_->setValue("performance/thread_count", thread_count_);
-        settings_->sync();
-    }
+    void LoadPerformanceSettings();
+    void SavePerformanceSettings();
+    void LoadMappingKeywords();
+    void SaveMappingKeywords();
+    void LoadRecentFiles();
+    void SaveRecentFiles();
+    void LoadFeeThresholds();
+    void SaveFeeThresholds();
+    void LoadCustomTemplates();
+    void SaveCustomTemplates();
 
     QString data_dir_;
     std::unique_ptr<QSettings> settings_;
     int memory_limit_mb_ = 4096;
     int thread_count_ = 4;
     bool auto_performance_ = true;
+    QMap<QString, QStringList> custom_keywords_;
+
+    QString last_input_dir_;
+    QString last_output_dir_;
+    QStringList recent_files_;
+    double fee_low_threshold_ = 5.0;
+    double fee_high_threshold_ = 20.0;
+    QList<TemplateFingerprint> custom_templates_;
+    QSet<QString> disabled_template_ids_;
+    bool template_auto_detect_global_ = true;
 };
 
 } // namespace freight::core
