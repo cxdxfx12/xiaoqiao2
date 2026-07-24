@@ -50,7 +50,7 @@ matched_zone AS (
         ON zg.template_id = zgp.template_id
        AND zg.group_code = zgp.group_code
     WHERE zgp.template_id = '%1'
-      AND zgp.province = '%2'
+      AND REGEXP_REPLACE(zgp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2'
     LIMIT 1
 ),
 matched_tier AS (
@@ -145,7 +145,8 @@ strategy_surcharge_calc AS (
               AND s.template_id = '%1'
               AND (
                   s.strategy_scope = 'global'
-                  OR (s.strategy_scope = 'province' AND sp.province = '%2')
+                  OR (s.strategy_scope = 'province'
+                      AND REGEXP_REPLACE(sp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') = '%2')
                   OR (s.strategy_scope = 'customer' AND sc.customer_id = '%5')
               )
               AND (sd.strategy_id IS NULL
@@ -312,7 +313,8 @@ matched_zone AS (
     FROM template_info ti
     LEFT JOIN zone_group_provinces zgp
         ON zgp.template_id = ti.template_id
-       AND zgp.province = REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+       AND REGEXP_REPLACE(zgp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+         = REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
     LEFT JOIN zone_groups zg
         ON zg.template_id = zgp.template_id
        AND zg.group_code = zgp.group_code
@@ -422,7 +424,8 @@ strategy_surcharge_calc AS (
               AND (
                   s.strategy_scope = 'global'
                   OR (s.strategy_scope = 'province'
-                      AND sp.province = REGEXP_REPLACE(rac.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', ''))
+                      AND REGEXP_REPLACE(sp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                        = REGEXP_REPLACE(rac.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', ''))
                   OR (s.strategy_scope = 'customer' AND sc.customer_id = rac.customer_id)
               )
               AND (sd.strategy_id IS NULL

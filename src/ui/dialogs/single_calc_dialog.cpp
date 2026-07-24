@@ -51,6 +51,10 @@ void SingleCalcDialog::SetupUI() {
     edt_city_->setPlaceholderText("选填");
     form_layout->addRow("目的城市：", edt_city_);
 
+    edt_customer_ = new QLineEdit();
+    edt_customer_->setPlaceholderText("选填，用于客户级加价策略匹配");
+    form_layout->addRow("客户：", edt_customer_);
+
     spn_weight_ = new QDoubleSpinBox();
     spn_weight_->setRange(0.01, 99999.0);
     spn_weight_->setDecimals(3);
@@ -194,12 +198,13 @@ QPushButton#normalBtn:hover {
 void SingleCalcDialog::OnCalc() {
     QString province = cbo_province_->currentText();
     QString city = edt_city_->text().trimmed();
+    QString customer = edt_customer_->text().trimmed();
     double weight = spn_weight_->value();
     double vol_weight = spn_vol_weight_->value();
     QString tpl_id = cbo_template_->currentData().toString();
 
     services::CalcService calc_svc;
-    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id, city);
+    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id, city, customer);
 
     if (result.success) {
         lbl_result_charge_weight_->setText(QString::number(result.charge_weight, 'f', 3) + " kg");
@@ -220,6 +225,7 @@ void SingleCalcDialog::OnClear() {
     edt_order_id_->clear();
     cbo_province_->setCurrentIndex(0);
     edt_city_->clear();
+    edt_customer_->clear();
     spn_weight_->setValue(1.0);
     spn_vol_weight_->setValue(0.0);
     lbl_result_charge_weight_->setText("—");

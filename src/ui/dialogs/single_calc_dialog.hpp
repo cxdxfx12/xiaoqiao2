@@ -27,6 +27,7 @@ private:
     QLineEdit *edt_order_id_ = nullptr;
     QComboBox *cbo_province_ = nullptr;
     QLineEdit *edt_city_ = nullptr;
+    QLineEdit *edt_customer_ = nullptr;
     QDoubleSpinBox *spn_weight_ = nullptr;
     QDoubleSpinBox *spn_vol_weight_ = nullptr;
     QComboBox *cbo_template_ = nullptr;
