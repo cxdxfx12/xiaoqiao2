@@ -214,14 +214,14 @@ bool SqliteRuleRepository::CreateTables() {
 
     q.exec("CREATE TABLE IF NOT EXISTS fuel_surcharge ("
            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-           "template_id VARCHAR(100) NOT NULL,"
+           "template_id VARCHAR(100) DEFAULT '*' NOT NULL,"
            "effective_date DATE NOT NULL,"
            "rate REAL NOT NULL,"
            "is_active INTEGER DEFAULT 1)");
 
     q.exec("CREATE TABLE IF NOT EXISTS remote_areas ("
            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-           "template_id VARCHAR(100) NOT NULL,"
+           "template_id VARCHAR(100) DEFAULT '*' NOT NULL,"
            "province VARCHAR(50),"
            "city VARCHAR(100),"
            "district VARCHAR(100),"

@@ -517,7 +517,8 @@ void RuleSettingDialog::LoadData() {
         fuel_table_->setItem(i, 0, new QTableWidgetItem(QString::number(f["id"].toInt())));
         fuel_table_->setItem(i, 1, new QTableWidgetItem(f["effective_date"].toString()));
         fuel_table_->setItem(i, 2, new QTableWidgetItem(QString::number(f["rate"].toDouble() * 100, 'f', 2) + "%"));
-        fuel_table_->setItem(i, 3, new QTableWidgetItem(f["template_id"].toString()));
+        QString tpl_str = f["template_id"].toString();
+        fuel_table_->setItem(i, 3, new QTableWidgetItem(tpl_str == "*" ? "◆ 全局（所有模板通用）" : tpl_str));
         bool active = f["is_active"].toBool();
         auto *status_item = new QTableWidgetItem(active ? "✅ 启用" : "❌ 停用");
         status_item->setForeground(active ? QColor("#67c23a") : QColor("#909399"));
@@ -535,7 +536,8 @@ void RuleSettingDialog::LoadData() {
         remote_table_->setItem(i, 2, new QTableWidgetItem(r["city"].toString()));
         remote_table_->setItem(i, 3, new QTableWidgetItem(r["district"].toString()));
         remote_table_->setItem(i, 4, new QTableWidgetItem("¥ " + QString::number(r["surcharge"].toDouble(), 'f', 2)));
-        remote_table_->setItem(i, 5, new QTableWidgetItem(r["template_id"].toString()));
+        QString tpl_r = r["template_id"].toString();
+        remote_table_->setItem(i, 5, new QTableWidgetItem(tpl_r == "*" ? "◆ 全局（所有模板通用）" : tpl_r));
         bool active = r["is_active"].toBool();
         auto *status_item = new QTableWidgetItem(active ? "✅ 启用" : "❌ 停用");
         status_item->setForeground(active ? QColor("#67c23a") : QColor("#909399"));
@@ -1131,7 +1133,8 @@ void RuleSettingDialog::ShowFuelDialog(bool is_add) {
     auto tpls = repo.ListTemplates();
     QString default_tpl = cb_fuel_filter_ && !cb_fuel_filter_->currentData().toString().isEmpty()
                               ? cb_fuel_filter_->currentData().toString()
-                              : (tpls.isEmpty() ? QString() : tpls.first().toMap()["template_id"].toString());
+                              : "*";
+    tpl_combo->addItem("◆ 全局（所有模板通用）", "*");
     for (const auto &tv : tpls) {
         const auto &t = tv.toMap();
         tpl_combo->addItem(QString("%1 (%2)").arg(t["template_name"].toString(), t["template_id"].toString()),
@@ -1150,7 +1153,6 @@ void RuleSettingDialog::ShowFuelDialog(bool is_add) {
     QString orig_tpl;
     if (!is_add && fuel_table_->currentRow() >= 0) {
         id_to_edit = fuel_table_->item(fuel_table_->currentRow(), 0)->text().toInt();
-        // 用空串查所有模板，不管筛选结果
         auto fuels = repo.ListFuelSurcharges("");
         for (const auto &f : fuels) {
             if (f.toMap()["id"].toInt() == id_to_edit) {
@@ -1222,7 +1224,8 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
     auto tpls = repo.ListTemplates();
     QString default_tpl = cb_remote_filter_ && !cb_remote_filter_->currentData().toString().isEmpty()
                               ? cb_remote_filter_->currentData().toString()
-                              : (tpls.isEmpty() ? QString() : tpls.first().toMap()["template_id"].toString());
+                              : "*";
+    tpl_combo->addItem("◆ 全局（所有模板通用）", "*");
     for (const auto &tv : tpls) {
         const auto &t = tv.toMap();
         tpl_combo->addItem(QString("%1 (%2)").arg(t["template_name"].toString(), t["template_id"].toString()),

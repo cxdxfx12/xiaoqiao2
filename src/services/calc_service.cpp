@@ -96,10 +96,10 @@ fuel_surcharge_calc AS (
         COALESCE(fs.rate, 0) * bfc.base_fee AS fuel_surcharge
     FROM base_fee_calc bfc
     LEFT JOIN fuel_surcharge fs
-        ON fs.template_id = '%1'
+        ON fs.template_id IN ('%1', '*')
        AND fs.is_active = 1
        AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
-                                 WHERE template_id = '%1'
+                                 WHERE template_id IN ('%1', '*')
                                    AND is_active = 1
                                    AND effective_date <= CURRENT_DATE)
 ),
@@ -109,7 +109,7 @@ remote_area_calc AS (
         COALESCE((
             SELECT SUM(ra.surcharge)
             FROM remote_areas ra
-            WHERE ra.template_id = '%1'
+            WHERE ra.template_id IN ('%1', '*')
               AND ra.is_active = 1
               AND (
                   (ra.province IS NOT NULL AND ra.province <> ''
@@ -376,10 +376,10 @@ fuel_surcharge_calc AS (
         COALESCE(fs.rate, 0) * bfc.base_fee AS fuel_surcharge
     FROM base_fee_calc bfc
     LEFT JOIN fuel_surcharge fs
-        ON fs.template_id = bfc.template_id
+        ON fs.template_id IN (bfc.template_id, '*')
        AND fs.is_active = 1
        AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
-                                 WHERE template_id = bfc.template_id
+                                 WHERE template_id IN (bfc.template_id, '*')
                                    AND is_active = 1
                                    AND effective_date <= CURRENT_DATE)
 ),
@@ -389,7 +389,7 @@ remote_area_calc AS (
         COALESCE((
             SELECT SUM(ra.surcharge)
             FROM remote_areas ra
-            WHERE ra.template_id = fsc.template_id
+            WHERE ra.template_id IN (fsc.template_id, '*')
               AND ra.is_active = 1
               AND (
                   (ra.province IS NOT NULL AND ra.province <> ''
