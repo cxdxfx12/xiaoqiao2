@@ -114,7 +114,10 @@ bool DuckDBManager::LoadRulesFromSQLite(const QString &rules_db_path) {
                     description VARCHAR,
                     is_default INTEGER DEFAULT 0,
                     created_at TIMESTAMP,
-                    updated_at TIMESTAMP
+                    updated_at TIMESTAMP,
+                    tpl_rounding_mode VARCHAR DEFAULT 'ceil_0_1kg',
+                    tpl_additional_unit DOUBLE DEFAULT 1.0,
+                    tpl_vol_divisor INTEGER DEFAULT 6000
                 )
             )SQL"},
             {"zone_groups", R"SQL(

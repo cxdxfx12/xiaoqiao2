@@ -239,3 +239,40 @@ if(APPLE)
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 endif()
+
+# 计费参数回归测试（console 版）
+add_executable(billing_params_test
+    tools/billing_params_test/main.cpp
+    src/core/app_config.hpp
+    src/core/app_config.cpp
+    src/core/freight_types.hpp
+    src/core/license_manager.hpp
+    src/core/license_manager.cpp
+    src/db/duckdb_manager.hpp
+    src/db/duckdb_manager.cpp
+    src/db/sqlite_rule_repository.hpp
+    src/db/sqlite_rule_repository.cpp
+    src/services/rule_service.hpp
+    src/services/rule_service.cpp
+    src/services/calc_service.hpp
+    src/services/calc_service.cpp
+    src/services/history_service.hpp
+    src/services/history_service.cpp
+)
+target_include_directories(billing_params_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${DUCKDB_INCLUDE_DIR}
+)
+target_link_libraries(billing_params_test PRIVATE
+    Qt6::Core
+    Qt6::Sql
+    Qt6::Concurrent
+    Qt6::Network
+    ${DUCKDB_LIBRARY}
+)
+if(APPLE)
+    set_target_properties(billing_params_test PROPERTIES
+        MACOSX_BUNDLE OFF
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+endif()
