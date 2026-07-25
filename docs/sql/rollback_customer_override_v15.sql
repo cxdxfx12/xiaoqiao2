@@ -26,14 +26,32 @@ UPDATE customers
 SET cust_rounding_mode         = '',
     cust_additional_unit       = 0,
     cust_vol_divisor           = 0,
-    cust_avg_enabled           = 0,
-    cust_min_avg_kg_per_piece  = 0,
-    cust_avg_default_pieces    = 0,
+    avg_weight_tpl_id          = NULL,
     cust_contract_no           = ''
 WHERE 1=1;
 
+-- 另：若 v1.0 老库存在过 cust_avg_enabled / cust_min_avg_kg_per_piece / cust_avg_default_pieces
+-- （v1.1 已删除，不再使用），可手动取消注释清字段（若存在）：
+-- UPDATE customers
+-- SET cust_avg_enabled = 0,
+--     cust_min_avg_kg_per_piece = 0,
+--     cust_avg_default_pieces = 0
+-- WHERE 1=1;
+
 -- 把 user_version 打回 10（下次启动时不会再跑 v11→v15 的 ALTER 升级路径）
 PRAGMA user_version = 10;
+
+-- -------- v1.1 新增：两张独立拉均重合同表（avg_weight_templates / avg_weight_zones）--------
+-- 温和降级（推荐先跑）：置 is_active=0 不参与计算；不清空数据，未来可重启用。
+UPDATE customers SET avg_weight_tpl_id = NULL WHERE 1=1;
+UPDATE avg_weight_templates SET is_active = 0 WHERE 1=1;
+
+-- 物理删除（仅当确认以后永远不用拉均重合同功能再跑）
+-- 先备份 rules.db！
+-- BEGIN;
+-- DROP TABLE IF EXISTS avg_weight_zones;
+-- DROP TABLE IF EXISTS avg_weight_templates;
+-- COMMIT;
 
 -- -------- 模式二：物理删列（仅 SQLite >= 3.35，确定彻底废弃本功能再跑）--------
 -- 先手动注释去掉下面的 BEGIN / COMMIT，再运行。
