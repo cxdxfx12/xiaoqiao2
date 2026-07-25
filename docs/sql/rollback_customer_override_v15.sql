@@ -21,6 +21,9 @@ SET tpl_avg_weight_enabled    = 0,
     tpl_min_avg_kg_per_piece  = 1.0,
     tpl_avg_default_pieces    = 1
 WHERE 1=1;
+-- 注：上面 3 列（tpl_avg_weight_enabled / tpl_min_avg_kg_per_piece / tpl_avg_default_pieces）
+--     仅存在于 v1.0 草案。v1.1 / v1.2 起已废弃，改用独立 avg_weight_templates / avg_weight_zones 两表；
+--     留在此段是为了兼容万一早期测试落过 v1.0 结构的老库。
 
 UPDATE customers
 SET cust_rounding_mode         = '',
@@ -51,6 +54,31 @@ UPDATE avg_weight_templates SET is_active = 0 WHERE 1=1;
 -- BEGIN;
 -- DROP TABLE IF EXISTS avg_weight_zones;
 -- DROP TABLE IF EXISTS avg_weight_templates;
+-- COMMIT;
+
+-- -------- v1.2 新增：avg_weight_templates 5 个轻小件参数（pool_min/max / base_avg / fee_cap / over_cap）--------
+-- 温和降级：把合同量化参数复位为行业/本项目默认值，但不破坏结构（可随时改回来）
+UPDATE avg_weight_templates SET
+    avg_pool_min_kg   = 0.0,   -- 进池门槛下沿
+    avg_pool_max_kg   = 1.0,   -- 进池门槛上沿（1kg，超了直接回阶梯）
+    base_avg_kg       = 0.3,   -- 约定基准均重：≤0.3kg都是基准价
+    base_fee          = 2.7,   -- 基准价（元/票）
+    step_kg           = 0.1,   -- 超基准每0.1kg一档
+    step_fee          = 0.2,   -- 每档加价0.2元
+    avg_fee_cap_kg    = 1.0,   -- 均重加价封顶kg：超了不再加（或走over_cap_mode策略）
+    over_cap_mode     = 0,     -- 0=按1kg封顶继续算  1=超了就整组回退阶梯
+    min_tickets       = 50,    -- 样本量门槛：<50单整组回退阶梯
+    reuse_zone_groups = 1      -- 1=省分区直接复用主模板，少配置一次
+WHERE 1=1;
+
+-- 物理删除（SQLite >=3.35 才支持 DROP COLUMN；仅确定要废弃拉均重再跑）
+-- BEGIN;
+-- ALTER TABLE avg_weight_templates DROP COLUMN avg_pool_min_kg;
+-- ALTER TABLE avg_weight_templates DROP COLUMN avg_pool_max_kg;
+-- ALTER TABLE avg_weight_templates DROP COLUMN base_avg_kg;
+-- ALTER TABLE avg_weight_templates DROP COLUMN avg_fee_cap_kg;
+-- ALTER TABLE avg_weight_templates DROP COLUMN over_cap_mode;
+-- ALTER TABLE avg_weight_templates DROP COLUMN reuse_zone_groups;
 -- COMMIT;
 
 -- -------- 模式二：物理删列（仅 SQLite >= 3.35，确定彻底废弃本功能再跑）--------
