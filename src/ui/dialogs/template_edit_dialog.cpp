@@ -16,6 +16,7 @@
 #include <QSet>
 #include <QMap>
 #include <QFont>
+#include <QWidget>
 
 namespace freight::ui::dialogs {
 
@@ -39,46 +40,73 @@ void TemplateEditDialog::SetTemplateId(const QString &id) {
     LoadData();
 }
 
+double TemplateEditDialog::CurrentAddUnit() const {
+    const double preset = cb_add_unit_->currentData().toDouble();
+    return preset > 0 ? preset : spn_add_unit_custom_->value();
+}
+int TemplateEditDialog::CurrentVolDivisor() const {
+    const int preset = cb_vol_divisor_->currentData().toInt();
+    return preset > 0 ? preset : spn_vol_divisor_custom_->value();
+}
+QString TemplateEditDialog::CurrentRoundingMode() const {
+    return cb_rounding_mode_->currentData().toString();
+}
+
+void TemplateEditDialog::SyncVolDivisorComboFromValue(int value) {
+    for (int i = 0; i < cb_vol_divisor_->count(); ++i) {
+        if (cb_vol_divisor_->itemData(i).toInt() == value) {
+            cb_vol_divisor_->setCurrentIndex(i);
+            spn_vol_divisor_custom_->setEnabled(false);
+            return;
+        }
+    }
+    int idx = cb_vol_divisor_->findData(-1);
+    if (idx >= 0) cb_vol_divisor_->setCurrentIndex(idx);
+    spn_vol_divisor_custom_->setValue(value);
+    spn_vol_divisor_custom_->setEnabled(true);
+}
+void TemplateEditDialog::SyncAddUnitComboFromValue(double value) {
+    for (int i = 0; i < cb_add_unit_->count(); ++i) {
+        const double d = cb_add_unit_->itemData(i).toDouble();
+        if (d > 0 && qAbs(d - value) < 0.0001) {
+            cb_add_unit_->setCurrentIndex(i);
+            spn_add_unit_custom_->setEnabled(false);
+            return;
+        }
+    }
+    int idx = cb_add_unit_->findData(-1.0);
+    if (idx >= 0) cb_add_unit_->setCurrentIndex(idx);
+    spn_add_unit_custom_->setValue(value);
+    spn_add_unit_custom_->setEnabled(true);
+}
+void TemplateEditDialog::SyncRoundingComboFromMode(const QString &mode) {
+    for (int i = 0; i < cb_rounding_mode_->count(); ++i) {
+        if (cb_rounding_mode_->itemData(i).toString() == mode) {
+            cb_rounding_mode_->setCurrentIndex(i);
+            return;
+        }
+    }
+    int idx = cb_rounding_mode_->findData("ceil_0_1kg");
+    if (idx >= 0) cb_rounding_mode_->setCurrentIndex(idx);
+}
+
 void TemplateEditDialog::SetupUI() {
     setWindowTitle(is_new_ ? "新增模板" : "编辑模板");
-    resize(1200, 700);
+    resize(1200, 740);
     setModal(true);
 
     auto *main_layout = new QVBoxLayout(this);
     main_layout->setContentsMargins(15, 15, 15, 15);
     main_layout->setSpacing(10);
 
-    // ====== 模板基本信息 ======
+    // ====== 模板基础信息 ======
     auto *info_group = new QGroupBox("模板信息");
     auto *info_form = new QFormLayout(info_group);
 
     edt_id_ = new QLineEdit();
     edt_name_ = new QLineEdit();
     edt_carrier_ = new QLineEdit();
-
-    spn_first_weight_ = new QDoubleSpinBox();
-    spn_first_weight_->setRange(0.1, 100.0);
-    spn_first_weight_->setSingleStep(0.5);
-    spn_first_weight_->setDecimals(1);
-
-    spn_add_unit_ = new QDoubleSpinBox();
-    spn_add_unit_->setRange(0.1, 100.0);
-    spn_add_unit_->setSingleStep(0.5);
-    spn_add_unit_->setDecimals(1);
-
-    spn_vol_ratio_ = new QDoubleSpinBox();
-    spn_vol_ratio_->setRange(1, 100000);
-    spn_vol_ratio_->setSingleStep(500);
-    spn_vol_ratio_->setDecimals(0);
-
-    spn_no_weight_fee_ = new QDoubleSpinBox();
-    spn_no_weight_fee_->setRange(0, 9999);
-    spn_no_weight_fee_->setSingleStep(0.5);
-    spn_no_weight_fee_->setDecimals(2);
-    spn_no_weight_fee_->setPrefix("¥ ");
-
     chk_default_ = new QCheckBox("设为默认模板");
-
     edt_desc_ = new QLineEdit();
 
     if (is_new_) {
@@ -87,17 +115,103 @@ void TemplateEditDialog::SetupUI() {
         edt_id_->setReadOnly(true);
     }
 
-    info_form->addRow("模板ID:", edt_id_);
+    info_form->addRow("模板ID:",   edt_id_);
     info_form->addRow("模板名称:", edt_name_);
-    info_form->addRow("承运商:", edt_carrier_);
-    info_form->addRow("首重(kg):", spn_first_weight_);
-    info_form->addRow("续重单位(kg):", spn_add_unit_);
-    info_form->addRow("体积重比:", spn_vol_ratio_);
-    info_form->addRow("无重量默认运费:", spn_no_weight_fee_);
-    info_form->addRow("", chk_default_);
-    info_form->addRow("描述:", edt_desc_);
+    info_form->addRow("承运商:",   edt_carrier_);
+    info_form->addRow("",          chk_default_);
+    info_form->addRow("描述:",     edt_desc_);
 
     main_layout->addWidget(info_group);
+
+    // ====== 📐 计费参数（新 GroupBox）======
+    auto *calc_group = new QGroupBox("📐 计费参数（绑定本模板的客户将默认继承，客户可单独覆写）");
+    auto *calc_form = new QFormLayout(calc_group);
+
+    // ① 首重
+    spn_first_weight_ = new QDoubleSpinBox();
+    spn_first_weight_->setRange(0.1, 100.0);
+    spn_first_weight_->setSingleStep(0.5);
+    spn_first_weight_->setDecimals(3);
+    spn_first_weight_->setSuffix(" kg");
+    calc_form->addRow("首重:", spn_first_weight_);
+
+    // ② 续重进位（全新）
+    cb_rounding_mode_ = new QComboBox();
+    cb_rounding_mode_->addItem("0.1kg 进一（国标推荐 · 极兔/韵达 2024 公示版）", "ceil_0_1kg");
+    cb_rounding_mode_->addItem("1kg 进一（通达系网点传统默认）",             "ceil_1kg");
+    cb_rounding_mode_->addItem("0.5kg 进一（顺丰特惠 / EMS 国际件）",          "ceil_0_5kg");
+    cb_rounding_mode_->addItem("0.1kg 四舍五入（小包专线 · 罕见）",            "round_0_1kg");
+    cb_rounding_mode_->addItem("不进位 · 按实际小数（按 kg 精确计费）",         "floor_no_round");
+    calc_form->addRow("续重进位规则:", cb_rounding_mode_);
+
+    // ③ 续重单位（preset + 自定义）
+    cb_add_unit_ = new QComboBox();
+    cb_add_unit_->addItem("1.0 kg（90% 客户 · 最常用）", 1.0);
+    cb_add_unit_->addItem("0.5 kg（电商中件 · 顺丰特惠）", 0.5);
+    cb_add_unit_->addItem("0.1 kg（精确到 100g · 顺丰标准 / 极兔）", 0.1);
+    cb_add_unit_->addItem("自定义 (小数 kg)…", -1.0);
+    spn_add_unit_custom_ = new QDoubleSpinBox();
+    spn_add_unit_custom_->setRange(0.01, 5.0);
+    spn_add_unit_custom_->setDecimals(3);
+    spn_add_unit_custom_->setSingleStep(0.05);
+    spn_add_unit_custom_->setSuffix(" kg");
+    spn_add_unit_custom_->setEnabled(false);
+    auto *add_unit_row = new QHBoxLayout();
+    add_unit_row->setContentsMargins(0,0,0,0);
+    add_unit_row->setSpacing(6);
+    add_unit_row->addWidget(cb_add_unit_, 3);
+    add_unit_row->addWidget(spn_add_unit_custom_, 2);
+    auto *add_unit_wrap = new QWidget();
+    add_unit_wrap->setLayout(add_unit_row);
+    calc_form->addRow("续重单位:", add_unit_wrap);
+    connect(cb_add_unit_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](){
+        const bool custom = cb_add_unit_->currentData().toDouble() < 0;
+        spn_add_unit_custom_->setEnabled(custom);
+    });
+
+    // ④ 体积重除数（preset + 自定义）
+    cb_vol_divisor_ = new QComboBox();
+    cb_vol_divisor_->addItem("6000（普通快递 / 顺丰标准 · 最常用）", 6000);
+    cb_vol_divisor_->addItem("5000（大客抛比 · 小体积轻货更贵）",   5000);
+    cb_vol_divisor_->addItem("8000（快运 / 中通快运 · 大包划算）",  8000);
+    cb_vol_divisor_->addItem("4800（德邦零担 / 精准卡航）",         4800);
+    cb_vol_divisor_->addItem("12000（顺丰重货 / 中铁快运）",        12000);
+    cb_vol_divisor_->addItem("自定义…", -1);
+    spn_vol_divisor_custom_ = new QSpinBox();
+    spn_vol_divisor_custom_->setRange(1000, 20000);
+    spn_vol_divisor_custom_->setSingleStep(100);
+    spn_vol_divisor_custom_->setSuffix(" cm³/kg");
+    spn_vol_divisor_custom_->setEnabled(false);
+    auto *vol_div_row = new QHBoxLayout();
+    vol_div_row->setContentsMargins(0,0,0,0);
+    vol_div_row->setSpacing(6);
+    vol_div_row->addWidget(cb_vol_divisor_, 3);
+    vol_div_row->addWidget(spn_vol_divisor_custom_, 2);
+    auto *vol_div_wrap = new QWidget();
+    vol_div_wrap->setLayout(vol_div_row);
+    auto *vol_hint = new QLabel("<span style='color:#909399;font-size:12px;'>公式：长(cm)×宽(cm)×高(cm) ÷ 除数 = 体积重量(kg)。取(实重, 体积重)较大值计费</span>");
+    vol_hint->setWordWrap(true);
+    auto *vol_vbox = new QVBoxLayout();
+    vol_vbox->setContentsMargins(0,0,0,0);
+    vol_vbox->setSpacing(2);
+    vol_vbox->addWidget(vol_div_wrap);
+    vol_vbox->addWidget(vol_hint);
+    auto *vol_vbox_wrap = new QWidget(); vol_vbox_wrap->setLayout(vol_vbox);
+    calc_form->addRow("体积重除数:", vol_vbox_wrap);
+    connect(cb_vol_divisor_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](){
+        const bool custom = cb_vol_divisor_->currentData().toInt() < 0;
+        spn_vol_divisor_custom_->setEnabled(custom);
+    });
+
+    // ⑤ 无重量默认运费
+    spn_no_weight_fee_ = new QDoubleSpinBox();
+    spn_no_weight_fee_->setRange(0, 9999);
+    spn_no_weight_fee_->setSingleStep(0.5);
+    spn_no_weight_fee_->setDecimals(2);
+    spn_no_weight_fee_->setPrefix("¥ ");
+    calc_form->addRow("无重量面单默认运费:", spn_no_weight_fee_);
+
+    main_layout->addWidget(calc_group);
 
     // ====== Tab 页：阶梯价格 / 分区省份 / 燃油附加费 ======
     auto *tab_widget = new QTabWidget();
@@ -246,8 +360,9 @@ QPushButton#primaryBtn:hover { background-color: #66b1ff; }
 void TemplateEditDialog::LoadData() {
     if (is_new_) {
         spn_first_weight_->setValue(1.0);
-        spn_add_unit_->setValue(1.0);
-        spn_vol_ratio_->setValue(6000);
+        SyncRoundingComboFromMode("ceil_0_1kg");
+        SyncAddUnitComboFromValue(1.0);
+        SyncVolDivisorComboFromValue(6000);
         spn_no_weight_fee_->setValue(0.0);
         return;
     }
@@ -262,12 +377,32 @@ void TemplateEditDialog::LoadData() {
     edt_id_->setText(tpl["template_id"].toString());
     edt_name_->setText(tpl["template_name"].toString());
     edt_carrier_->setText(tpl["carrier_name"].toString());
-    spn_first_weight_->setValue(tpl["first_weight"].toDouble());
-    spn_add_unit_->setValue(tpl["additional_unit"].toDouble());
-    spn_vol_ratio_->setValue(tpl["vol_weight_ratio"].toDouble());
-    spn_no_weight_fee_->setValue(tpl.value("default_no_weight_fee", 0).toDouble());
     chk_default_->setChecked(tpl["is_default"].toBool());
     edt_desc_->setText(tpl["description"].toString());
+
+    spn_first_weight_->setValue(tpl["first_weight"].toDouble());
+    spn_no_weight_fee_->setValue(tpl.value("default_no_weight_fee", 0).toDouble());
+
+    // --- 续重单位：优先读新字段 tpl_additional_unit，否则 fallback 老字段 additional_unit
+    bool ok_add = false;
+    double add_unit = tpl.value("tpl_additional_unit").toDouble(&ok_add);
+    if (!ok_add || add_unit <= 0) add_unit = tpl["additional_unit"].toDouble();
+    if (add_unit <= 0) add_unit = 1.0;
+    SyncAddUnitComboFromValue(add_unit);
+
+    // --- 体积重除数：优先 tpl_vol_divisor (int)，否则 fallback 老 vol_weight_ratio (double)
+    bool ok_vol = false;
+    int vol_div = tpl.value("tpl_vol_divisor").toInt(&ok_vol);
+    if (!ok_vol || vol_div <= 0) {
+        double v = tpl["vol_weight_ratio"].toDouble();
+        vol_div = v > 1 ? static_cast<int>(v) : 6000;
+    }
+    SyncVolDivisorComboFromValue(vol_div);
+
+    // --- 续重进位：只在新字段 tpl_rounding_mode 有值，否则默认 ceil_0_1kg (国标推荐)
+    QString rounding = tpl.value("tpl_rounding_mode").toString().trimmed();
+    if (rounding.isEmpty()) rounding = "ceil_0_1kg";
+    SyncRoundingComboFromMode(rounding);
 
     // 加载阶梯价格 - 矩阵布局（每行一个省份，列为重量区间）
     loading_data_ = true;
@@ -423,8 +558,14 @@ void TemplateEditDialog::OnSave() {
     tpl["template_name"] = edt_name_->text().trimmed();
     tpl["carrier_name"] = edt_carrier_->text().trimmed();
     tpl["first_weight"] = spn_first_weight_->value();
-    tpl["additional_unit"] = spn_add_unit_->value();
-    tpl["vol_weight_ratio"] = spn_vol_ratio_->value();
+    // 新旧两列都写，保证向后兼容
+    const double add_unit = CurrentAddUnit();
+    const int vol_divisor = CurrentVolDivisor();
+    tpl["additional_unit"]      = add_unit;              // 老列兼容
+    tpl["tpl_additional_unit"]  = add_unit;              // 新列 (schema 14)
+    tpl["vol_weight_ratio"]     = static_cast<double>(vol_divisor); // 老列兼容
+    tpl["tpl_vol_divisor"]      = vol_divisor;           // 新列 (schema 14)
+    tpl["tpl_rounding_mode"]    = CurrentRoundingMode(); // 新列 (schema 14)
     tpl["default_no_weight_fee"] = spn_no_weight_fee_->value();
     tpl["description"] = edt_desc_->text().trimmed();
 

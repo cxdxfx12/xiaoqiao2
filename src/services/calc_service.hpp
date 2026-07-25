@@ -19,7 +19,10 @@ public:
                                  double vol_weight = 0.0,
                                  const QString &template_id = "zto_standard",
                                  const QString &city = QString(),
-                                 const QString &customer_id = QString());
+                                 const QString &customer_id = QString(),
+                                 double vol_length = 0.0,
+                                 double vol_width = 0.0,
+                                 double vol_height = 0.0);
 
     bool CalcBatch(const QString &input_table,
                    const QString &output_table);

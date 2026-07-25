@@ -2,6 +2,7 @@
 #include "core/freight_types.hpp"
 #include "core/app_config.hpp"
 #include "db/duckdb_manager.hpp"
+#include "db/sqlite_rule_repository.hpp"
 #include <QDebug>
 #include <QDir>
 #include <QFileInfo>
@@ -15,22 +16,71 @@ namespace freight::services {
 
 CalcService::CalcService(QObject *parent) : QObject(parent) {}
 
+namespace {
+double RoundChargeWeightByMode(double cw, const QString &mode) {
+    if (cw <= 0) return cw;
+    const QString m = mode.trimmed().isEmpty() ? QStringLiteral("ceil_0_1kg") : mode;
+    if (m == "ceil_1kg")       return std::ceil(cw);
+    if (m == "ceil_0_5kg")     return std::ceil(cw * 2.0) / 2.0;
+    if (m == "ceil_0_1kg")     return std::ceil(cw * 10.0) / 10.0;
+    if (m == "round_0_1kg")    return std::round(cw * 10.0) / 10.0;
+    if (m == "floor_no_round") return cw;
+    return std::ceil(cw * 10.0) / 10.0;  // 默认：国标推荐 0.1kg 进一
+}
+} // anon ns
+
 core::CalcResult CalcService::CalcSingle(const QString &province,
                                           double weight,
                                           double vol_weight,
                                           const QString &template_id,
                                           const QString &city,
-                                          const QString &customer_id) {
+                                          const QString &customer_id,
+                                          double vol_length,
+                                          double vol_width,
+                                          double vol_height) {
     core::CalcResult result;
     result.dest_province = province;
     result.weight = weight;
     result.vol_weight = vol_weight;
 
     try {
+        auto &cfg = core::AppConfig::Instance();
+        db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
+        repo.Init();
+
         auto &dbm = db::DuckDBManager::Instance();
         auto con = dbm.CreateConnection();
 
-        double charge_weight = (vol_weight > 0 && vol_weight > weight) ? vol_weight : weight;
+        // 先读模板计费三参数：续重进位、续重单位、体积重除数
+        QString rounding_mode = "ceil_0_1kg";
+        double tpl_additional_unit = 1.0;
+        int vol_divisor = 6000;
+        QVariantMap tpl = repo.GetTemplate(template_id);
+        if (!tpl.isEmpty()) {
+            rounding_mode = tpl.value("tpl_rounding_mode", "ceil_0_1kg").toString().trimmed();
+            if (rounding_mode.isEmpty()) rounding_mode = "ceil_0_1kg";
+            double au = tpl.value("tpl_additional_unit", 0.0).toDouble();
+            if (au > 0) tpl_additional_unit = au;
+            else {
+                double au_old = tpl.value("additional_unit", 0.0).toDouble();
+                if (au_old > 0) tpl_additional_unit = au_old;
+            }
+            int vd = tpl.value("tpl_vol_divisor", 6000).toInt();
+            if (vd > 0) vol_divisor = vd;
+        }
+
+        // 体积重：若传了长宽高，用 vol_divisor 现算；否则用已填 vol_weight
+        double actual_vol = vol_weight;
+        if (vol_length > 0 && vol_width > 0 && vol_height > 0) {
+            actual_vol = (vol_length * vol_width * vol_height) / static_cast<double>(vol_divisor);
+        }
+        // 计费重 = MAX(实重, 体积重>0 && 体积重>实重 ? 体积重 : 实重)
+        double raw_cw = weight;
+        if (actual_vol > 0 && actual_vol > weight) raw_cw = actual_vol;
+        // 按 rounding_mode 进位（国标默认 0.1kg 进一）
+        double charge_weight = RoundChargeWeightByMode(raw_cw, rounding_mode);
+        // 续重单位（模板级优先），C++层先存，SQL里再显式传一份，保证两端一致
+        const double eff_add_unit = tpl_additional_unit > 0 ? tpl_additional_unit : 1.0;
 
         QRegularExpression province_suffix_re(R"((省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$)");
         QString norm_province = province;
@@ -39,7 +89,11 @@ core::CalcResult CalcService::CalcSingle(const QString &province,
         QString sql = QString(R"SQL(
 WITH
 template_info AS (
-    SELECT COALESCE(default_no_weight_fee, 0) AS default_no_weight_fee
+    SELECT
+        COALESCE(default_no_weight_fee, 0) AS default_no_weight_fee,
+        COALESCE(NULLIF(tpl_rounding_mode, ''), 'ceil_0_1kg') AS rounding_mode,
+        COALESCE(NULLIF(tpl_additional_unit, 0), NULLIF(additional_unit, 0), 1.0) AS tpl_additional_unit,
+        COALESCE(NULLIF(tpl_vol_divisor, 0), CAST(NULLIF(vol_weight_ratio, 0) AS INTEGER), 6000) AS tpl_vol_divisor
     FROM freight_templates
     WHERE template_id = '%1'
 ),
@@ -84,10 +138,16 @@ base_fee_calc AS (
                 THEN (SELECT first_price FROM matched_tier)
             WHEN (SELECT tier_code FROM matched_tier) IS NOT NULL
                 THEN (SELECT first_price FROM matched_tier)
-                     + %3 * (SELECT additional_price FROM matched_tier)
+                     + GREATEST(0, CEIL(
+                         (%3 - (SELECT first_weight FROM matched_tier))
+                         / GREATEST(COALESCE((SELECT tpl_additional_unit FROM template_info), %7), 0.0001)
+                     )) * (SELECT additional_price FROM matched_tier)
             ELSE
                 COALESCE((SELECT max_first_price FROM tier_max), 0) +
-                %3 * COALESCE((SELECT max_additional_price FROM tier_max), 0)
+                GREATEST(0, CEIL(
+                    (%3 - COALESCE((SELECT max_first_weight FROM tier_max), 0))
+                    / GREATEST(COALESCE((SELECT tpl_additional_unit FROM template_info), %7), 0.0001)
+                )) * COALESCE((SELECT max_additional_price FROM tier_max), 0)
         END AS base_fee
 ),
 fuel_surcharge_calc AS (
@@ -203,7 +263,8 @@ FROM strategy_surcharge_calc
         .arg(charge_weight, 0, 'f', 6)
         .arg(city)
         .arg(customer_id)
-        .arg(vol_weight, 0, 'f', 6);
+        .arg(actual_vol, 0, 'f', 6)
+        .arg(eff_add_unit, 0, 'f', 6);
 
         qDebug() << "Calculating:" << province << weight << "kg, charge_weight:" << charge_weight;
 
@@ -321,7 +382,7 @@ input_data AS (
         CASE
             WHEN COALESCE(vol_weight, 0) > 0 AND vol_weight > weight THEN vol_weight
             ELSE weight
-        END AS charge_weight
+        END AS raw_charge_weight
     FROM %2
 ),
 customer_template_lookup AS (
@@ -334,21 +395,38 @@ customer_template_lookup AS (
 template_info AS (
     SELECT
         ctl.*,
-        COALESCE(ft.default_no_weight_fee, 0) AS default_no_weight_fee
+        COALESCE(ft.default_no_weight_fee, 0) AS default_no_weight_fee,
+        COALESCE(NULLIF(ft.tpl_rounding_mode, ''), 'ceil_0_1kg') AS tpl_rounding_mode,
+        COALESCE(NULLIF(ft.tpl_additional_unit, 0), NULLIF(ft.additional_unit, 0), 1.0) AS tpl_additional_unit,
+        COALESCE(NULLIF(ft.tpl_vol_divisor, 0), CAST(NULLIF(ft.vol_weight_ratio, 0) AS INTEGER), 6000) AS tpl_vol_divisor
     FROM customer_template_lookup ctl
     LEFT JOIN freight_templates ft ON ft.template_id = ctl.template_id
 ),
-matched_zone AS (
+-- 按模板 rounding_mode 对计费重量做进位（国标默认 0.1kg 进一）
+charge_weight_rounded AS (
     SELECT
         ti.*,
-        REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') AS norm_province,
+        CASE COALESCE(ti.tpl_rounding_mode, 'ceil_0_1kg')
+            WHEN 'ceil_1kg'       THEN CEIL(ti.raw_charge_weight)
+            WHEN 'ceil_0_5kg'     THEN CEIL(ti.raw_charge_weight * 2.0) / 2.0
+            WHEN 'ceil_0_1kg'     THEN CEIL(ti.raw_charge_weight * 10.0) / 10.0
+            WHEN 'round_0_1kg'    THEN ROUND(ti.raw_charge_weight * 10.0) / 10.0
+            WHEN 'floor_no_round' THEN ti.raw_charge_weight
+            ELSE CEIL(ti.raw_charge_weight * 10.0) / 10.0
+        END AS charge_weight
+    FROM template_info ti
+),
+matched_zone AS (
+    SELECT
+        cwr.*,
+        REGEXP_REPLACE(cwr.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '') AS norm_province,
         zgp.group_code,
         zg.group_name
-    FROM template_info ti
+    FROM charge_weight_rounded cwr
     LEFT JOIN zone_group_provinces zgp
-        ON zgp.template_id = ti.template_id
+        ON zgp.template_id = cwr.template_id
        AND REGEXP_REPLACE(zgp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
-         = REGEXP_REPLACE(ti.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+         = REGEXP_REPLACE(cwr.dest_province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
     LEFT JOIN zone_groups zg
         ON zg.template_id = zgp.template_id
        AND zg.group_code = zgp.group_code
@@ -391,10 +469,17 @@ base_fee_calc AS (
             WHEN mt.group_code IS NULL THEN 0
             WHEN mt.charge_weight <= mt.first_weight THEN mt.first_price
             WHEN mt.tier_code IS NOT NULL
-                THEN mt.first_price + mt.charge_weight * mt.additional_price
+                THEN mt.first_price
+                     + GREATEST(0, CEIL(
+                         (mt.charge_weight - mt.first_weight)
+                         / GREATEST(COALESCE(mt.tpl_additional_unit, mt.additional_unit, 1.0), 0.0001)
+                     )) * mt.additional_price
             ELSE
                 COALESCE(tm.max_first_price, 0) +
-                mt.charge_weight * COALESCE(tm.max_additional_price, 0)
+                GREATEST(0, CEIL(
+                    (mt.charge_weight - COALESCE(tm.max_first_weight, 0))
+                    / GREATEST(COALESCE(mt.tpl_additional_unit, tm.max_additional_unit, 1.0), 0.0001)
+                )) * COALESCE(tm.max_additional_price, 0)
         END AS base_fee
     FROM matched_tier mt
     LEFT JOIN tier_max tm

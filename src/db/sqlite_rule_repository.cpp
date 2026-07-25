@@ -1,5 +1,6 @@
 #include "db/sqlite_rule_repository.hpp"
 #include <QSqlError>
+#include <QSqlRecord>
 #include <QDebug>
 #include <QFileInfo>
 #include <QUuid>
@@ -196,8 +197,55 @@ bool SqliteRuleRepository::Init() {
         }
     }
 
+    // ============================================================
+    // Schema 13→14 模板计费参数升级：
+    // 新增 freight_templates.tpl_rounding_mode / tpl_additional_unit / tpl_vol_divisor
+    // 三列，把历史 additional_unit / vol_weight_ratio 老字段值回填到新列。
+    // 原因：续重进位规则(ceil_0_1kg等)、续重单位预设下拉、体积重除数预设下拉
+    // 三参数在 template_edit_dialog 已独立为计费参数卡片 UI，独立三列读取
+    // 比老 REAL 类型 additional_unit/vol_weight_ratio 更直观，保留老列同时
+    // 读写新列保证向后兼容（80% 普通散客代码也能继续读老列兜底）。
+    // ============================================================
+    if (current_version >= 13 && current_version < 14) {
+        qInfo() << "[data-fix] Schema 13→14: freight_templates 计费参数三列升级(tpl_rounding/tpl_add_unit/tpl_vol)";
+        auto tryAddCol = [&](const QString &addSql) {
+            QSqlQuery qt(db_);
+            if (!qt.exec(addSql)) {
+                const QString err = qt.lastError().text().toLower();
+                // SQLite 报 duplicate column 正常跳过（列已存在）
+                if (err.contains("duplicate column") || err.contains("already exists"))
+                    return true;
+                qCritical() << "add column failed:" << qt.lastError().text() << "SQL=" << addSql;
+                return false;
+            }
+            return true;
+        };
+        bool okMig = true;
+        okMig &= tryAddCol("ALTER TABLE freight_templates ADD COLUMN tpl_rounding_mode VARCHAR(30) DEFAULT 'ceil_0_1kg'");
+        okMig &= tryAddCol("ALTER TABLE freight_templates ADD COLUMN tpl_additional_unit REAL DEFAULT 1.0");
+        okMig &= tryAddCol("ALTER TABLE freight_templates ADD COLUMN tpl_vol_divisor INTEGER DEFAULT 6000");
+        if (okMig) {
+            // 回填老数据：additional_unit → tpl_additional_unit；vol_weight_ratio(CAST INT) → tpl_vol_divisor
+            {
+                QSqlQuery qt(db_);
+                qt.prepare(R"SQL(
+                    UPDATE freight_templates SET
+                      tpl_rounding_mode    = COALESCE(NULLIF(tpl_rounding_mode, ''), 'ceil_0_1kg'),
+                      tpl_additional_unit  = CASE WHEN COALESCE(tpl_additional_unit, 0) > 0 THEN tpl_additional_unit
+                                                  ELSE COALESCE(NULLIF(additional_unit, 0), 1.0) END,
+                      tpl_vol_divisor      = CASE WHEN COALESCE(tpl_vol_divisor, 0) > 0 THEN tpl_vol_divisor
+                                                  ELSE COALESCE(CAST(NULLIF(vol_weight_ratio, 0) AS INTEGER), 6000) END
+                )SQL");
+                if (!qt.exec())
+                    qCritical() << "backfill failed:" << qt.lastError().text();
+                else
+                    qInfo() << "  freight_templates 回填" << qt.numRowsAffected() << "行计费参数";
+            }
+        }
+    }
+
     // 更新 schema 版本
-    int new_version = 13;
+    int new_version = 14;
     if (current_version < new_version) {
         vq.exec("DELETE FROM schema_version");
         vq.prepare("INSERT INTO schema_version VALUES (?)");
@@ -241,7 +289,10 @@ bool SqliteRuleRepository::CreateTables() {
            "description TEXT,"
            "is_default INTEGER DEFAULT 0,"
            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
-           "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
+           "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+           "tpl_rounding_mode VARCHAR(30) DEFAULT 'ceil_0_1kg',"
+           "tpl_additional_unit REAL DEFAULT 1.0,"
+           "tpl_vol_divisor INTEGER DEFAULT 6000)");
 
     q.exec("CREATE TABLE IF NOT EXISTS zone_groups ("
            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -537,6 +588,36 @@ QVariantMap SqliteRuleRepository::GetTemplate(const QString &template_id) {
         m["default_no_weight_fee"] = q.value("default_no_weight_fee").toDouble();
         m["is_default"] = q.value("is_default").toInt() == 1;
         m["description"] = q.value("description");
+
+        // 新 3 列（schema 14）：优先新列，其次兼容老列
+        QVariant rmode;
+        bool newColPresent = false;
+        for (int i = 0; i < q.record().count(); ++i) {
+            const QString cn = q.record().fieldName(i).toLower();
+            if (cn == "tpl_rounding_mode")   { rmode = q.value(i); newColPresent = true; }
+        }
+        QString rounding_mode = rmode.toString().trimmed();
+        if (rounding_mode.isEmpty()) rounding_mode = "ceil_0_1kg";
+        m["tpl_rounding_mode"] = rounding_mode;
+
+        // tpl_additional_unit（新列兼容老 additional_unit）
+        double tpl_add = q.record().contains("tpl_additional_unit")
+                                ? q.value("tpl_additional_unit").toDouble()
+                                : 0.0;
+        if (tpl_add <= 0) tpl_add = m["additional_unit"].toDouble();
+        if (tpl_add <= 0) tpl_add = 1.0;
+        m["tpl_additional_unit"] = tpl_add;
+
+        // tpl_vol_divisor（新列兼容老 vol_weight_ratio）
+        int tpl_vol = q.record().contains("tpl_vol_divisor")
+                            ? q.value("tpl_vol_divisor").toInt()
+                            : 0;
+        if (tpl_vol <= 0) {
+            double v = m["vol_weight_ratio"].toDouble();
+            tpl_vol = v > 1 ? static_cast<int>(v) : 6000;
+        }
+        m["tpl_vol_divisor"] = tpl_vol;
+        Q_UNUSED(newColPresent);
     }
     return m;
 }
@@ -545,17 +626,49 @@ bool SqliteRuleRepository::AddTemplate(const QVariantMap &tpl) {
     QSqlQuery q(db_);
     QString tpl_id = tpl["template_id"].toString();
 
-    q.prepare("INSERT INTO freight_templates (template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio, default_no_weight_fee, description) VALUES (?,?,?,?,?,?,?,?)");
+    // 新3列 + 老3列 双写
+    const QString rmode = tpl.value("tpl_rounding_mode", "ceil_0_1kg").toString().trimmed();
+    const double add_unit = tpl.contains("tpl_additional_unit")
+                                ? tpl["tpl_additional_unit"].toDouble()
+                                : tpl.value("additional_unit", 1.0).toDouble();
+    const int vol_div = tpl.contains("tpl_vol_divisor")
+                            ? tpl["tpl_vol_divisor"].toInt()
+                            : static_cast<int>(tpl.value("vol_weight_ratio", 6000.0).toDouble());
+
+    // 先尝试 11 列（含新3列）schema 14 全写；失败时 fallback 到老 8 列（旧 DB schema）
+    QString sqlInsert = QStringLiteral(
+        "INSERT INTO freight_templates "
+        "(template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio,"
+        " default_no_weight_fee, description,"
+        " tpl_rounding_mode, tpl_additional_unit, tpl_vol_divisor)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)");
+    q.prepare(sqlInsert);
     q.addBindValue(tpl_id);
     q.addBindValue(tpl["template_name"].toString());
     q.addBindValue(tpl["carrier_name"].toString());
     q.addBindValue(tpl.value("first_weight", 1.0).toDouble());
-    q.addBindValue(tpl.value("additional_unit", 1.0).toDouble());
-    q.addBindValue(tpl.value("vol_weight_ratio", 6000.0).toDouble());
+    q.addBindValue(add_unit);
+    q.addBindValue(static_cast<double>(vol_div));
     q.addBindValue(tpl.value("default_no_weight_fee", 0.0).toDouble());
     q.addBindValue(tpl["description"].toString());
+    q.addBindValue(rmode);
+    q.addBindValue(add_unit);
+    q.addBindValue(vol_div);
     if (!q.exec()) {
-        return false;
+        // fallback：老 schema（没有新3列的 DB），只用老 8 列 INSERT
+        q.clear();
+        q.prepare("INSERT INTO freight_templates "
+                  "(template_id, template_name, carrier_name, first_weight, additional_unit, vol_weight_ratio,"
+                  " default_no_weight_fee, description) VALUES (?,?,?,?,?,?,?,?)");
+        q.addBindValue(tpl_id);
+        q.addBindValue(tpl["template_name"].toString());
+        q.addBindValue(tpl["carrier_name"].toString());
+        q.addBindValue(tpl.value("first_weight", 1.0).toDouble());
+        q.addBindValue(add_unit);
+        q.addBindValue(static_cast<double>(vol_div));
+        q.addBindValue(tpl.value("default_no_weight_fee", 0.0).toDouble());
+        q.addBindValue(tpl["description"].toString());
+        if (!q.exec()) return false;
     }
 
     // 创建默认分区和阶梯定价
@@ -635,16 +748,46 @@ bool SqliteRuleRepository::AddTemplate(const QVariantMap &tpl) {
 
 bool SqliteRuleRepository::UpdateTemplate(const QVariantMap &tpl) {
     QSqlQuery q(db_);
-    q.prepare("UPDATE freight_templates SET template_name=?, carrier_name=?, first_weight=?, additional_unit=?, vol_weight_ratio=?, default_no_weight_fee=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE template_id=?");
+
+    const QString rmode = tpl.value("tpl_rounding_mode", "ceil_0_1kg").toString().trimmed();
+    const double add_unit = tpl.contains("tpl_additional_unit")
+                                ? tpl["tpl_additional_unit"].toDouble()
+                                : tpl.value("additional_unit", 1.0).toDouble();
+    const int vol_div = tpl.contains("tpl_vol_divisor")
+                            ? tpl["tpl_vol_divisor"].toInt()
+                            : static_cast<int>(tpl.value("vol_weight_ratio", 6000.0).toDouble());
+
+    // 尝试 schema 14：更新老6列 + 新3列；失败 fallback 老8列
+    q.prepare("UPDATE freight_templates SET"
+              " template_name=?, carrier_name=?, first_weight=?, additional_unit=?, vol_weight_ratio=?,"
+              " default_no_weight_fee=?, description=?, updated_at=CURRENT_TIMESTAMP,"
+              " tpl_rounding_mode=?, tpl_additional_unit=?, tpl_vol_divisor=?"
+              " WHERE template_id=?");
     q.addBindValue(tpl["template_name"].toString());
     q.addBindValue(tpl["carrier_name"].toString());
     q.addBindValue(tpl.value("first_weight", 1.0).toDouble());
-    q.addBindValue(tpl.value("additional_unit", 1.0).toDouble());
-    q.addBindValue(tpl.value("vol_weight_ratio", 6000.0).toDouble());
+    q.addBindValue(add_unit);
+    q.addBindValue(static_cast<double>(vol_div));
     q.addBindValue(tpl.value("default_no_weight_fee", 0.0).toDouble());
     q.addBindValue(tpl.value("description", "").toString());
+    q.addBindValue(rmode);
+    q.addBindValue(add_unit);
+    q.addBindValue(vol_div);
     q.addBindValue(tpl["template_id"].toString());
-    return q.exec();
+    if (!q.exec()) {
+        q.clear();
+        q.prepare("UPDATE freight_templates SET template_name=?, carrier_name=?, first_weight=?, additional_unit=?, vol_weight_ratio=?, default_no_weight_fee=?, description=?, updated_at=CURRENT_TIMESTAMP WHERE template_id=?");
+        q.addBindValue(tpl["template_name"].toString());
+        q.addBindValue(tpl["carrier_name"].toString());
+        q.addBindValue(tpl.value("first_weight", 1.0).toDouble());
+        q.addBindValue(add_unit);
+        q.addBindValue(static_cast<double>(vol_div));
+        q.addBindValue(tpl.value("default_no_weight_fee", 0.0).toDouble());
+        q.addBindValue(tpl.value("description", "").toString());
+        q.addBindValue(tpl["template_id"].toString());
+        return q.exec();
+    }
+    return true;
 }
 
 bool SqliteRuleRepository::DeleteTemplate(const QString &template_id) {
