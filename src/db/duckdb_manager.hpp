@@ -26,6 +26,8 @@ public:
 
     bool TableExists(const QString &table_name);
 
+    void ResetDB();
+
 private:
     DuckDBManager() = default;
     ~DuckDBManager() = default;

@@ -37,7 +37,8 @@ core::CalcResult CalcService::CalcSingle(const QString &province,
                                           const QString &customer_id,
                                           double vol_length,
                                           double vol_width,
-                                          double vol_height) {
+                                          double vol_height,
+                                          bool enable_avg_weight) {
     core::CalcResult result;
     result.dest_province = province;
     result.weight = weight;
@@ -48,25 +49,62 @@ core::CalcResult CalcService::CalcSingle(const QString &province,
         db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
         repo.Init();
 
+        // 关键修复：单笔计算前也强制把 SQLite 新规则同步到 DuckDB，
+        // 保证用户在「规则设置」里刚保存的合同能立刻生效，且与批量算结果一致
+        try {
+            auto &dbm_lazy = db::DuckDBManager::Instance();
+            dbm_lazy.ReloadRules(cfg.GetRulesDbPath());
+        } catch (...) {}
+
         auto &dbm = db::DuckDBManager::Instance();
         auto con = dbm.CreateConnection();
 
-        // 先读模板计费三参数：续重进位、续重单位、体积重除数
+        // 先读客户级覆写 3 列（优先于模板级）
+        QString cust_rounding_mode;
+        double  cust_additional_unit = 0.0;
+        int     cust_vol_divisor = 0;
+        if (!customer_id.isEmpty()) {
+            QVariantMap cust = repo.GetCustomer(customer_id);
+            if (!cust.isEmpty()) {
+                cust_rounding_mode = cust.value("cust_rounding_mode").toString().trimmed();
+                bool ok = false;
+                double au = cust.value("cust_additional_unit").toDouble(&ok);
+                if (ok && au > 0) cust_additional_unit = au;
+                int vd = cust.value("cust_vol_divisor").toInt(&ok);
+                if (ok && vd > 0)  cust_vol_divisor = vd;
+            }
+        }
+
+        // 读模板计费三参数：续重进位、续重单位、体积重除数
         QString rounding_mode = "ceil_0_1kg";
         double tpl_additional_unit = 1.0;
         int vol_divisor = 6000;
         QVariantMap tpl = repo.GetTemplate(template_id);
         if (!tpl.isEmpty()) {
-            rounding_mode = tpl.value("tpl_rounding_mode", "ceil_0_1kg").toString().trimmed();
-            if (rounding_mode.isEmpty()) rounding_mode = "ceil_0_1kg";
-            double au = tpl.value("tpl_additional_unit", 0.0).toDouble();
-            if (au > 0) tpl_additional_unit = au;
+            // 客户级三列优先 > 模板级 > 默认
+            rounding_mode = cust_rounding_mode;
+            if (rounding_mode.isEmpty())
+                rounding_mode = tpl.value("tpl_rounding_mode", QString{}).toString().trimmed();
+            if (rounding_mode.isEmpty())
+                rounding_mode = "ceil_0_1kg";
+            if (cust_additional_unit > 0) tpl_additional_unit = cust_additional_unit;
             else {
-                double au_old = tpl.value("additional_unit", 0.0).toDouble();
-                if (au_old > 0) tpl_additional_unit = au_old;
+                double au_tpl = tpl.value("tpl_additional_unit", 0.0).toDouble();
+                if (au_tpl > 0) tpl_additional_unit = au_tpl;
+                else {
+                    double au_old = tpl.value("additional_unit", 0.0).toDouble();
+                    if (au_old > 0) tpl_additional_unit = au_old;
+                }
             }
-            int vd = tpl.value("tpl_vol_divisor", 6000).toInt();
-            if (vd > 0) vol_divisor = vd;
+            if (cust_vol_divisor > 0) vol_divisor = cust_vol_divisor;
+            else {
+                int vd_tpl = tpl.value("tpl_vol_divisor", 6000).toInt();
+                if (vd_tpl > 0) vol_divisor = vd_tpl;
+                else {
+                    int vd_old = tpl.value("vol_weight_ratio", 6000).toInt();
+                    if (vd_old > 0) vol_divisor = vd_old;
+                }
+            }
         }
 
         // 体积重：若传了长宽高，用 vol_divisor 现算；否则用已填 vol_weight
@@ -256,7 +294,20 @@ SELECT
     ROUND(fuel_surcharge, 2) AS fuel_surcharge,
     ROUND(remote_surcharge, 2) AS remote_surcharge,
     ROUND(strategy_surcharge, 2) AS strategy_surcharge,
-    ROUND(base_fee + fuel_surcharge + remote_surcharge + strategy_surcharge, 2) AS total_fee
+    ROUND(base_fee + fuel_surcharge + remote_surcharge + strategy_surcharge, 2) AS total_fee,
+    0::BOOLEAN AS lajz_in_pool,
+    ''::VARCHAR AS lajz_contract_no,
+    0.0::DOUBLE  AS lajz_pool_avg_kg,
+    0.0::DOUBLE  AS lajz_pool_max_kg,
+    0.0::DOUBLE  AS lajz_base_avg_kg,
+    0.0::DOUBLE  AS lajz_fee_cap_kg,
+    0.0::DOUBLE  AS lajz_base_fee,
+    0.0::DOUBLE  AS lajz_step_kg,
+    0.0::DOUBLE  AS lajz_step_fee,
+    0::BOOLEAN AS lajz_used,
+    0.0::DOUBLE  AS lajz_fee_per_ticket,
+    0.0::DOUBLE  AS lajz_save_vs_tier,
+    0::INT      AS lajz_over_cap_mode
 FROM strategy_surcharge_calc
         )SQL")
         .arg(template_id, norm_province)
@@ -289,6 +340,183 @@ FROM strategy_surcharge_calc
             result.success = false;
             result.error_msg = "无计算结果";
         }
+
+        // ====== CalcSingle 拉均重补充计算（单算近似：池均重=本单charge_weight，省份门控对齐 Batch SQL 语义） ======
+        //   注意：真实"池均重"必须 Batch 批量才有上下文，这里只验证"是否进池/是否有资格用拉均重价"的门控逻辑，
+        //        和 BuildCalcSQL 里 avg_weight_active / avg_weight_pool_in 两端完全一致。
+        //   FEAT-01：enable_avg_weight 总开关（默认 false）→ 未勾选时完全跳过拉均重逻辑
+        if (result.success && enable_avg_weight) {
+            // 客户级覆写：cust_contract_no / cust_avg_weight_tpl_id
+            QString cust_contract_no;
+            QString cust_avg_weight_tpl_id;
+            if (!customer_id.isEmpty()) {
+                QVariantMap cust = repo.GetCustomer(customer_id);
+                if (!cust.isEmpty()) {
+                    cust_contract_no = cust.value("cust_contract_no").toString().trimmed();
+                    cust_avg_weight_tpl_id = cust.value("avg_weight_tpl_id").toString().trimmed();
+                }
+            }
+
+            // A. 取 group_code（和 batch CTE matched_zone 同语义）
+            QString group_code;
+            {
+                QSqlQuery zg_q(repo.Database());
+                zg_q.prepare("SELECT zgp.group_code FROM zone_group_provinces zgp "
+                             "WHERE zgp.template_id=? "
+                             "AND REGEXP_REPLACE(zgp.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')=? LIMIT 1");
+                zg_q.addBindValue(template_id);
+                zg_q.addBindValue(norm_province);
+                if (zg_q.exec() && zg_q.next()) group_code = zg_q.value(0).toString();
+            }
+
+            // B. 匹配一份合同（和 avg_weight_active + avg_weight_joined 同语义）
+            QString lajz_avg_tpl_id;
+            double  lajz_pool_max_kg = 1.0;
+            double  lajz_base_avg_kg = 0.3;
+            double  lajz_fee_cap_kg  = 1.0;
+            double  lajz_base_fee    = 2.7;
+            double  lajz_step_kg     = 0.1;
+            double  lajz_step_fee    = 0.2;
+            int     lajz_min_tickets = 50;
+            int     lajz_over_cap_mode = 0;
+            int     lajz_reuse_zone_groups = 1;
+            QString lajz_contract_no;
+            {
+                auto pick = [&](const QString &bind_avg, const QString &bind_tpl) -> bool {
+                    QVariantList tpls = repo.ListAvgWeightTemplates();
+                    int best_ver = -1;
+                    QVariantMap best;
+                    QDate today = QDate::currentDate();
+                    for (const auto &t : tpls) {
+                        QVariantMap m = t.toMap();
+                        if (m["is_active"].toInt() != 1) continue;
+                        QString bind_aw = m["avg_tpl_id"].toString().trimmed();
+                        QString bind_tp = m["template_id"].toString().trimmed();
+                        if (bind_avg.isEmpty()) {
+                            if (bind_tp != bind_tpl && bind_tp != "") continue;
+                        } else {
+                            if (bind_aw != bind_avg) continue;
+                        }
+                        QDate ef = QDate::fromString(m["effective_from"].toString().left(10), Qt::ISODate);
+                        QString et_s = m["effective_to"].toString().trimmed();
+                        QDate et;
+                        if (!et_s.isEmpty() && et_s != "") et = QDate::fromString(et_s.left(10), Qt::ISODate);
+                        if (ef.isValid() && ef > today) continue;
+                        if (et.isValid() && !et_s.isEmpty() && et < today) continue;
+                        int ver = m["version"].toInt();
+                        if (ver > best_ver) { best_ver = ver; best = m; }
+                    }
+                    if (best.isEmpty()) return false;
+                    lajz_avg_tpl_id        = best["avg_tpl_id"].toString();
+                    lajz_pool_max_kg       = best["avg_pool_max_kg"].toDouble();
+                    lajz_base_avg_kg       = best["base_avg_kg"].toDouble();
+                    lajz_fee_cap_kg        = best["avg_fee_cap_kg"].toDouble();
+                    lajz_base_fee          = best["base_fee"].toDouble();
+                    lajz_step_kg           = best["step_kg"].toDouble();
+                    lajz_step_fee          = best["step_fee"].toDouble();
+                    lajz_min_tickets       = best["min_tickets"].toInt();
+                    lajz_over_cap_mode     = best["over_cap_mode"].toInt();
+                    lajz_reuse_zone_groups = best["reuse_zone_groups"].toInt();
+                    lajz_contract_no       = best["contract_no"].toString().trimmed();
+                    return true;
+                };
+                bool ok = false;
+                if (!cust_avg_weight_tpl_id.isEmpty())
+                    ok = pick(cust_avg_weight_tpl_id, template_id);
+                if (!ok)
+                    ok = pick("", template_id);
+                (void)ok;
+            }
+
+            if (!lajz_avg_tpl_id.isEmpty()) {
+                // C. 进池判定（和 avg_weight_pool_in CTE 对齐）
+                bool in_pool_raw = false;
+                if (charge_weight <= lajz_pool_max_kg) {
+                    if (lajz_reuse_zone_groups == 1 && !group_code.isEmpty()) {
+                        // 方案A：勾选分区 + 排除省
+                        bool has_any_check = false;
+                        bool checked = false;
+                        {
+                            QVariantList gts = repo.GetAvgWeightTplGroups(lajz_avg_tpl_id);
+                            for (const auto &g : gts) {
+                                const auto m = g.toMap();
+                                QString gt_t = m["template_id"].toString();
+                                QString gt_g = m["group_code"].toString();
+                                if (gt_t != "" && gt_t != "*" && gt_t != template_id) continue;
+                                has_any_check = true;
+                                if (gt_g == group_code) { checked = true; break; }
+                            }
+                        }
+                        bool pass_check = (!has_any_check) || checked;
+                        bool excluded = false;
+                        {
+                            QVariantList ex = repo.GetAvgWeightExcludes(lajz_avg_tpl_id);
+                            for (const auto &e : ex) {
+                                const auto m = e.toMap();
+                                QString ex_t = m["template_id"].toString();
+                                QString ex_g = m["group_code"].toString();
+                                QString ex_p = m["province"].toString();
+                                if (ex_t != "" && ex_t != "*" && ex_t != template_id) continue;
+                                if (ex_g != group_code) continue;
+                                // 归一化排除省
+                                QString ne = ex_p;
+                                static const QRegularExpression reProv(
+                                    "(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$");
+                                ne.replace(reProv, "");
+                                if (ne.trimmed() == norm_province.trimmed()) { excluded = true; break; }
+                            }
+                        }
+                        in_pool_raw = pass_check && !excluded;
+                    } else if (lajz_reuse_zone_groups == 0) {
+                        // 方案B：avg_weight_zones 归一化省命中
+                        QVariantList zs = repo.GetAvgWeightZones(lajz_avg_tpl_id);
+                        static const QRegularExpression reProv(
+                            "(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$");
+                        for (const auto &z : zs) {
+                            const auto m = z.toMap();
+                            const QStringList ps = m["provinces"].toStringList();
+                            for (const auto &p : ps) {
+                                QString np = p;
+                                np.replace(reProv, "");
+                                if (np.trimmed() == norm_province.trimmed()) { in_pool_raw = true; break; }
+                            }
+                            if (in_pool_raw) break;
+                        }
+                    }
+                }
+                result.lajz_in_pool     = in_pool_raw;
+                result.lajz_avg_tpl_id  = lajz_avg_tpl_id;
+                result.lajz_contract_no = cust_contract_no.isEmpty() ? lajz_contract_no : cust_contract_no;
+                result.lajz_pool_avg_kg = in_pool_raw ? charge_weight : 0.0;
+                result.lajz_pool_max_kg = lajz_pool_max_kg;
+                result.lajz_base_avg_kg = lajz_base_avg_kg;
+                result.lajz_fee_cap_kg  = lajz_fee_cap_kg;
+                result.lajz_base_fee    = lajz_base_fee;
+                result.lajz_step_kg     = lajz_step_kg;
+                result.lajz_step_fee    = lajz_step_fee;
+                result.lajz_over_cap_mode = lajz_over_cap_mode;
+                // 单算：pool 门槛和 over_cap_mode 封顶 简单保守判断
+                // （单票一个池 → pool_n=1，只要 min_tickets<=1 就合格；正常拉均重合同 min_tickets>=50 会不合格 → 退回阶梯）
+                bool pool_eligible = (1 >= lajz_min_tickets);
+                bool pass_cap = (lajz_over_cap_mode == 0) ||
+                                (lajz_over_cap_mode == 1 && result.lajz_pool_avg_kg <= lajz_fee_cap_kg);
+                bool used = in_pool_raw && pool_eligible && pass_cap;
+                result.lajz_used = used;
+                if (used) {
+                    double stepkg = qMax(lajz_step_kg, 0.0001);
+                    double steps = std::max(0.0, std::ceil((result.lajz_pool_avg_kg - lajz_base_avg_kg) / stepkg));
+                    double cap   = std::max(0.0, std::ceil((lajz_fee_cap_kg - lajz_base_avg_kg) / stepkg));
+                    double ticket = lajz_base_fee + std::min(steps, cap) * lajz_step_fee;
+                    result.lajz_fee_per_ticket = std::round(ticket * 100.0) / 100.0;
+                    result.lajz_save_vs_tier   = std::round((result.base_fee - result.lajz_fee_per_ticket) * 100.0) / 100.0;
+                    result.base_fee = result.lajz_fee_per_ticket;
+                    result.total_fee = std::round((result.base_fee + result.fuel_surcharge + result.remote_surcharge + result.strategy_surcharge) * 100.0) / 100.0;
+                } else {
+                    result.lajz_fee_per_ticket = 0.0;
+                    result.lajz_save_vs_tier   = 0.0;
+                }
+            }
+        }
     } catch (const std::exception &e) {
         result.success = false;
         result.error_msg = QString::fromStdString(e.what());
@@ -299,15 +527,35 @@ FROM strategy_surcharge_calc
 }
 
 bool CalcService::CalcBatch(const QString &input_table,
-                            const QString &output_table) {
+                            const QString &output_table,
+                            bool enable_avg_weight) {
     try {
         emit ProgressChanged(5);
         auto &dbm = db::DuckDBManager::Instance();
         auto con = dbm.CreateConnection();
 
-        QString sql = BuildCalcSQL(input_table, output_table);
+        QString sql = BuildCalcSQL(input_table, output_table, enable_avg_weight);
         emit ProgressChanged(15);
         con.Query(sql.toStdString());
+
+        // 诊断：当输出为空或输入行丢失时打印 enable_avg_weight + SQL 片段，便于定位门控/进池判定问题
+    try {
+        auto chk = con.Query(QString("SELECT COUNT(*) FROM %1").arg(output_table).toStdString());
+        if (chk && chk->RowCount() > 0) {
+            long long cnt = chk->GetValue(0,0).GetValue<long long>();
+            auto chki = con.Query(QString("SELECT COUNT(*) FROM %1").arg(input_table).toStdString());
+            long long in_cnt = (chki && chki->RowCount()>0) ? chki->GetValue(0,0).GetValue<long long>() : -1;
+            if (cnt == 0) {
+                qWarning() << "[CalcBatch WARN] output=" << output_table << "ROWS=" << cnt
+                           << "（input_rows=" << in_cnt << "，enable_avg_weight=" << enable_avg_weight << "）";
+                qWarning() << "                SQL 前 1500 字符：\n" << sql.left(1500);
+                qWarning() << "                SQL 后 1500 字符：\n" << sql.right(1500);
+            } else if (in_cnt > 0 && cnt != in_cnt && cnt != 0) {
+                qDebug() << "[CalcBatch] rows：input=" << in_cnt << " output=" << cnt
+                         << "（enable_avg_weight=" << enable_avg_weight << "）";
+            }
+        }
+    } catch(...) {}
 
         emit ProgressChanged(100);
         emit CalcFinished(true, QStringLiteral("计算完成"));
@@ -320,10 +568,20 @@ bool CalcService::CalcBatch(const QString &input_table,
 }
 
 bool CalcService::CalcFromFile(const QString &input_file,
-                               const QString &output_file) {
+                               const QString &output_file,
+                               bool enable_avg_weight) {
     try {
         emit ProgressChanged(0);
+        auto &cfg = core::AppConfig::Instance();
         auto &dbm = db::DuckDBManager::Instance();
+
+        // DEBUG-01 关键修复：每次文件计算前强制重新加载 SQLite → DuckDB 规则表
+        //   保证用户在「规则设置/客户设置」里刚保存的拉均重合同、参数立即生效
+        try {
+            dbm.ReloadRules(cfg.GetRulesDbPath());
+        } catch (const std::exception &re) {
+            qWarning() << "ReloadRules skipped:" << re.what();
+        }
 
         QFileInfo fi(input_file);
         QString input_table = "_input_tmp";
@@ -343,7 +601,8 @@ bool CalcService::CalcFromFile(const QString &input_file,
         }
 
         emit ProgressChanged(45);
-        if (!CalcBatch(normalized_table, output_table)) {
+        // 透传 enable_avg_weight 开关到 CalcBatch → BuildCalcSQL
+        if (!CalcBatch(normalized_table, output_table, enable_avg_weight)) {
             return false;
         }
 
@@ -367,10 +626,297 @@ bool CalcService::CalcFromFile(const QString &input_file,
 }
 
 QString CalcService::BuildCalcSQL(const QString &input_table,
-                                  const QString &output_table) {
-    QString sql = QString(R"SQL(
+                                  const QString &output_table,
+                                  bool enable_avg_weight) {
+    // ====== 拉均重 CTE 区块：enable 时用真实逻辑；disable 时全置空 ======
+    //   这样下游 fuel_surcharge_calc / final_merged / SELECT 输出列 完全无需改动
+    const QString LAJZ_CTES = enable_avg_weight ? QStringLiteral(R"SQL(
+-- =====================================================================
+-- Step5-2：拉均重合同匹配 avg_weight_templates + avg_weight_zones
+--   ① 先筛当前生效合同（is_active=1 + 日期窗口 + 每个绑定(template_id,avg_tpl_id)取version最大）
+--   ② 每行：优先客户级 cust_avg_weight_tpl_id 外键 → 模板级 template_id 同名绑定
+-- =====================================================================
+avg_weight_active AS (
+    SELECT a.*
+    FROM avg_weight_templates a
+    INNER JOIN (
+        SELECT COALESCE(NULLIF(template_id,''), '*')            AS bind_template_id,
+               COALESCE(NULLIF(avg_tpl_id,''), '')              AS bind_avg_tpl_id,
+               MAX(version)                                     AS max_ver
+        FROM avg_weight_templates
+        WHERE is_active = 1
+          AND CAST(effective_from AS DATE) <= CURRENT_DATE
+          AND (effective_to IS NULL OR CAST(effective_to AS VARCHAR)='' OR CAST(effective_to AS DATE) >= CURRENT_DATE)
+        GROUP BY 1, 2
+    ) k ON (
+              (k.bind_avg_tpl_id <> '' AND a.avg_tpl_id = k.bind_avg_tpl_id)
+           OR (k.bind_avg_tpl_id = '' AND COALESCE(NULLIF(a.template_id,''), '*') = k.bind_template_id)
+          ) AND a.version = k.max_ver
+    WHERE a.is_active = 1
+),
+avg_weight_joined AS (
+    SELECT
+        bfc.*,
+        COALESCE(
+            (SELECT aw.avg_tpl_id  FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.avg_tpl_id  FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1)
+        )                                                      AS lajz_avg_tpl_id,
+        COALESCE(
+            (SELECT aw.contract_no  FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.contract_no  FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), ''
+        )                                                      AS lajz_contract_no,
+        COALESCE(
+            (SELECT aw.avg_pool_max_kg FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.avg_pool_max_kg FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 1.0
+        )                                                      AS lajz_pool_max_kg,
+        COALESCE(
+            (SELECT aw.base_avg_kg FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.base_avg_kg FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 0.3
+        )                                                      AS lajz_base_avg_kg,
+        COALESCE(
+            (SELECT aw.avg_fee_cap_kg FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.avg_fee_cap_kg FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 1.0
+        )                                                      AS lajz_fee_cap_kg,
+        COALESCE(
+            (SELECT aw.base_fee FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.base_fee FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 2.7
+        )                                                      AS lajz_base_fee,
+        COALESCE(
+            (SELECT aw.step_kg FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.step_kg FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 0.1
+        )                                                      AS lajz_step_kg,
+        COALESCE(
+            (SELECT aw.step_fee FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.step_fee FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 0.2
+        )                                                      AS lajz_step_fee,
+        COALESCE(
+            (SELECT aw.min_tickets FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.min_tickets FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 50
+        )                                                      AS lajz_min_tickets,
+        COALESCE(
+            (SELECT aw.over_cap_mode FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.over_cap_mode FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 0
+        )::INT                                                  AS lajz_over_cap_mode,
+        COALESCE(
+            (SELECT aw.reuse_zone_groups FROM avg_weight_active aw
+              WHERE bfc.cust_avg_weight_tpl_id IS NOT NULL
+                AND aw.avg_tpl_id = bfc.cust_avg_weight_tpl_id LIMIT 1),
+            (SELECT aw.reuse_zone_groups FROM avg_weight_active aw
+              WHERE COALESCE(NULLIF(aw.template_id,''), '*') = bfc.template_id LIMIT 1), 1
+        )::INT                                                  AS lajz_reuse_zone_groups
+    FROM base_fee_calc bfc
+),
+-- Step5-3 L2：进池判定（命中合同 + 单件重 ≤ avg_pool_max_kg + 省在白名单）
+avg_weight_pool_in AS (
+    SELECT
+        awj.*,
+        CASE
+            WHEN awj.lajz_avg_tpl_id IS NULL OR TRIM(awj.lajz_avg_tpl_id)='' THEN FALSE
+            WHEN awj.charge_weight > awj.lajz_pool_max_kg                     THEN FALSE
+            WHEN awj.lajz_reuse_zone_groups = 1 THEN
+                (
+                   awj.group_code IS NOT NULL
+                   AND (
+                         EXISTS (SELECT 1 FROM avg_weight_zone_tpl_groups gt
+                                 WHERE gt.avg_tpl_id  = awj.lajz_avg_tpl_id
+                                   AND (gt.template_id = awj.template_id OR gt.template_id='*' OR gt.template_id=''))
+                               = FALSE
+                         OR
+                         EXISTS (SELECT 1 FROM avg_weight_zone_tpl_groups gt
+                                 WHERE gt.avg_tpl_id  = awj.lajz_avg_tpl_id
+                                   AND (gt.template_id = awj.template_id OR gt.template_id='*' OR gt.template_id='')
+                                   AND gt.group_code  = awj.group_code)
+                   )
+                   AND
+                   NOT EXISTS (SELECT 1 FROM avg_weight_zone_excludes ex
+                               WHERE ex.avg_tpl_id  = awj.lajz_avg_tpl_id
+                                 AND (ex.template_id = awj.template_id OR ex.template_id='*' OR ex.template_id='')
+                                 AND ex.group_code  = awj.group_code
+                                 AND REGEXP_REPLACE(ex.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                                   = awj.norm_province)
+                )
+            WHEN awj.lajz_reuse_zone_groups = 0 AND EXISTS(
+                     SELECT 1 FROM avg_weight_zones az
+                     WHERE az.avg_tpl_id = awj.lajz_avg_tpl_id
+                       AND REGEXP_REPLACE(az.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                         = awj.norm_province
+                 ) THEN TRUE
+            ELSE FALSE
+        END AS lajz_in_pool_raw
+    FROM avg_weight_joined awj
+),
+avg_weight_pool_b_zone AS (
+    SELECT p.order_id,
+           (SELECT az.zone_code FROM avg_weight_zones az
+             WHERE az.avg_tpl_id = p.lajz_avg_tpl_id
+               AND REGEXP_REPLACE(az.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
+                 = p.norm_province LIMIT 1) AS b_zone_code
+    FROM avg_weight_pool_in p
+    WHERE p.lajz_reuse_zone_groups = 0
+),
+avg_weight_pool_b_zone_cnt AS (
+    SELECT avg_tpl_id, COUNT(DISTINCT zone_code) AS zone_cnt
+    FROM avg_weight_zones
+    GROUP BY 1
+),
+avg_weight_pool_agg AS (
+    SELECT
+        COALESCE(NULLIF(pi.lajz_avg_tpl_id,''), '__no_contract__')             AS pool_key,
+        CASE
+           WHEN COALESCE(pi.lajz_reuse_zone_groups, 1) = 1
+               THEN COALESCE(NULLIF(pi.group_code,''), '__default__')
+           ELSE COALESCE(
+                 CASE WHEN COALESCE(zc.zone_cnt, 0) >= 2 THEN bz.b_zone_code END,
+                 '__global__'
+           )
+        END                                                                     AS pool_subkey,
+        COUNT(*) FILTER (WHERE pi.lajz_in_pool_raw = TRUE)                     AS pool_n,
+        AVG(pi.charge_weight) FILTER (WHERE pi.lajz_in_pool_raw = TRUE)        AS pool_avg_kg,
+        MAX(pi.lajz_min_tickets)                                               AS pool_min_required
+    FROM avg_weight_pool_in pi
+    LEFT JOIN avg_weight_pool_b_zone     bz ON bz.order_id = pi.order_id
+    LEFT JOIN avg_weight_pool_b_zone_cnt zc ON zc.avg_tpl_id = pi.lajz_avg_tpl_id
+    GROUP BY 1, 2
+),
+avg_weight_pool_final AS (
+    SELECT p.*,
+           CASE WHEN pool_n < pool_min_required THEN FALSE ELSE TRUE END AS pool_eligible
+    FROM avg_weight_pool_agg p
+),
+lajz_final AS (
+    SELECT
+        p.*,
+        COALESCE(fp.pool_avg_kg, 0.0)                              AS lajz_pool_avg_kg,
+        COALESCE(fp.pool_n, 0)                                     AS lajz_pool_n,
+        CASE WHEN fp.pool_eligible = TRUE AND p.lajz_in_pool_raw = TRUE
+                AND (
+                    (p.lajz_over_cap_mode = 1 AND COALESCE(fp.pool_avg_kg, 0) <= p.lajz_fee_cap_kg)
+                    OR p.lajz_over_cap_mode = 0
+                )
+             THEN TRUE ELSE FALSE END                              AS lajz_used,
+        CASE WHEN fp.pool_eligible = TRUE AND p.lajz_in_pool_raw = TRUE
+             THEN ROUND(
+                  p.lajz_base_fee +
+                  LEAST(
+                      GREATEST(0, CEIL((COALESCE(fp.pool_avg_kg,0) - p.lajz_base_avg_kg)
+                                 / NULLIF(p.lajz_step_kg,0))) * p.lajz_step_fee,
+                      GREATEST(0, CEIL((p.lajz_fee_cap_kg - p.lajz_base_avg_kg)
+                                 / NULLIF(p.lajz_step_kg,0))) * p.lajz_step_fee
+                  ), 2)
+             ELSE NULL END                                         AS lajz_fee_per_ticket
+    FROM avg_weight_pool_in p
+    LEFT JOIN avg_weight_pool_b_zone     lbz ON lbz.order_id = p.order_id
+    LEFT JOIN avg_weight_pool_b_zone_cnt lzc ON lzc.avg_tpl_id = p.lajz_avg_tpl_id
+    LEFT JOIN avg_weight_pool_final fp
+           ON fp.pool_key    = COALESCE(NULLIF(p.lajz_avg_tpl_id,''), '__no_contract__')
+          AND fp.pool_subkey = CASE
+                    WHEN COALESCE(p.lajz_reuse_zone_groups, 1) = 1
+                        THEN COALESCE(NULLIF(p.group_code,''), '__default__')
+                    ELSE COALESCE(
+                          CASE WHEN COALESCE(lzc.zone_cnt,0) >= 2 THEN lbz.b_zone_code END,
+                          '__global__'
+                    ) END
+),
+)SQL") : QStringLiteral(R"SQL(
+-- =====================================================================
+-- Step5-2~5-4：拉均重总开关未启用（enable_avg_weight=FALSE）
+--   全量列置空，占位直通，保证下游 CTE / 输出 SELECT 列结构完全一致
+-- =====================================================================
+avg_weight_active AS (SELECT * FROM avg_weight_templates WHERE 1=0),
+avg_weight_joined AS (
+    SELECT
+        bfc.*,
+        NULL::VARCHAR                                           AS lajz_avg_tpl_id,
+        ''::VARCHAR                                             AS lajz_contract_no,
+        1.0::DOUBLE                                             AS lajz_pool_max_kg,
+        0.3::DOUBLE                                             AS lajz_base_avg_kg,
+        1.0::DOUBLE                                             AS lajz_fee_cap_kg,
+        2.7::DOUBLE                                             AS lajz_base_fee,
+        0.1::DOUBLE                                             AS lajz_step_kg,
+        0.2::DOUBLE                                             AS lajz_step_fee,
+        50::BIGINT                                              AS lajz_min_tickets,
+        0::INT                                                  AS lajz_over_cap_mode,
+        1::INT                                                  AS lajz_reuse_zone_groups
+    FROM base_fee_calc bfc
+),
+avg_weight_pool_in AS (
+    SELECT awj.*, FALSE::BOOLEAN AS lajz_in_pool_raw FROM avg_weight_joined awj
+),
+avg_weight_pool_b_zone AS (SELECT order_id, NULL::VARCHAR AS b_zone_code FROM avg_weight_pool_in WHERE 1=0),
+avg_weight_pool_b_zone_cnt AS (SELECT avg_tpl_id, 0::BIGINT AS zone_cnt FROM avg_weight_zones WHERE 1=0),
+avg_weight_pool_agg AS (
+    SELECT '__no_contract__'::VARCHAR AS pool_key, '__default__'::VARCHAR AS pool_subkey,
+           0::BIGINT AS pool_n, 0::DOUBLE AS pool_avg_kg, 50::BIGINT AS pool_min_required
+    WHERE 1=0
+),
+avg_weight_pool_final AS (SELECT p.*, FALSE::BOOLEAN AS pool_eligible FROM avg_weight_pool_agg p WHERE 1=0),
+lajz_final AS (
+    SELECT p.*,
+           0.0::DOUBLE AS lajz_pool_avg_kg,
+           0::BIGINT   AS lajz_pool_n,
+           FALSE::BOOLEAN           AS lajz_used,
+           NULL::DOUBLE             AS lajz_fee_per_ticket
+    FROM avg_weight_pool_in p
+),
+)SQL");
+
+    const QString enable_flag_str = enable_avg_weight ? "TRUE" : "FALSE";
+
+    // ========== 输出列构造：enable_avg_weight=FALSE 时完全不输出拉均重列 ==========
+    const QString LAJZ_OUTPUT_COLS = enable_avg_weight ? QStringLiteral(R"SQL(,
+    CASE WHEN lajz_in_pool_raw THEN '是' ELSE '否' END              AS "是否命中拉均重池",
+    CASE WHEN lajz_used        THEN '是' ELSE '否' END              AS "是否采用拉均重价",
+    COALESCE(NULLIF(lajz_contract_no,''), '')                       AS "拉均重合同编号",
+    ROUND(lajz_pool_avg_kg, 5)                                      AS "拉均重池平均重量(KG)",
+    ROUND(lajz_pool_max_kg, 3)                                      AS "拉均重池进池上限(KG)",
+    ROUND(lajz_base_avg_kg, 3)                                      AS "拉均重约定基准(KG)",
+    ROUND(lajz_fee_cap_kg, 3)                                       AS "拉均重加价封顶(KG)",
+    ROUND(COALESCE(lajz_fee_per_ticket, 0), 2)                      AS "拉均重单票基础价(元)",
+    ROUND(COALESCE(lajz_save_vs_tier, 0), 2)                        AS "拉均重相比阶梯节省(元/票)",
+    COALESCE(lajz_avg_tpl_id, '')                                   AS "诊断_命中的拉均重合同ID",
+    CASE WHEN lajz_in_pool_raw IS TRUE THEN '是' ELSE '否' END      AS "诊断_是否命中拉均重池",
+    COALESCE(lajz_pool_n, 0)                                        AS "诊断_有效进池票数",
+    CASE WHEN lajz_used IS TRUE THEN '是' ELSE '否' END             AS "诊断_最终是否采用拉均重"
+)SQL") : QStringLiteral("");
+
+    qCritical() << "[DIAG] BuildCalcSQL called: enable_avg_weight =" << enable_avg_weight
+                << "，enable_flag_str =" << enable_flag_str;
+
+    // ========== 主 SQL：__lajz_global 的标志直接写死（不再靠 %4 arg，防止占位符顺序错位）==========
+    const QString sql_head = QString(R"SQL(
 CREATE OR REPLACE TABLE %1 AS
 WITH
+__lajz_global AS (SELECT )SQL") + enable_flag_str + QStringLiteral(R"SQL(::BOOLEAN AS enable_avg_weight),
 input_data AS (
     SELECT
         COALESCE(order_id, '') AS order_id,
@@ -388,7 +934,13 @@ input_data AS (
 customer_template_lookup AS (
     SELECT
         i.*,
-        COALESCE(c.default_template, 'zto_standard') AS template_id
+        COALESCE(c.default_template, 'zto_standard') AS template_id,
+        COALESCE(NULLIF(TRIM(c.cust_rounding_mode), ''), NULL)   AS cust_rounding_mode,
+        CASE WHEN COALESCE(c.cust_additional_unit, 0) > 0
+             THEN c.cust_additional_unit ELSE NULL END           AS cust_additional_unit,
+        CASE WHEN COALESCE(c.cust_vol_divisor, 0) > 0
+             THEN c.cust_vol_divisor ELSE NULL END               AS cust_vol_divisor,
+        COALESCE(NULLIF(TRIM(c.avg_weight_tpl_id), ''), NULL)    AS cust_avg_weight_tpl_id
     FROM input_data i
     LEFT JOIN customers c ON c.customer_id = i.customer_id
 ),
@@ -396,17 +948,24 @@ template_info AS (
     SELECT
         ctl.*,
         COALESCE(ft.default_no_weight_fee, 0) AS default_no_weight_fee,
-        COALESCE(NULLIF(ft.tpl_rounding_mode, ''), 'ceil_0_1kg') AS tpl_rounding_mode,
-        COALESCE(NULLIF(ft.tpl_additional_unit, 0), NULLIF(ft.additional_unit, 0), 1.0) AS tpl_additional_unit,
-        COALESCE(NULLIF(ft.tpl_vol_divisor, 0), CAST(NULLIF(ft.vol_weight_ratio, 0) AS INTEGER), 6000) AS tpl_vol_divisor
+        COALESCE(ctl.cust_rounding_mode,
+                 NULLIF(ft.tpl_rounding_mode, ''),
+                 'ceil_0_1kg')                                                 AS eff_rounding_mode,
+        COALESCE(ctl.cust_additional_unit,
+                 NULLIF(ft.tpl_additional_unit, 0),
+                 NULLIF(ft.additional_unit, 0),
+                 1.0)                                                        AS eff_additional_unit,
+        COALESCE(ctl.cust_vol_divisor,
+                 NULLIF(ft.tpl_vol_divisor, 0),
+                 CAST(NULLIF(ft.vol_weight_ratio, 0) AS INTEGER),
+                 6000)                                                       AS eff_vol_divisor
     FROM customer_template_lookup ctl
     LEFT JOIN freight_templates ft ON ft.template_id = ctl.template_id
 ),
--- 按模板 rounding_mode 对计费重量做进位（国标默认 0.1kg 进一）
 charge_weight_rounded AS (
     SELECT
         ti.*,
-        CASE COALESCE(ti.tpl_rounding_mode, 'ceil_0_1kg')
+        CASE COALESCE(ti.eff_rounding_mode, 'ceil_0_1kg')
             WHEN 'ceil_1kg'       THEN CEIL(ti.raw_charge_weight)
             WHEN 'ceil_0_5kg'     THEN CEIL(ti.raw_charge_weight * 2.0) / 2.0
             WHEN 'ceil_0_1kg'     THEN CEIL(ti.raw_charge_weight * 10.0) / 10.0
@@ -472,30 +1031,35 @@ base_fee_calc AS (
                 THEN mt.first_price
                      + GREATEST(0, CEIL(
                          (mt.charge_weight - mt.first_weight)
-                         / GREATEST(COALESCE(mt.tpl_additional_unit, mt.additional_unit, 1.0), 0.0001)
+                         / GREATEST(COALESCE(mt.eff_additional_unit, mt.additional_unit, 1.0), 0.0001)
                      )) * mt.additional_price
             ELSE
                 COALESCE(tm.max_first_price, 0) +
                 GREATEST(0, CEIL(
                     (mt.charge_weight - COALESCE(tm.max_first_weight, 0))
-                    / GREATEST(COALESCE(mt.tpl_additional_unit, tm.max_additional_unit, 1.0), 0.0001)
+                    / GREATEST(COALESCE(mt.eff_additional_unit, tm.max_additional_unit, 1.0), 0.0001)
                 )) * COALESCE(tm.max_additional_price, 0)
-        END AS base_fee
+        END AS base_fee__tier,
+        NULL::DOUBLE AS __lajz_stub
     FROM matched_tier mt
     LEFT JOIN tier_max tm
         ON tm.template_id = mt.template_id
        AND tm.group_code = mt.group_code
 ),
+)SQL");
+
+    // ========== 拉均重 + 燃油/偏远/策略/final_merged + SELECT 输出列拼接 ==========
+    const QString sql_tail = QStringLiteral(R"SQL(
 fuel_surcharge_calc AS (
     SELECT
-        bfc.*,
+        lf.*,
         COALESCE((
             SELECT fs.rate
             FROM fuel_surcharge fs
-            WHERE fs.template_id = bfc.template_id
+            WHERE fs.template_id = lf.template_id
               AND fs.is_active = 1
               AND fs.effective_date = (SELECT MAX(effective_date) FROM fuel_surcharge
-                                         WHERE template_id = bfc.template_id
+                                         WHERE template_id = lf.template_id
                                            AND is_active = 1
                                            AND effective_date <= CURRENT_DATE)
             LIMIT 1
@@ -509,8 +1073,8 @@ fuel_surcharge_calc AS (
                                            AND is_active = 1
                                            AND effective_date <= CURRENT_DATE)
             LIMIT 1
-        ), 0) * bfc.base_fee AS fuel_surcharge
-    FROM base_fee_calc bfc
+        ), 0) * lf.base_fee__tier AS fuel_surcharge
+    FROM lajz_final lf
 ),
 remote_area_calc AS (
     SELECT
@@ -563,7 +1127,7 @@ strategy_surcharge_calc AS (
             SELECT SUM(
                 CASE s.strategy_type
                     WHEN 'fixed' THEN s.amount
-                    WHEN 'percentage' THEN rac.base_fee * s.amount
+                    WHEN 'percentage' THEN rac.base_fee__tier * s.amount
                     WHEN 'per_weight' THEN rac.charge_weight * s.amount
                     WHEN 'per_volume' THEN COALESCE(NULLIF(rac.vol_weight, 0), rac.charge_weight) * s.amount
                     ELSE 0
@@ -588,24 +1152,43 @@ strategy_surcharge_calc AS (
               AND (s.max_weight IS NULL OR s.max_weight = 0 OR rac.charge_weight <= s.max_weight)
         ), 0) AS strategy_surcharge
     FROM remote_area_calc rac
+),
+final_merged AS (
+    SELECT ssc.*,
+        CASE WHEN (SELECT enable_avg_weight FROM __lajz_global) = TRUE
+                  AND ssc.lajz_used = TRUE
+             THEN COALESCE(ssc.lajz_fee_per_ticket, ssc.base_fee__tier)
+             ELSE ssc.base_fee__tier END                    AS base_fee,
+        CASE WHEN (SELECT enable_avg_weight FROM __lajz_global) = TRUE
+                  AND ssc.lajz_used = TRUE
+             THEN ROUND(COALESCE(ssc.base_fee__tier, 0)
+                      - COALESCE(ssc.lajz_fee_per_ticket, 0), 2)
+             ELSE 0 END                                      AS lajz_save_vs_tier
+    FROM strategy_surcharge_calc ssc
 )
 
 SELECT
-    order_id AS "订单号",
-    customer_id AS "客户编号",
-    dest_province AS "目的省份",
-    dest_city AS "目的城市",
-    weight AS "实际重量(KG)",
-    vol_weight AS "体积重量(KG)",
-    charge_weight AS "计费重量(KG)",
-    ROUND(base_fee, 2) AS "基础运费",
-    ROUND(fuel_surcharge, 2) AS "燃油附加费",
-    ROUND(remote_surcharge, 2) AS "地区加价",
-    ROUND(strategy_surcharge, 2) AS "其他附加费",
+    order_id                                                AS "订单号",
+    customer_id                                             AS "客户编号",
+    dest_province                                           AS "目的省份",
+    dest_city                                               AS "目的城市",
+    weight                                                  AS "实际重量(KG)",
+    vol_weight                                              AS "体积重量(KG)",
+    charge_weight                                           AS "计费重量(KG)",
+    ROUND(base_fee, 2)                                      AS "基础运费",
+    ROUND(fuel_surcharge, 2)                                AS "燃油附加费",
+    ROUND(remote_surcharge, 2)                              AS "地区加价",
+    ROUND(strategy_surcharge, 2)                            AS "其他附加费",
     ROUND(base_fee + fuel_surcharge + remote_surcharge + strategy_surcharge, 2) AS "总运费",
-    'CNY' AS "币种"
-FROM strategy_surcharge_calc
-    )SQL").arg(output_table, input_table);
+    'CNY'                                                   AS "币种"
+)SQL")
+        + LAJZ_OUTPUT_COLS
+        + QStringLiteral("\nFROM final_merged\n");
+
+    QString sql = (sql_head + LAJZ_CTES + sql_tail).arg(output_table, input_table);
+
+    qCritical() << "[DIAG] 最终 SQL __lajz_global 附近 300 字符：\n"
+                << sql.mid(sql.indexOf("__lajz_global"), 300);
 
     return sql;
 }

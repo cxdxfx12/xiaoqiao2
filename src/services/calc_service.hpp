@@ -22,13 +22,16 @@ public:
                                  const QString &customer_id = QString(),
                                  double vol_length = 0.0,
                                  double vol_width = 0.0,
-                                 double vol_height = 0.0);
+                                 double vol_height = 0.0,
+                                 bool enable_avg_weight = false);
 
     bool CalcBatch(const QString &input_table,
-                   const QString &output_table);
+                   const QString &output_table,
+                   bool enable_avg_weight = false);
 
     bool CalcFromFile(const QString &input_file,
-                      const QString &output_file);
+                      const QString &output_file,
+                      bool enable_avg_weight = false);
 
     // 表头映射支持
     QStringList GetTableColumns(const QString &table_name);
@@ -50,7 +53,8 @@ signals:
 
 private:
     QString BuildCalcSQL(const QString &input_table,
-                         const QString &output_table);
+                         const QString &output_table,
+                         bool enable_avg_weight = false);
 };
 
 } // namespace freight::services

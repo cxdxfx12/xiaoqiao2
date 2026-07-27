@@ -78,6 +78,7 @@ private:
     QComboBox *cbo_recent_ = nullptr;
     QCheckBox *chk_detect_template_ = nullptr;
     QCheckBox *chk_show_diff_ = nullptr;
+    QCheckBox *chk_enable_avg_weight_ = nullptr;
     QLabel *lbl_template_info_ = nullptr;
 
     QTableWidget *preview_table_ = nullptr;

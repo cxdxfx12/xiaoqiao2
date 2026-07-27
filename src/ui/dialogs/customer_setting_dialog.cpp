@@ -11,6 +11,9 @@
 #include <QMessageBox>
 #include <QLineEdit>
 #include <QDoubleSpinBox>
+#include <QSpinBox>
+#include <QComboBox>
+#include <QFrame>
 #include <QDialogButtonBox>
 #include <QFormLayout>
 #include <QFileDialog>
@@ -241,14 +244,41 @@ void CustomerSettingDialog::LoadCustomerList() {
     db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
     repo.Init();
 
+    QMap<QString, QString> rounding_label;
+    rounding_label[""] = "不覆写";
+    rounding_label["ceil_1kg"] = "向上取整kg";
+    rounding_label["ceil_0_5kg"] = "向上0.5kg";
+    rounding_label["ceil_0_1kg"] = "向上0.1kg";
+    rounding_label["round_0_1kg"] = "四舍五入0.1kg";
+    rounding_label["floor_no_round"] = "不进整";
+
+    QMap<QString, QString> avg_tpl_name;
+    auto avg_tpls = repo.ListAvgWeightTemplates();
+    for (const auto &a : avg_tpls) {
+        auto am = a.toMap();
+        avg_tpl_name[am["avg_tpl_id"].toString()] = am["name"].toString();
+    }
+
     customer_list_->clear();
     auto customers = repo.ListCustomers();
     for (const auto &c : customers) {
         auto map = c.toMap();
         auto *item = new QListWidgetItem(map["customer_name"].toString());
         item->setData(Qt::UserRole, map["customer_id"].toString());
+
         double discount = map["discount_rate"].toDouble();
-        item->setToolTip(QString("折扣: %1折").arg(discount * 10, 0, 'f', 1));
+        QString rounding = map.value("cust_rounding_mode", "").toString();
+        QString avg_tpl_id = map.value("avg_weight_tpl_id", "").toString();
+
+        QStringList tips;
+        tips << QString("折扣: %1折").arg(discount * 10, 0, 'f', 1);
+        tips << QString("舍入模式: %1").arg(rounding_label.value(rounding, rounding));
+        if (avg_tpl_id.isEmpty()) {
+            tips << "拉均重合同: 不指定（按模板匹配）";
+        } else {
+            tips << QString("拉均重合同: %1").arg(avg_tpl_name.value(avg_tpl_id, avg_tpl_id));
+        }
+        item->setToolTip(tips.join("\n"));
         customer_list_->addItem(item);
     }
 }
@@ -514,7 +544,7 @@ void CustomerSettingDialog::OnSaveCustomerPricing() {
 void CustomerSettingDialog::ShowCustomerDialog(bool is_add) {
     QDialog dlg(this);
     dlg.setWindowTitle(is_add ? "新增客户" : "编辑客户");
-    dlg.resize(400, 300);
+    dlg.resize(500, 520);
     dlg.setModal(true);
 
     auto &cfg = core::AppConfig::Instance();
@@ -533,19 +563,60 @@ void CustomerSettingDialog::ShowCustomerDialog(bool is_add) {
     auto *contact_edit = new QLineEdit();
     auto *phone_edit = new QLineEdit();
 
+    auto *cust_rounding_mode = new QComboBox();
+    cust_rounding_mode->addItem("不覆写（默认）", "");
+    cust_rounding_mode->addItem("ceil_1kg（向上取整kg）", "ceil_1kg");
+    cust_rounding_mode->addItem("ceil_0_5kg（向上0.5kg）", "ceil_0_5kg");
+    cust_rounding_mode->addItem("ceil_0_1kg（向上0.1kg）", "ceil_0_1kg");
+    cust_rounding_mode->addItem("round_0_1kg（四舍五入0.1kg）", "round_0_1kg");
+    cust_rounding_mode->addItem("floor_no_round（不进整）", "floor_no_round");
+
+    auto *cust_additional_unit = new QDoubleSpinBox();
+    cust_additional_unit->setRange(0.0, 5.0);
+    cust_additional_unit->setSingleStep(0.1);
+    cust_additional_unit->setDecimals(1);
+    cust_additional_unit->setValue(0.0);
+    cust_additional_unit->setSpecialValueText("0 = 不覆写");
+
+    auto *cust_vol_divisor = new QSpinBox();
+    cust_vol_divisor->setRange(0, 10000);
+    cust_vol_divisor->setSingleStep(100);
+    cust_vol_divisor->setValue(0);
+    cust_vol_divisor->setSpecialValueText("0 = 不覆写");
+
+    auto *avg_weight_tpl_id = new QComboBox();
+    avg_weight_tpl_id->addItem("不指定（按模板匹配）", "");
+    auto avg_tpls = repo.ListAvgWeightTemplates();
+    for (const auto &a : avg_tpls) {
+        auto am = a.toMap();
+        QString display = QString("%1(%2)").arg(am["name"].toString(), am["contract_no"].toString());
+        avg_weight_tpl_id->addItem(display, am["avg_tpl_id"].toString());
+    }
+
+    auto *cust_contract_no = new QLineEdit();
+
     QString cust_id_to_edit;
     if (!is_add && !current_cust_id_.isEmpty()) {
         cust_id_to_edit = current_cust_id_;
-        auto customers = repo.ListCustomers();
-        for (const auto &c : customers) {
-            auto map = c.toMap();
-            if (map["customer_id"].toString() == cust_id_to_edit) {
-                name_edit->setText(map["customer_name"].toString());
-                discount_spin->setValue(map["discount_rate"].toDouble() * 10);
-                contact_edit->setText(map["contact_person"].toString());
-                phone_edit->setText(map["contact_phone"].toString());
-                break;
-            }
+        auto old_cust = repo.GetCustomer(cust_id_to_edit);
+        if (!old_cust.isEmpty()) {
+            name_edit->setText(old_cust["customer_name"].toString());
+            discount_spin->setValue(old_cust["discount_rate"].toDouble() * 10);
+            contact_edit->setText(old_cust["contact_person"].toString());
+            phone_edit->setText(old_cust["contact_phone"].toString());
+
+            QString rounding = old_cust.value("cust_rounding_mode", "").toString();
+            int idx = cust_rounding_mode->findData(rounding);
+            cust_rounding_mode->setCurrentIndex(idx >= 0 ? idx : 0);
+
+            cust_additional_unit->setValue(old_cust.value("cust_additional_unit", 0.0).toDouble());
+            cust_vol_divisor->setValue(old_cust.value("cust_vol_divisor", 0).toInt());
+
+            QString avg_tpl = old_cust.value("avg_weight_tpl_id", "").toString();
+            int aidx = avg_weight_tpl_id->findData(avg_tpl);
+            avg_weight_tpl_id->setCurrentIndex(aidx >= 0 ? aidx : 0);
+
+            cust_contract_no->setText(old_cust.value("cust_contract_no", "").toString());
         }
     }
 
@@ -553,6 +624,17 @@ void CustomerSettingDialog::ShowCustomerDialog(bool is_add) {
     form->addRow("折扣率(折):", discount_spin);
     form->addRow("联系人:", contact_edit);
     form->addRow("联系电话:", phone_edit);
+
+    auto *sep1 = new QFrame();
+    sep1->setFrameShape(QFrame::HLine);
+    sep1->setFrameShadow(QFrame::Sunken);
+    form->addRow(sep1);
+
+    form->addRow("客户级进位模式:", cust_rounding_mode);
+    form->addRow("客户级续重单位(kg):", cust_additional_unit);
+    form->addRow("客户级体积重除数:", cust_vol_divisor);
+    form->addRow("拉均重合同:", avg_weight_tpl_id);
+    form->addRow("合同号(备注):", cust_contract_no);
 
     layout->addLayout(form);
 
@@ -571,18 +653,24 @@ void CustomerSettingDialog::ShowCustomerDialog(bool is_add) {
         QVariantMap cust;
         cust["customer_name"] = name_edit->text().trimmed();
         cust["discount_rate"] = discount_spin->value() / 10.0;
-        cust["default_template"] = "";
         cust["contact_person"] = contact_edit->text().trimmed();
         cust["contact_phone"] = phone_edit->text().trimmed();
+
+        cust["cust_rounding_mode"] = cust_rounding_mode->currentData().toString();
+        cust["cust_additional_unit"] = cust_additional_unit->value();
+        cust["cust_vol_divisor"] = cust_vol_divisor->value();
+        cust["avg_weight_tpl_id"] = avg_weight_tpl_id->currentData().toString();
+        cust["cust_contract_no"] = cust_contract_no->text().trimmed();
 
         QString new_cust_id;
         if (is_add) {
             new_cust_id = "cust_" + QString::number(QDateTime::currentSecsSinceEpoch())
                         + "_" + QString::number(QRandomGenerator::global()->generate() % 10000);
             cust["customer_id"] = new_cust_id;
+            cust["default_template"] = "";
+            cust["address"] = "";
             if (repo.AddCustomer(cust)) {
                 LoadCustomerList();
-                // 选中新客户
                 for (int i = 0; i < customer_list_->count(); i++) {
                     if (customer_list_->item(i)->data(Qt::UserRole).toString() == new_cust_id) {
                         customer_list_->setCurrentRow(i);
@@ -595,9 +683,11 @@ void CustomerSettingDialog::ShowCustomerDialog(bool is_add) {
             }
         } else {
             cust["customer_id"] = cust_id_to_edit;
+            auto old_cust = repo.GetCustomer(cust_id_to_edit);
+            cust["default_template"] = old_cust.value("default_template", "").toString();
+            cust["address"] = old_cust.value("address", "").toString();
             if (repo.UpdateCustomer(cust)) {
                 LoadCustomerList();
-                // 重新选中
                 for (int i = 0; i < customer_list_->count(); i++) {
                     if (customer_list_->item(i)->data(Qt::UserRole).toString() == cust_id_to_edit) {
                         customer_list_->setCurrentRow(i);

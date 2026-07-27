@@ -24,6 +24,15 @@
 #include <QDateTime>
 #include <QRandomGenerator>
 #include <QPlainTextEdit>
+#include <QDateEdit>
+#include <QScrollArea>
+#include <QButtonGroup>
+#include <QRadioButton>
+#include <QPushButton>
+#include <QListWidget>
+#include <QListWidgetItem>
+#include <QGroupBox>
+#include <QRegularExpression>
 
 namespace freight::ui::dialogs {
 
@@ -318,6 +327,11 @@ void RuleSettingDialog::SetupUI() {
     SetupMappingTab(mapping_tab);
     mapping_tab_idx_ = tab_widget_->addTab(mapping_tab, "🧭 表头关键字");
 
+    // ====== Tab 7: 拉均重合同 ======
+    auto *lajz_tab = new QWidget();
+    SetupLajzTab(lajz_tab);
+    lajz_tab_idx_ = tab_widget_->addTab(lajz_tab, "拉均重合同");
+
     main_layout->addWidget(tab_widget_);
 
     // 底部按钮
@@ -545,6 +559,7 @@ void RuleSettingDialog::LoadData() {
     }
 
     LoadMappingTable();
+    LoadLajzTable();
 }
 
 void RuleSettingDialog::ShowSurchargeDialog(bool is_add) {
@@ -1337,6 +1352,1453 @@ void RuleSettingDialog::ShowRemoteDialog(bool is_add) {
             QMessageBox::information(this, "成功", is_add ? "已添加" : "已更新");
         } else {
             QMessageBox::warning(this, "错误", is_add ? "添加失败" : "更新失败");
+        }
+    }
+}
+
+void RuleSettingDialog::SetupLajzTab(QWidget *tab) {
+    auto &icons = IconManager::Instance();
+    auto *root = new QVBoxLayout(tab);
+    root->setContentsMargins(16, 16, 16, 16);
+    root->setSpacing(12);
+
+    lajz_table_ = new QTableWidget(0, 17);
+    lajz_table_->setHorizontalHeaderLabels({
+        "启停", "合同ID", "合同名称", "合同编号", "版本", "绑定模板",
+        "生效起", "生效至", "基准均重kg", "进池上限kg", "封顶kg",
+        "基础价", "步长kg", "每步加价", "最少票数", "超上限模式", "复用分组"
+    });
+    lajz_table_->horizontalHeader()->setStretchLastSection(true);
+    lajz_table_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+    lajz_table_->setSelectionBehavior(QAbstractItemView::SelectRows);
+    lajz_table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    lajz_table_->setMinimumHeight(420);
+    root->addWidget(lajz_table_, 1);
+
+    auto *btn_layout = new QHBoxLayout();
+    auto *btn_add = new QPushButton(" 新增合同");
+    btn_add->setIcon(icons.ActionIcon("add"));
+    btn_add->setCursor(Qt::PointingHandCursor);
+    auto *btn_edit = new QPushButton(" 编辑");
+    btn_edit->setCursor(Qt::PointingHandCursor);
+    auto *btn_del = new QPushButton(" 删除");
+    btn_del->setIcon(icons.ActionIcon("delete"));
+    btn_del->setCursor(Qt::PointingHandCursor);
+    auto *btn_enable = new QPushButton(" 启用");
+    btn_enable->setCursor(Qt::PointingHandCursor);
+    auto *btn_disable = new QPushButton(" 停用");
+    btn_disable->setCursor(Qt::PointingHandCursor);
+
+    btn_layout->addWidget(btn_add);
+    btn_layout->addWidget(btn_edit);
+    btn_layout->addWidget(btn_del);
+    btn_layout->addStretch();
+    btn_layout->addWidget(btn_enable);
+    btn_layout->addWidget(btn_disable);
+    root->addLayout(btn_layout);
+
+    connect(lajz_table_, &QTableWidget::cellClicked, this, &RuleSettingDialog::OnLajzItemClicked);
+    connect(btn_add, &QPushButton::clicked, this, &RuleSettingDialog::OnLajzAdd);
+    connect(btn_edit, &QPushButton::clicked, this, &RuleSettingDialog::OnLajzEdit);
+    connect(btn_del, &QPushButton::clicked, this, &RuleSettingDialog::OnLajzDel);
+    connect(btn_enable, &QPushButton::clicked, this, [this]() { OnLajzToggle(true); });
+    connect(btn_disable, &QPushButton::clicked, this, [this]() { OnLajzToggle(false); });
+}
+
+void RuleSettingDialog::LoadLajzTable() {
+    if (!lajz_table_) return;
+    auto &cfg = core::AppConfig::Instance();
+    db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
+    repo.Init();
+
+    auto list = repo.ListAvgWeightTemplates();
+    lajz_table_->setRowCount(list.size());
+    for (int i = 0; i < list.size(); ++i) {
+        const auto m = list[i].toMap();
+        bool active = m["is_active"].toBool();
+        auto *act_item = new QTableWidgetItem(active ? "是" : "否");
+        act_item->setForeground(active ? QColor("#67c23a") : QColor("#909399"));
+        act_item->setTextAlignment(Qt::AlignCenter);
+        act_item->setData(Qt::UserRole, m["avg_tpl_id"].toString());
+        lajz_table_->setItem(i, 0, act_item);
+
+        lajz_table_->setItem(i, 1, new QTableWidgetItem(m["avg_tpl_id"].toString()));
+        lajz_table_->setItem(i, 2, new QTableWidgetItem(m["name"].toString()));
+        lajz_table_->setItem(i, 3, new QTableWidgetItem(m["contract_no"].toString()));
+        lajz_table_->setItem(i, 4, new QTableWidgetItem(QString::number(m["version"].toInt())));
+        lajz_table_->setItem(i, 5, new QTableWidgetItem(m["template_id"].toString()));
+        lajz_table_->setItem(i, 6, new QTableWidgetItem(m["effective_from"].toString()));
+        lajz_table_->setItem(i, 7, new QTableWidgetItem(m["effective_to"].toString()));
+        lajz_table_->setItem(i, 8, new QTableWidgetItem(QString::number(m["base_avg_kg"].toDouble(), 'f', 3)));
+        lajz_table_->setItem(i, 9, new QTableWidgetItem(QString::number(m["avg_pool_max_kg"].toDouble(), 'f', 3)));
+        lajz_table_->setItem(i, 10, new QTableWidgetItem(QString::number(m["avg_fee_cap_kg"].toDouble(), 'f', 3)));
+        lajz_table_->setItem(i, 11, new QTableWidgetItem(QString::number(m["base_fee"].toDouble(), 'f', 2)));
+        lajz_table_->setItem(i, 12, new QTableWidgetItem(QString::number(m["step_kg"].toDouble(), 'f', 3)));
+        lajz_table_->setItem(i, 13, new QTableWidgetItem(QString::number(m["step_fee"].toDouble(), 'f', 2)));
+        lajz_table_->setItem(i, 14, new QTableWidgetItem(QString::number(m["min_tickets"].toInt())));
+
+        int ocm = m["over_cap_mode"].toInt();
+        lajz_table_->setItem(i, 15, new QTableWidgetItem(ocm == 0 ? "封顶" : "整池回阶梯"));
+
+        int rzg = m["reuse_zone_groups"].toInt();
+        auto *rzg_item = new QTableWidgetItem(rzg == 1 ? "是" : "否");
+        rzg_item->setTextAlignment(Qt::AlignCenter);
+        lajz_table_->setItem(i, 16, rzg_item);
+    }
+    lajz_table_->resizeColumnsToContents();
+}
+
+void RuleSettingDialog::OpenAvgWeightTab() {
+    if (lajz_tab_idx_ >= 0) {
+        tab_widget_->setCurrentIndex(lajz_tab_idx_);
+    }
+}
+
+void RuleSettingDialog::OnLajzItemClicked(int row, int col) {
+    if (col != 0) return;
+    QString avg_tpl_id = lajz_table_->item(row, 0)->data(Qt::UserRole).toString();
+    if (avg_tpl_id.isEmpty()) return;
+    bool current_active = lajz_table_->item(row, 0)->text() == "是";
+    auto &cfg = core::AppConfig::Instance();
+    db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
+    repo.Init();
+    repo.SetAvgWeightTemplateActive(avg_tpl_id, !current_active);
+    LoadLajzTable();
+}
+
+void RuleSettingDialog::OnLajzToggle(bool active) {
+    if (lajz_table_->currentRow() < 0) {
+        QMessageBox::warning(this, "提示", "请先选择一条合同记录");
+        return;
+    }
+    QString avg_tpl_id = lajz_table_->item(lajz_table_->currentRow(), 1)->text();
+    if (avg_tpl_id.isEmpty()) return;
+    auto &cfg = core::AppConfig::Instance();
+    db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
+    repo.Init();
+    repo.SetAvgWeightTemplateActive(avg_tpl_id, active);
+    LoadLajzTable();
+}
+
+void RuleSettingDialog::OnLajzAdd() {
+    ShowLajzDialog(true);
+}
+
+void RuleSettingDialog::OnLajzEdit() {
+    if (lajz_table_->currentRow() < 0) {
+        QMessageBox::warning(this, "提示", "请先选择一条合同记录");
+        return;
+    }
+    ShowLajzDialog(false);
+}
+
+void RuleSettingDialog::OnLajzDel() {
+    if (lajz_table_->currentRow() < 0) {
+        QMessageBox::warning(this, "提示", "请先选择一条合同记录");
+        return;
+    }
+    QString avg_tpl_id = lajz_table_->item(lajz_table_->currentRow(), 1)->text();
+    QString name = lajz_table_->item(lajz_table_->currentRow(), 2)->text();
+    auto ret = QMessageBox::question(this, "确认删除",
+        QString("确定要删除合同 \"%1\" (%2) 吗？").arg(name, avg_tpl_id),
+        QMessageBox::Yes | QMessageBox::No);
+    if (ret == QMessageBox::Yes) {
+        auto &cfg = core::AppConfig::Instance();
+        db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
+        repo.Init();
+        repo.DeleteAvgWeightTemplate(avg_tpl_id);
+        LoadLajzTable();
+    }
+}
+
+void RuleSettingDialog::ShowLajzDialog(bool is_add) {
+    QDialog dlg(this);
+    dlg.setWindowTitle(is_add ? "新增拉均重合同" : "编辑拉均重合同");
+    dlg.resize(960, 860);
+    dlg.setModal(true);
+
+    auto &cfg = core::AppConfig::Instance();
+    db::SqliteRuleRepository repo(cfg.GetRulesDbPath());
+    repo.Init();
+
+    const QStringList ALL_PROVINCES = {
+        "北京","天津","河北","山西","内蒙古","辽宁","吉林","黑龙江",
+        "上海","江苏","浙江","安徽","福建","江西","山东","河南",
+        "湖北","湖南","广东","广西","海南","重庆","四川","贵州",
+        "云南","西藏","陕西","甘肃","青海","宁夏","新疆","台湾",
+        "香港","澳门"
+    };
+
+    auto templates_with_zones = repo.ListCourierTemplatesWithZones();
+    auto find_tpl_map = [&](const QString &tid) -> QVariantMap {
+        for (const auto &tv : templates_with_zones) {
+            auto t = tv.toMap();
+            if (t["template_id"].toString() == tid) return t;
+        }
+        return {};
+    };
+
+    QSet<QString> sel_tpl_groups;
+    QSet<QString> excl_tplg_provs;
+
+    QMap<QString, QStringList> mem_b_zones;
+    int b_zone_next_idx = 0;
+
+    auto *layout = new QVBoxLayout(&dlg);
+    auto *scroll = new QScrollArea();
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    auto *scroll_widget = new QWidget();
+    auto *form = new QFormLayout(scroll_widget);
+    form->setLabelAlignment(Qt::AlignRight);
+    form->setHorizontalSpacing(12);
+    form->setVerticalSpacing(10);
+    scroll->setWidget(scroll_widget);
+    layout->addWidget(scroll, 1);
+
+    auto *ed_avg_tpl_id = new QLineEdit();
+    ed_avg_tpl_id->setPlaceholderText("例如: AVG_2026_SF");
+    auto *ed_name = new QLineEdit();
+    ed_name->setPlaceholderText("合同名称");
+    auto *ed_contract_no = new QLineEdit();
+    ed_contract_no->setPlaceholderText("合同编号");
+
+    auto *template_combo = new QComboBox();
+    template_combo->addItem("⚑ 全部模板通配（新订单匹配任何模板）", "");
+    {
+        QVariantList inactive_tpls;
+        for (const auto &tv : templates_with_zones) {
+            auto t = tv.toMap();
+            if (t["is_active"].toBool()) {
+                QString label = QString("%1 (%2) - 已启用 ✅")
+                    .arg(t["template_name"].toString(), t["template_id"].toString());
+                template_combo->addItem(label, t["template_id"].toString());
+            } else {
+                inactive_tpls << t;
+            }
+        }
+        for (const auto &tv : inactive_tpls) {
+            auto t = tv.toMap();
+            QString label = QString("%1 (%2) - 未启用 ⚠️")
+                .arg(t["template_name"].toString(), t["template_id"].toString());
+            template_combo->addItem(label, t["template_id"].toString());
+        }
+    }
+
+    auto *sp_version = new QSpinBox();
+    sp_version->setRange(1, 99999);
+    sp_version->setValue(1);
+
+    auto *sp_min_tickets = new QSpinBox();
+    sp_min_tickets->setRange(0, 9999999);
+    sp_min_tickets->setValue(50);
+
+    auto *sp_base_avg_kg = new QDoubleSpinBox();
+    sp_base_avg_kg->setRange(0, 99999);
+    sp_base_avg_kg->setDecimals(3);
+    sp_base_avg_kg->setSingleStep(0.1);
+    sp_base_avg_kg->setValue(0.3);
+
+    auto *sp_avg_pool_max_kg = new QDoubleSpinBox();
+    sp_avg_pool_max_kg->setRange(0, 99999);
+    sp_avg_pool_max_kg->setDecimals(3);
+    sp_avg_pool_max_kg->setSingleStep(0.1);
+    sp_avg_pool_max_kg->setValue(1.0);
+
+    auto *sp_avg_fee_cap_kg = new QDoubleSpinBox();
+    sp_avg_fee_cap_kg->setRange(0, 99999);
+    sp_avg_fee_cap_kg->setDecimals(3);
+    sp_avg_fee_cap_kg->setSingleStep(0.1);
+    sp_avg_fee_cap_kg->setValue(1.0);
+
+    auto *sp_base_fee = new QDoubleSpinBox();
+    sp_base_fee->setRange(0, 999999);
+    sp_base_fee->setDecimals(2);
+    sp_base_fee->setSingleStep(0.1);
+    sp_base_fee->setValue(2.7);
+
+    auto *sp_step_kg = new QDoubleSpinBox();
+    sp_step_kg->setRange(0, 99999);
+    sp_step_kg->setDecimals(3);
+    sp_step_kg->setSingleStep(0.05);
+    sp_step_kg->setValue(0.1);
+
+    auto *sp_step_fee = new QDoubleSpinBox();
+    sp_step_fee->setRange(0, 999999);
+    sp_step_fee->setDecimals(2);
+    sp_step_fee->setSingleStep(0.05);
+    sp_step_fee->setValue(0.2);
+
+    auto *de_from = new QDateEdit(QDate::currentDate());
+    de_from->setCalendarPopup(true);
+    de_from->setDisplayFormat("yyyy-MM-dd");
+
+    auto *de_to = new QDateEdit(QDate::currentDate().addYears(1));
+    de_to->setCalendarPopup(true);
+    de_to->setDisplayFormat("yyyy-MM-dd");
+    de_to->setSpecialValueText(" ");
+    de_to->setMinimumDate(QDate(2000, 1, 1));
+
+    auto *cb_over_cap = new QComboBox();
+    cb_over_cap->addItem("封顶", 0);
+    cb_over_cap->addItem("整池回阶梯", 1);
+
+    auto *chk_active = new QCheckBox("启用");
+    chk_active->setChecked(true);
+
+    // ====== 绑定说明（顶部提示，避免用户不知道如何生效）======
+    auto *binding_box = new QGroupBox("💡 如何让这份合同生效？—— 两种绑定方式（任选一种）");
+    auto *binding_vl = new QVBoxLayout(binding_box);
+    binding_vl->setContentsMargins(12, 18, 12, 12);
+    binding_vl->setSpacing(6);
+    auto *bind_lbl = new QLabel();
+    bind_lbl->setWordWrap(true);
+    bind_lbl->setTextFormat(Qt::RichText);
+    bind_lbl->setStyleSheet("color:#303133;font-size:13px;line-height:1.6;");
+    bind_lbl->setText(
+        "① <b>【客户级绑定 · 推荐】</b> 去「客户设置」→ 编辑客户 → 「拉均重合同」下拉里选本合同 → "
+        "<b>该客户所有订单（无论默认模板是哪一个）都走本合同</b>（优先级最高）。<br>"
+        "② <b>【模板级绑定】</b> 上方「绑定运费模板」下拉选一个具体模板（不要选「全部模板通配」）→ "
+        "凡匹配到该运费模板的订单，若客户未设置客户级绑定，则自动回退到本合同。"
+    );
+    binding_vl->addWidget(bind_lbl);
+
+    // ====== 方案A / 方案B 单选 ======
+    auto *gb_match_mode = new QGroupBox("📋 进池省份 · 匹配方式");
+    auto *gb_match_vl = new QVBoxLayout(gb_match_mode);
+    gb_match_vl->setSpacing(10);
+
+    auto *bg_plan = new QButtonGroup(&dlg);
+    auto *rb_plan_a = new QRadioButton("○ A. 复用运费模板已有分区（推荐 · 零配置）");
+    auto *rb_plan_b = new QRadioButton("○ B. 自定义拉均重专属省份（仅本合同生效）");
+    bg_plan->addButton(rb_plan_a, 1);
+    bg_plan->addButton(rb_plan_b, 0);
+    rb_plan_a->setChecked(true);
+
+    // ====== 方案A 界面 ======
+    auto *plan_a_widget = new QWidget();
+    auto *plan_a_hl = new QHBoxLayout(plan_a_widget);
+    plan_a_hl->setContentsMargins(0, 0, 0, 0);
+    plan_a_hl->setSpacing(10);
+
+    // 方案A 左：分区勾选
+    auto *a_gb_left = new QGroupBox("1) 勾选参与拉均重的分区");
+    a_gb_left->setMinimumWidth(300);
+    a_gb_left->setMaximumWidth(300);
+    auto *a_left_vl = new QVBoxLayout(a_gb_left);
+    auto *a_hint_label = new QLabel();
+    a_hint_label->setWordWrap(true);
+    a_hint_label->setStyleSheet("color:#909399;padding:4px 6px;background:#f5f7fa;border-radius:4px;font-size:12px;");
+    a_left_vl->addWidget(a_hint_label);
+
+    auto *a_scroll = new QScrollArea();
+    a_scroll->setWidgetResizable(true);
+    a_scroll->setFrameShape(QFrame::NoFrame);
+    a_scroll->setStyleSheet("QScrollArea{background:#fafbfc;border:1px solid #ebeef5;border-radius:4px;}");
+    auto *a_scroll_widget = new QWidget();
+    auto *a_checkbox_layout = new QVBoxLayout(a_scroll_widget);
+    a_checkbox_layout->setContentsMargins(6, 6, 6, 6);
+    a_checkbox_layout->setSpacing(4);
+    a_checkbox_layout->addStretch();
+    a_scroll->setWidget(a_scroll_widget);
+    a_left_vl->addWidget(a_scroll, 1);
+
+    // 方案A 右：预览+排除省
+    auto *a_gb_right = new QGroupBox("2) 分区省份预览 + 排除省黑名单");
+    auto *a_right_vl = new QVBoxLayout(a_gb_right);
+    auto *a_preview_tip = new QLabel("预览区：根据上方勾选的分区，合并去重的省份如下。对个别想临时剔除的省，点击下方「添加到排除省」。");
+    a_preview_tip->setWordWrap(true);
+    a_preview_tip->setStyleSheet("color:#606266;font-size:12px;");
+    a_right_vl->addWidget(a_preview_tip);
+
+    auto *a_preview_edit = new QPlainTextEdit();
+    a_preview_edit->setReadOnly(true);
+    a_preview_edit->setFixedHeight(100);
+    a_preview_edit->setPlaceholderText("（勾选分区后，此处自动显示合并后的省份列表）");
+    a_right_vl->addWidget(a_preview_edit);
+
+    auto *a_excl_bar = new QHBoxLayout();
+    auto *a_exclude_combo = new QComboBox();
+    a_exclude_combo->setMinimumWidth(140);
+    auto *btn_add_exclude = new QPushButton("+ 加入黑名单");
+    btn_add_exclude->setCursor(Qt::PointingHandCursor);
+    a_excl_bar->addWidget(a_exclude_combo);
+    a_excl_bar->addWidget(btn_add_exclude);
+    a_excl_bar->addStretch();
+    a_right_vl->addLayout(a_excl_bar);
+
+    auto *a_excl_tags_tip = new QLabel("排除省黑名单（点 ✕ 移除）：");
+    a_excl_tags_tip->setStyleSheet("color:#606266;font-size:12px;");
+    a_right_vl->addWidget(a_excl_tags_tip);
+
+    auto *a_excl_tags_scroll = new QScrollArea();
+    a_excl_tags_scroll->setWidgetResizable(true);
+    a_excl_tags_scroll->setFrameShape(QFrame::NoFrame);
+    a_excl_tags_scroll->setFixedHeight(64);
+    auto *a_excl_tags_widget = new QWidget();
+    auto *a_excl_tags_layout = new QHBoxLayout(a_excl_tags_widget);
+    a_excl_tags_layout->setContentsMargins(2, 2, 2, 2);
+    a_excl_tags_layout->setSpacing(6);
+    a_excl_tags_layout->addStretch();
+    a_excl_tags_scroll->setWidget(a_excl_tags_widget);
+    a_right_vl->addWidget(a_excl_tags_scroll);
+
+    plan_a_hl->addWidget(a_gb_left);
+    plan_a_hl->addWidget(a_gb_right, 1);
+
+    // ====== 方案B 界面 ======
+    auto *plan_b_widget = new QWidget();
+    auto *plan_b_vl = new QVBoxLayout(plan_b_widget);
+    plan_b_vl->setContentsMargins(0, 0, 0, 0);
+    plan_b_vl->setSpacing(8);
+
+    auto *bg_b_poolmode = new QButtonGroup(&dlg);
+    auto *rb_b_global = new QRadioButton("○ 全部省份合一个池（默认最简单）");
+    auto *rb_b_zones = new QRadioButton("○ 按自定义分区独立分池（每个分区一个均重池）");
+    bg_b_poolmode->addButton(rb_b_global, 0);
+    bg_b_poolmode->addButton(rb_b_zones, 1);
+    rb_b_global->setChecked(true);
+    auto *b_mode_hl = new QHBoxLayout();
+    b_mode_hl->addWidget(rb_b_global);
+    b_mode_hl->addSpacing(24);
+    b_mode_hl->addWidget(rb_b_zones);
+    b_mode_hl->addStretch();
+    plan_b_vl->addLayout(b_mode_hl);
+
+    // 方案B：按分区时的顶部操作条
+    auto *b_zones_section = new QWidget();
+    auto *b_zones_vl = new QVBoxLayout(b_zones_section);
+    b_zones_vl->setContentsMargins(0, 0, 0, 0);
+    b_zones_vl->setSpacing(6);
+
+    auto *b_zones_main_hl = new QHBoxLayout();
+    b_zones_main_hl->setSpacing(10);
+
+    // 左侧分区列表
+    auto *b_zone_col = new QWidget();
+    b_zone_col->setMinimumWidth(180);
+    b_zone_col->setMaximumWidth(180);
+    auto *b_zone_col_vl = new QVBoxLayout(b_zone_col);
+    b_zone_col_vl->setContentsMargins(0, 0, 0, 0);
+    b_zone_col_vl->setSpacing(4);
+
+    auto *b_zone_btn_bar = new QHBoxLayout();
+    b_zone_btn_bar->setSpacing(4);
+    auto *btn_b_zone_add = new QPushButton("+新建");
+    auto *btn_b_zone_ren = new QPushButton("重命名");
+    auto *btn_b_zone_del = new QPushButton("删除");
+    btn_b_zone_add->setCursor(Qt::PointingHandCursor);
+    btn_b_zone_ren->setCursor(Qt::PointingHandCursor);
+    btn_b_zone_del->setCursor(Qt::PointingHandCursor);
+    btn_b_zone_add->setStyleSheet("QPushButton{padding:3px 8px;font-size:12px;}");
+    btn_b_zone_ren->setStyleSheet("QPushButton{padding:3px 8px;font-size:12px;}");
+    btn_b_zone_del->setStyleSheet("QPushButton{padding:3px 8px;font-size:12px;}");
+    b_zone_btn_bar->addWidget(btn_b_zone_add);
+    b_zone_btn_bar->addWidget(btn_b_zone_ren);
+    b_zone_btn_bar->addWidget(btn_b_zone_del);
+    b_zone_col_vl->addLayout(b_zone_btn_bar);
+
+    auto *b_zone_list = new QListWidget();
+    b_zone_list->setStyleSheet("QListWidget{border:1px solid #ebeef5;border-radius:4px;}");
+    b_zone_col_vl->addWidget(b_zone_list, 1);
+
+    // 右侧省份穿梭框
+    auto *b_shuttle_col = new QWidget();
+    auto *b_shuttle_vl = new QVBoxLayout(b_shuttle_col);
+    b_shuttle_vl->setContentsMargins(0, 0, 0, 0);
+    b_shuttle_vl->setSpacing(4);
+
+    auto *b_avail_filter = new QLineEdit();
+    b_avail_filter->setPlaceholderText("🔍 搜索省名...");
+    b_shuttle_vl->addWidget(b_avail_filter);
+
+    auto *b_shuttle_hl = new QHBoxLayout();
+    b_shuttle_hl->setSpacing(6);
+
+    auto *b_avail_col_wrap = new QWidget();
+    auto *b_avail_col_vl = new QVBoxLayout(b_avail_col_wrap);
+    b_avail_col_vl->setContentsMargins(0, 0, 0, 0);
+    b_avail_col_vl->setSpacing(4);
+    auto *b_avail_list = new QListWidget();
+    b_avail_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    b_avail_list->setStyleSheet("QListWidget{border:1px solid #ebeef5;border-radius:4px;}");
+    for (const auto &p : ALL_PROVINCES) {
+        b_avail_list->addItem(p);
+    }
+    b_avail_col_vl->addWidget(b_avail_list, 1);
+    auto *b_avail_btn_hl = new QHBoxLayout();
+    auto *btn_b_avail_all = new QPushButton("全选");
+    auto *btn_b_avail_inv = new QPushButton("反选");
+    btn_b_avail_all->setCursor(Qt::PointingHandCursor);
+    btn_b_avail_inv->setCursor(Qt::PointingHandCursor);
+    btn_b_avail_all->setStyleSheet("QPushButton{padding:3px 8px;font-size:12px;}");
+    btn_b_avail_inv->setStyleSheet("QPushButton{padding:3px 8px;font-size:12px;}");
+    b_avail_btn_hl->addWidget(btn_b_avail_all);
+    b_avail_btn_hl->addWidget(btn_b_avail_inv);
+    b_avail_col_vl->addLayout(b_avail_btn_hl);
+
+    auto *b_mid_btns = new QWidget();
+    auto *b_mid_vl = new QVBoxLayout(b_mid_btns);
+    b_mid_vl->setContentsMargins(0, 0, 0, 0);
+    b_mid_vl->addStretch();
+    auto *btn_move_right = new QPushButton(">>");
+    auto *btn_move_left = new QPushButton("<<");
+    btn_move_right->setCursor(Qt::PointingHandCursor);
+    btn_move_left->setCursor(Qt::PointingHandCursor);
+    btn_move_right->setFixedWidth(48);
+    btn_move_left->setFixedWidth(48);
+    b_mid_vl->addWidget(btn_move_right);
+    b_mid_vl->addSpacing(8);
+    b_mid_vl->addWidget(btn_move_left);
+    b_mid_vl->addStretch();
+
+    auto *b_selected_col_wrap = new QWidget();
+    auto *b_selected_col_vl = new QVBoxLayout(b_selected_col_wrap);
+    b_selected_col_vl->setContentsMargins(0, 0, 0, 0);
+    b_selected_col_vl->setSpacing(4);
+    auto *b_selected_list = new QListWidget();
+    b_selected_list->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    b_selected_list->setStyleSheet("QListWidget{border:1px solid #ebeef5;border-radius:4px;}");
+    b_selected_col_vl->addWidget(b_selected_list, 1);
+    auto *b_selected_btn_hl = new QHBoxLayout();
+    auto *btn_b_sel_clear = new QPushButton("清空已选");
+    btn_b_sel_clear->setCursor(Qt::PointingHandCursor);
+    btn_b_sel_clear->setStyleSheet("QPushButton{padding:3px 8px;font-size:12px;}");
+    b_selected_btn_hl->addStretch();
+    b_selected_btn_hl->addWidget(btn_b_sel_clear);
+    b_selected_col_vl->addLayout(b_selected_btn_hl);
+
+    b_shuttle_hl->addWidget(b_avail_col_wrap, 1);
+    b_shuttle_hl->addWidget(b_mid_btns);
+    b_shuttle_hl->addWidget(b_selected_col_wrap, 1);
+    b_shuttle_vl->addLayout(b_shuttle_hl, 1);
+
+    b_zones_main_hl->addWidget(b_zone_col);
+    b_zones_main_hl->addWidget(b_shuttle_col, 1);
+    b_zones_vl->addLayout(b_zones_main_hl, 1);
+
+    plan_b_vl->addWidget(b_zones_section, 1);
+
+    gb_match_vl->addWidget(rb_plan_a);
+    gb_match_vl->addWidget(plan_a_widget);
+    gb_match_vl->addWidget(rb_plan_b);
+    gb_match_vl->addWidget(plan_b_widget);
+
+    // ============= 辅助 Lambda（先声明为 std::function，解决相互调用顺序问题）=============
+    std::function<void()> rebuild_a_preview_and_excl_combo;
+    std::function<void()> rebuild_a_checkboxes = [&]() {
+        QLayoutItem *child;
+        while ((child = a_checkbox_layout->takeAt(0)) != nullptr) {
+            if (child->widget()) child->widget()->deleteLater();
+            delete child;
+        }
+
+        QString cur_tid = template_combo->currentData().toString();
+        bool is_wildcard = cur_tid.isEmpty();
+
+        if (is_wildcard) {
+            a_hint_label->setText("通配模式：勾选后，每个订单匹配到自己的运费模板分区时生效，模板名前缀用于区分。");
+            a_hint_label->setStyleSheet("color:#909399;padding:4px 6px;background:#ecf5ff;border:1px solid #d9ecff;border-radius:4px;font-size:12px;");
+        } else {
+            auto tm = find_tpl_map(cur_tid);
+            auto groups = tm["groups"].toList();
+            if (groups.size() == 0) {
+                a_hint_label->setText("⚠️ 当前选中模板尚未建立分区，请先到「运费模板」Tab 建立或切换到通配");
+                a_hint_label->setStyleSheet("color:#f56c6c;padding:4px 6px;background:#fef0f0;border:1px solid #fde2e2;border-radius:4px;font-size:12px;font-weight:600;");
+            } else {
+                a_hint_label->setText("勾选后仅下列分区命中的订单可进拉均重池（默认：0勾选=未建分区表→所有分区均可进池）");
+                a_hint_label->setStyleSheet("color:#909399;padding:4px 6px;background:#f5f7fa;border-radius:4px;font-size:12px;");
+            }
+        }
+
+        struct CBItem {
+            QString key;
+            QString text;
+        };
+        QList<CBItem> items;
+
+        if (is_wildcard) {
+            for (const auto &tv : templates_with_zones) {
+                auto t = tv.toMap();
+                QString tid = t["template_id"].toString();
+                QString tname = t["template_name"].toString();
+                auto groups = t["groups"].toList();
+                for (const auto &gv : groups) {
+                    auto g = gv.toMap();
+                    QString key = QString("%1::%2").arg(tid, g["group_code"].toString());
+                    QString txt = QString("%1 - %2(%3) - %4省")
+                        .arg(tname, g["group_name"].toString(), g["group_code"].toString())
+                        .arg(g["province_count"].toInt());
+                    items << CBItem{key, txt};
+                }
+            }
+        } else {
+            auto tm = find_tpl_map(cur_tid);
+            auto groups = tm["groups"].toList();
+            for (const auto &gv : groups) {
+                auto g = gv.toMap();
+                QString key = QString("%1::%2").arg(cur_tid, g["group_code"].toString());
+                QString txt = QString("%1(%2) - %3省")
+                    .arg(g["group_name"].toString(), g["group_code"].toString())
+                    .arg(g["province_count"].toInt());
+                items << CBItem{key, txt};
+            }
+        }
+
+        for (const auto &it : items) {
+            auto *cb = new QCheckBox(it.text);
+            cb->blockSignals(true);
+            cb->setChecked(sel_tpl_groups.contains(it.key));
+            cb->setProperty("key", it.key);
+            cb->blockSignals(false);
+            QObject::connect(cb, &QCheckBox::toggled, &dlg, [&, it](bool checked) {
+                if (checked) sel_tpl_groups.insert(it.key);
+                else sel_tpl_groups.remove(it.key);
+                rebuild_a_preview_and_excl_combo();
+            });
+            a_checkbox_layout->addWidget(cb);
+        }
+        a_checkbox_layout->addStretch();
+    };
+
+    rebuild_a_preview_and_excl_combo = [&]() {
+        QSet<QString> merged_provs_set;
+        QMap<QString, QSet<QString>> key_to_provs;
+
+        for (const auto &key : sel_tpl_groups) {
+            auto parts = key.split("::");
+            if (parts.size() < 2) continue;
+            QString tid = parts[0];
+            QString gcode = parts[1];
+            auto tm = find_tpl_map(tid);
+            if (tm.isEmpty()) continue;
+            auto groups = tm["groups"].toList();
+            for (const auto &gv : groups) {
+                auto g = gv.toMap();
+                if (g["group_code"].toString() == gcode) {
+                    auto provs = g["provinces"].toStringList();
+                    for (const auto &p : provs) {
+                        merged_provs_set.insert(p);
+                        key_to_provs[key].insert(p);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // 预览文本（排除黑名单中的省份显示）
+        QSet<QString> excl_display_provs;
+        for (const auto &ek : excl_tplg_provs) {
+            auto ps = ek.split("::");
+            if (ps.size() >= 3) excl_display_provs.insert(ps[2]);
+        }
+
+        QStringList preview_lines;
+        QStringList merged_list = merged_provs_set.values();
+        std::sort(merged_list.begin(), merged_list.end(), [&](const QString &a, const QString &b) {
+            int ia = ALL_PROVINCES.indexOf(a); if (ia < 0) ia = 999;
+            int ib = ALL_PROVINCES.indexOf(b); if (ib < 0) ib = 999;
+            return ia < ib;
+        });
+        for (const auto &p : merged_list) {
+            if (excl_display_provs.contains(p)) {
+                preview_lines << QString("%1 （已排除⚠️）").arg(p);
+            } else {
+                preview_lines << p;
+            }
+        }
+        a_preview_edit->setPlainText(preview_lines.join("\n"));
+
+        // 刷新 exclude_combo：只列勾选分区合集中有的省（且未被当前加黑的）
+        a_exclude_combo->blockSignals(true);
+        a_exclude_combo->clear();
+        for (const auto &p : merged_list) {
+            a_exclude_combo->addItem(p, p);
+        }
+        a_exclude_combo->blockSignals(false);
+    };
+
+    std::function<void()> rebuild_a_excl_tags;
+    rebuild_a_excl_tags = [&]() {
+        QLayoutItem *child;
+        while ((child = a_excl_tags_layout->takeAt(0)) != nullptr) {
+            if (child->widget()) child->widget()->deleteLater();
+            delete child;
+        }
+
+        QStringList keys = excl_tplg_provs.values();
+        std::sort(keys.begin(), keys.end());
+        for (const auto &key : keys) {
+            auto parts = key.split("::");
+            QString prov_show;
+            if (parts.size() >= 3) prov_show = parts[2];
+            else prov_show = key;
+            auto *btn = new QPushButton(QString("%1 ✕").arg(prov_show));
+            btn->setCursor(Qt::PointingHandCursor);
+            btn->setStyleSheet(
+                "QPushButton{background:#409eff;color:white;border-radius:12px;padding:3px 12px;border:none;font-size:12px;}"
+                "QPushButton:hover{background:#66b1ff;}"
+            );
+            QObject::connect(btn, &QPushButton::clicked, &dlg, [&, key]() {
+                excl_tplg_provs.remove(key);
+                rebuild_a_excl_tags();
+                rebuild_a_preview_and_excl_combo();
+            });
+            a_excl_tags_layout->addWidget(btn);
+        }
+        a_excl_tags_layout->addStretch();
+    };
+
+    auto save_b_current_zone_to_mem = [&]() {
+        if (rb_b_global->isChecked()) return;
+        QString cur_zc;
+        if (b_zone_list->currentItem()) cur_zc = b_zone_list->currentItem()->data(Qt::UserRole).toString();
+        if (cur_zc.isEmpty()) return;
+        QStringList provs;
+        for (int i = 0; i < b_selected_list->count(); i++) {
+            provs << b_selected_list->item(i)->text();
+        }
+        mem_b_zones[cur_zc] = provs;
+    };
+
+    auto load_b_zone_to_shuttle = [&](const QString &zc) {
+        b_selected_list->clear();
+        QSet<QString> selected;
+        if (mem_b_zones.contains(zc)) {
+            for (const auto &p : mem_b_zones[zc]) selected.insert(p);
+        }
+        for (int i = 0; i < b_avail_list->count(); i++) {
+            auto *it = b_avail_list->item(i);
+            it->setHidden(selected.contains(it->text()));
+        }
+        QStringList provs = selected.values();
+        std::sort(provs.begin(), provs.end(), [&](const QString &a, const QString &b) {
+            int ia = ALL_PROVINCES.indexOf(a); if (ia < 0) ia = 999;
+            int ib = ALL_PROVINCES.indexOf(b); if (ib < 0) ib = 999;
+            return ia < ib;
+        });
+        for (const auto &p : provs) b_selected_list->addItem(p);
+    };
+
+    auto refresh_b_avail_by_filter = [&]() {
+        QString kw = b_avail_filter->text().trimmed();
+        QSet<QString> selected;
+        if (rb_b_global->isChecked()) {
+            for (int i = 0; i < b_selected_list->count(); i++) {
+                selected.insert(b_selected_list->item(i)->text());
+            }
+        } else {
+            QString cur_zc;
+            if (b_zone_list->currentItem()) cur_zc = b_zone_list->currentItem()->data(Qt::UserRole).toString();
+            if (!cur_zc.isEmpty() && mem_b_zones.contains(cur_zc)) {
+                for (const auto &p : mem_b_zones[cur_zc]) selected.insert(p);
+            }
+        }
+        for (int i = 0; i < b_avail_list->count(); i++) {
+            auto *it = b_avail_list->item(i);
+            bool hide_selected = selected.contains(it->text());
+            bool hide_kw = !kw.isEmpty() && !it->text().contains(kw, Qt::CaseInsensitive);
+            it->setHidden(hide_selected || hide_kw);
+        }
+    };
+
+    auto update_plan_b_global_vs_zones = [&]() {
+        bool use_zones = rb_b_zones->isChecked();
+        b_zone_col->setVisible(use_zones);
+        b_zone_btn_bar->setEnabled(use_zones);
+        b_zone_list->setEnabled(use_zones);
+    };
+
+    auto save_b_global_to_mem = [&]() {
+        if (!rb_b_global->isChecked()) return;
+        QStringList provs;
+        for (int i = 0; i < b_selected_list->count(); i++) {
+            provs << b_selected_list->item(i)->text();
+        }
+        mem_b_zones["__global__"] = provs;
+    };
+
+    auto load_b_global_from_mem = [&]() {
+        b_selected_list->clear();
+        QSet<QString> selected;
+        if (mem_b_zones.contains("__global__")) {
+            for (const auto &p : mem_b_zones["__global__"]) selected.insert(p);
+        }
+        for (int i = 0; i < b_avail_list->count(); i++) {
+            auto *it = b_avail_list->item(i);
+            it->setHidden(selected.contains(it->text()));
+        }
+        QStringList provs = selected.values();
+        std::sort(provs.begin(), provs.end(), [&](const QString &a, const QString &b) {
+            int ia = ALL_PROVINCES.indexOf(a); if (ia < 0) ia = 999;
+            int ib = ALL_PROVINCES.indexOf(b); if (ib < 0) ib = 999;
+            return ia < ib;
+        });
+        for (const auto &p : provs) b_selected_list->addItem(p);
+        refresh_b_avail_by_filter();
+    };
+
+    auto switch_ab_plan = [&]() {
+        bool a_on = rb_plan_a->isChecked();
+        plan_a_widget->setEnabled(a_on);
+        plan_b_widget->setEnabled(!a_on);
+        if (!a_on) save_b_current_zone_to_mem();
+    };
+    switch_ab_plan();
+
+    // ============= 数据加载（编辑模式）=============
+    QString avg_tpl_id_to_edit;
+    int saved_reuse_zone_groups = 1;
+    if (!is_add && lajz_table_->currentRow() >= 0) {
+        avg_tpl_id_to_edit = lajz_table_->item(lajz_table_->currentRow(), 1)->text();
+        auto m = repo.GetAvgWeightTemplate(avg_tpl_id_to_edit);
+        ed_avg_tpl_id->setText(m["avg_tpl_id"].toString());
+        ed_avg_tpl_id->setReadOnly(true);
+        ed_name->setText(m["name"].toString());
+        ed_contract_no->setText(m["contract_no"].toString());
+
+        QString tpl_id_val = m["template_id"].toString();
+        if (tpl_id_val.isEmpty() || tpl_id_val == "*") {
+            template_combo->setCurrentIndex(0);
+        } else {
+            int ti = template_combo->findData(tpl_id_val);
+            if (ti >= 0) {
+                template_combo->setCurrentIndex(ti);
+            } else {
+                template_combo->addItem(QString("%1(已不存在⚠️)").arg(tpl_id_val), tpl_id_val);
+                template_combo->setCurrentIndex(template_combo->count() - 1);
+            }
+        }
+
+        sp_version->setValue(m["version"].toInt());
+        sp_min_tickets->setValue(m["min_tickets"].toInt());
+        sp_base_avg_kg->setValue(m["base_avg_kg"].toDouble());
+        sp_avg_pool_max_kg->setValue(m["avg_pool_max_kg"].toDouble());
+        sp_avg_fee_cap_kg->setValue(m["avg_fee_cap_kg"].toDouble());
+        sp_base_fee->setValue(m["base_fee"].toDouble());
+        sp_step_kg->setValue(m["step_kg"].toDouble());
+        sp_step_fee->setValue(m["step_fee"].toDouble());
+
+        QString ef = m["effective_from"].toString();
+        if (!ef.isEmpty()) de_from->setDate(QDate::fromString(ef, Qt::ISODate));
+        QString et = m["effective_to"].toString();
+        if (!et.isEmpty()) de_to->setDate(QDate::fromString(et, Qt::ISODate));
+
+        int ocm = m["over_cap_mode"].toInt();
+        int idx_ocm = cb_over_cap->findData(ocm);
+        if (idx_ocm >= 0) cb_over_cap->setCurrentIndex(idx_ocm);
+
+        saved_reuse_zone_groups = m["reuse_zone_groups"].toInt();
+        chk_active->setChecked(m["is_active"].toBool());
+
+        // 方案A：分区勾选 + 排除省黑名单回灌（含按当前 template_combo 做 key 归一化）
+        QString cur_tpl_for_lajz = template_combo->currentData().toString();
+        bool cur_is_wildcard = cur_tpl_for_lajz.isEmpty();
+        QMap<QString, QStringList> avail_keys_by_tpl;   // 内存加速：tpl_id -> [key1,key2...]
+        QMap<QString, QStringList> avail_gcode_by_tpl;  // tpl_id -> [gcode1,gcode2...]
+        for (const auto &tv : templates_with_zones) {
+            auto t = tv.toMap();
+            QString tid = t["template_id"].toString();
+            auto groups = t["groups"].toList();
+            for (const auto &gv : groups) {
+                auto g = gv.toMap();
+                QString gc = g["group_code"].toString();
+                avail_keys_by_tpl[tid] << QString("%1::%2").arg(tid, gc);
+                avail_gcode_by_tpl[tid] << gc;
+            }
+        }
+        auto normalized_key = [&](const QString &db_tpl, const QString &gcode) -> QString {
+            QString key = QString("%1::%2").arg(db_tpl, gcode);
+            if (cur_is_wildcard) {
+                // wildcard 模式：找到 UI 里任意模板中存在该 group_code 的任一匹配
+                for (const auto &tid : avail_keys_by_tpl.keys()) {
+                    QString try_key = QString("%1::%2").arg(tid, gcode);
+                    if (avail_keys_by_tpl[tid].contains(try_key)) return try_key;
+                }
+                return key;
+            }
+            // specific 模式：强制用当前选择的模板 ID 重建 key（只要该模板里真的有这个 group_code）
+            if (avail_gcode_by_tpl.value(cur_tpl_for_lajz).contains(gcode)) {
+                return QString("%1::%2").arg(cur_tpl_for_lajz, gcode);
+            }
+            // 找不到匹配：返回原 key（会在 rebuild 里不显示，但内存保留以防用户切回 wildcard 再保存）
+            return key;
+        };
+        auto normalized_excl_key = [&](const QString &db_tpl, const QString &gcode,
+                                       const QString &prov) -> QString {
+            QStringList candidate_tids;
+            if (cur_is_wildcard) {
+                // wildcard: 所有含该 gcode 的模板，挑第一个命中的
+                for (const auto &tid : avail_keys_by_tpl.keys()) {
+                    if (avail_gcode_by_tpl.value(tid).contains(gcode)) {
+                        candidate_tids << tid;
+                    }
+                }
+            } else {
+                if (avail_gcode_by_tpl.value(cur_tpl_for_lajz).contains(gcode)) {
+                    candidate_tids << cur_tpl_for_lajz;
+                }
+            }
+            // 进一步校验 prov 是否属于 该 tid+gcode 下的 province
+            for (const auto &tid : candidate_tids) {
+                auto tm = find_tpl_map(tid);
+                auto groups = tm["groups"].toList();
+                for (const auto &gv : groups) {
+                    auto g = gv.toMap();
+                    if (g["group_code"].toString() == gcode) {
+                        auto provs = g["provinces"].toStringList();
+                        if (provs.contains(prov)) return QString("%1::%2::%3").arg(tid, gcode, prov);
+                    }
+                }
+            }
+            // 完全找不到则原样返回（内存保留，防止用户改 combo 后出现差异）
+            return QString("%1::%2::%3").arg(db_tpl, gcode, prov);
+        };
+
+        auto tgl = repo.GetAvgWeightTplGroups(avg_tpl_id_to_edit);
+        for (const auto &g : tgl) {
+            auto gm = g.toMap();
+            sel_tpl_groups.insert(normalized_key(gm["template_id"].toString(),
+                                                  gm["group_code"].toString()));
+        }
+        auto excl = repo.GetAvgWeightExcludes(avg_tpl_id_to_edit);
+        for (const auto &e : excl) {
+            auto em = e.toMap();
+            excl_tplg_provs.insert(normalized_excl_key(
+                em["template_id"].toString(),
+                em["group_code"].toString(),
+                em["province"].toString()));
+        }
+        auto zones = repo.GetAvgWeightZones(avg_tpl_id_to_edit);
+        mem_b_zones.clear();
+        b_zone_next_idx = 0;
+        for (const auto &z : zones) {
+            auto zm = z.toMap();
+            QString zc = zm["zone_code"].toString();
+            mem_b_zones[zc] = zm["provinces"].toStringList();
+            if (zc.startsWith("z") && zc.mid(1).toInt() > b_zone_next_idx) {
+                b_zone_next_idx = zc.mid(1).toInt();
+            }
+        }
+    }
+
+    if (saved_reuse_zone_groups == 1) {
+        rb_plan_a->setChecked(true);
+    } else {
+        rb_plan_b->setChecked(true);
+    }
+    switch_ab_plan();
+
+    // 方案B：初始化分区列表/模式
+    {
+        QStringList zone_codes = mem_b_zones.keys();
+        int count_real_zones = 0;
+        for (const auto &zc : zone_codes) {
+            if (zc != "__global__") count_real_zones++;
+        }
+        if (count_real_zones >= 2) {
+            rb_b_zones->setChecked(true);
+        } else {
+            rb_b_global->setChecked(true);
+            if (!mem_b_zones.contains("__global__")) {
+                QStringList all_global;
+                for (const auto &zc : zone_codes) {
+                    for (const auto &p : mem_b_zones[zc]) {
+                        if (!all_global.contains(p)) all_global << p;
+                    }
+                }
+                mem_b_zones["__global__"] = all_global;
+            }
+        }
+        update_plan_b_global_vs_zones();
+
+        b_zone_list->clear();
+        for (const auto &zc : zone_codes) {
+            if (zc == "__global__") continue;
+            int cnt = mem_b_zones[zc].size();
+            QString label = QString("%1(%2省)").arg(zc).arg(cnt);
+            auto *item = new QListWidgetItem(label);
+            item->setData(Qt::UserRole, zc);
+            b_zone_list->addItem(item);
+        }
+
+        if (rb_b_zones->isChecked()) {
+            if (b_zone_list->count() == 0) {
+                b_zone_next_idx = 1;
+                QString zc = QString("z%1").arg(b_zone_next_idx++);
+                mem_b_zones[zc] = QStringList();
+                auto *item = new QListWidgetItem(QString("%1(0省)").arg(zc));
+                item->setData(Qt::UserRole, zc);
+                b_zone_list->addItem(item);
+                b_zone_list->setCurrentRow(0);
+            } else {
+                b_zone_list->setCurrentRow(0);
+            }
+            save_b_current_zone_to_mem();
+            load_b_zone_to_shuttle(b_zone_list->currentItem()->data(Qt::UserRole).toString());
+        } else {
+            load_b_global_from_mem();
+        }
+    }
+
+    rebuild_a_checkboxes();
+    rebuild_a_preview_and_excl_combo();
+    rebuild_a_excl_tags();
+
+    // ============= 连接信号 =============
+    QObject::connect(template_combo, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [&](int) {
+        rebuild_a_checkboxes();
+        rebuild_a_preview_and_excl_combo();
+    });
+
+    QObject::connect(btn_add_exclude, &QPushButton::clicked, &dlg, [&]() {
+        QString prov = a_exclude_combo->currentData().toString();
+        if (prov.isEmpty()) return;
+        for (const auto &key : sel_tpl_groups) {
+            auto parts = key.split("::");
+            if (parts.size() < 2) continue;
+            QString tid = parts[0];
+            QString gcode = parts[1];
+            auto tm = find_tpl_map(tid);
+            if (tm.isEmpty()) continue;
+            auto groups = tm["groups"].toList();
+            for (const auto &gv : groups) {
+                auto g = gv.toMap();
+                if (g["group_code"].toString() == gcode) {
+                    auto provs = g["provinces"].toStringList();
+                    if (provs.contains(prov)) {
+                        excl_tplg_provs.insert(QString("%1::%2::%3").arg(tid, gcode, prov));
+                    }
+                    break;
+                }
+            }
+        }
+        rebuild_a_excl_tags();
+        rebuild_a_preview_and_excl_combo();
+    });
+
+    QObject::connect(rb_plan_a, &QRadioButton::toggled, &dlg, [&](bool) { switch_ab_plan(); });
+    QObject::connect(rb_plan_b, &QRadioButton::toggled, &dlg, [&](bool) { switch_ab_plan(); });
+
+    QObject::connect(rb_b_global, &QRadioButton::toggled, &dlg, [&](bool checked) {
+        if (checked) {
+            save_b_current_zone_to_mem();
+            update_plan_b_global_vs_zones();
+            load_b_global_from_mem();
+        }
+    });
+    QObject::connect(rb_b_zones, &QRadioButton::toggled, &dlg, [&](bool checked) {
+        if (checked) {
+            save_b_global_to_mem();
+            update_plan_b_global_vs_zones();
+            if (b_zone_list->count() == 0) {
+                b_zone_next_idx = 1;
+                QString zc = QString("z%1").arg(b_zone_next_idx++);
+                mem_b_zones[zc] = QStringList();
+                auto *item = new QListWidgetItem(QString("%1(0省)").arg(zc));
+                item->setData(Qt::UserRole, zc);
+                b_zone_list->addItem(item);
+            }
+            b_zone_list->setCurrentRow(0);
+            load_b_zone_to_shuttle(b_zone_list->currentItem()->data(Qt::UserRole).toString());
+        }
+    });
+
+    QObject::connect(b_avail_filter, &QLineEdit::textChanged, &dlg, [&](const QString &) { refresh_b_avail_by_filter(); });
+
+    QObject::connect(btn_move_right, &QPushButton::clicked, &dlg, [&]() {
+        QStringList to_move;
+        for (int i = 0; i < b_avail_list->count(); i++) {
+            auto *it = b_avail_list->item(i);
+            if (it->isSelected() && !it->isHidden()) to_move << it->text();
+        }
+        if (to_move.isEmpty()) {
+            for (int i = 0; i < b_avail_list->count(); i++) {
+                auto *it = b_avail_list->item(i);
+                if (!it->isHidden()) to_move << it->text();
+            }
+        }
+        QSet<QString> existing;
+        for (int i = 0; i < b_selected_list->count(); i++) existing.insert(b_selected_list->item(i)->text());
+        for (const auto &p : to_move) {
+            if (existing.contains(p)) continue;
+            b_selected_list->addItem(p);
+            for (int j = 0; j < b_avail_list->count(); j++) {
+                if (b_avail_list->item(j)->text() == p) { b_avail_list->item(j)->setHidden(true); break; }
+            }
+        }
+    });
+    QObject::connect(btn_move_left, &QPushButton::clicked, &dlg, [&]() {
+        QStringList to_move;
+        for (auto *it : b_selected_list->selectedItems()) to_move << it->text();
+        if (to_move.isEmpty()) {
+            for (int i = 0; i < b_selected_list->count(); i++) to_move << b_selected_list->item(i)->text();
+        }
+        for (const auto &p : to_move) {
+            for (int j = 0; j < b_selected_list->count(); j++) {
+                if (b_selected_list->item(j)->text() == p) {
+                    delete b_selected_list->takeItem(j); break;
+                }
+            }
+            for (int j = 0; j < b_avail_list->count(); j++) {
+                if (b_avail_list->item(j)->text() == p) { b_avail_list->item(j)->setHidden(false); break; }
+            }
+        }
+        refresh_b_avail_by_filter();
+    });
+
+    QObject::connect(btn_b_avail_all, &QPushButton::clicked, &dlg, [&]() {
+        QSet<QString> existing;
+        for (int i = 0; i < b_selected_list->count(); i++) existing.insert(b_selected_list->item(i)->text());
+        for (int i = 0; i < b_avail_list->count(); i++) {
+            auto *it = b_avail_list->item(i);
+            if (it->isHidden()) continue;
+            QString p = it->text();
+            if (existing.contains(p)) continue;
+            b_selected_list->addItem(p);
+            it->setHidden(true);
+        }
+    });
+    QObject::connect(btn_b_avail_inv, &QPushButton::clicked, &dlg, [&]() {
+        QStringList all_visible;
+        QSet<QString> visible_selected;
+        for (int i = 0; i < b_avail_list->count(); i++) {
+            auto *it = b_avail_list->item(i);
+            if (it->isHidden()) continue;
+            all_visible << it->text();
+            if (it->isSelected()) visible_selected.insert(it->text());
+        }
+        QSet<QString> existing;
+        for (int i = 0; i < b_selected_list->count(); i++) existing.insert(b_selected_list->item(i)->text());
+        for (const auto &p : all_visible) {
+            if (visible_selected.contains(p)) continue;
+            if (existing.contains(p)) continue;
+            b_selected_list->addItem(p);
+            for (int j = 0; j < b_avail_list->count(); j++) {
+                if (b_avail_list->item(j)->text() == p) { b_avail_list->item(j)->setHidden(true); break; }
+            }
+        }
+        for (const auto &p : visible_selected) {
+            for (int j = 0; j < b_selected_list->count(); j++) {
+                if (b_selected_list->item(j)->text() == p) { delete b_selected_list->takeItem(j); break; }
+            }
+            for (int j = 0; j < b_avail_list->count(); j++) {
+                if (b_avail_list->item(j)->text() == p) { b_avail_list->item(j)->setHidden(false); break; }
+            }
+        }
+        refresh_b_avail_by_filter();
+    });
+    QObject::connect(btn_b_sel_clear, &QPushButton::clicked, &dlg, [&]() {
+        QStringList all;
+        for (int i = 0; i < b_selected_list->count(); i++) all << b_selected_list->item(i)->text();
+        for (const auto &p : all) {
+            for (int j = 0; j < b_avail_list->count(); j++) {
+                if (b_avail_list->item(j)->text() == p) { b_avail_list->item(j)->setHidden(false); break; }
+            }
+        }
+        b_selected_list->clear();
+    });
+
+    QObject::connect(b_zone_list, &QListWidget::currentItemChanged, &dlg, [&](QListWidgetItem *cur, QListWidgetItem *prev) {
+        Q_UNUSED(prev);
+        save_b_current_zone_to_mem();
+        if (cur) {
+            QString zc = cur->data(Qt::UserRole).toString();
+            load_b_zone_to_shuttle(zc);
+        }
+    });
+
+    QObject::connect(btn_b_zone_add, &QPushButton::clicked, &dlg, [&]() {
+        bool ok = false;
+        QString name = QInputDialog::getText(&dlg, "新建分区", "请输入分区名称（如：江浙沪池）:",
+            QLineEdit::Normal, QString("分区%1").arg(b_zone_next_idx + 1), &ok);
+        if (!ok || name.trimmed().isEmpty()) return;
+        save_b_current_zone_to_mem();
+        b_zone_next_idx++;
+        QString zc = QString("z%1").arg(b_zone_next_idx);
+        mem_b_zones[zc] = QStringList();
+        auto *item = new QListWidgetItem(QString("%1(0省)").arg(name));
+        item->setData(Qt::UserRole, zc);
+        item->setData(Qt::UserRole + 1, name);
+        b_zone_list->addItem(item);
+        b_zone_list->setCurrentItem(item);
+    });
+    QObject::connect(btn_b_zone_ren, &QPushButton::clicked, &dlg, [&]() {
+        auto *cur = b_zone_list->currentItem();
+        if (!cur) { QMessageBox::warning(&dlg, "提示", "请先选择一个分区"); return; }
+        QString old_name;
+        if (cur->data(Qt::UserRole + 1).isValid()) old_name = cur->data(Qt::UserRole + 1).toString();
+        else old_name = cur->data(Qt::UserRole).toString();
+        bool ok = false;
+        QString name = QInputDialog::getText(&dlg, "重命名分区", "新名称:", QLineEdit::Normal, old_name, &ok);
+        if (!ok || name.trimmed().isEmpty()) return;
+        QString zc = cur->data(Qt::UserRole).toString();
+        int cnt = mem_b_zones[zc].size();
+        cur->setText(QString("%1(%2省)").arg(name).arg(cnt));
+        cur->setData(Qt::UserRole + 1, name);
+    });
+    QObject::connect(btn_b_zone_del, &QPushButton::clicked, &dlg, [&]() {
+        auto *cur = b_zone_list->currentItem();
+        if (!cur) { QMessageBox::warning(&dlg, "提示", "请先选择一个分区"); return; }
+        if (b_zone_list->count() <= 1) { QMessageBox::warning(&dlg, "提示", "至少需要保留一个分区"); return; }
+        auto ret = QMessageBox::question(&dlg, "确认删除", "确定删除该分区（连同省份）吗？",
+            QMessageBox::Yes | QMessageBox::No);
+        if (ret != QMessageBox::Yes) return;
+        QString zc = cur->data(Qt::UserRole).toString();
+        mem_b_zones.remove(zc);
+        delete cur;
+        if (b_zone_list->currentItem()) {
+            load_b_zone_to_shuttle(b_zone_list->currentItem()->data(Qt::UserRole).toString());
+        }
+    });
+
+    // ============= 表单组装 =============
+    form->addRow("合同ID(avg_tpl_id):", ed_avg_tpl_id);
+    form->addRow("合同名称(name):", ed_name);
+    form->addRow("合同编号(contract_no):", ed_contract_no);
+    form->addRow("版本(version):", sp_version);
+    form->addRow("绑定模板(template_id):", template_combo);
+    form->addRow("生效起(effective_from):", de_from);
+    form->addRow("生效至(effective_to):", de_to);
+    form->addRow("基准均重kg(base_avg_kg):", sp_base_avg_kg);
+    form->addRow("进池上限kg(avg_pool_max_kg):", sp_avg_pool_max_kg);
+    form->addRow("封顶kg(avg_fee_cap_kg):", sp_avg_fee_cap_kg);
+    form->addRow("基础价(base_fee):", sp_base_fee);
+    form->addRow("步长kg(step_kg):", sp_step_kg);
+    form->addRow("每步加价(step_fee):", sp_step_fee);
+    form->addRow("最少票数(min_tickets):", sp_min_tickets);
+    form->addRow("超上限模式(over_cap_mode):", cb_over_cap);
+
+    auto *gb_match_wrap = new QVBoxLayout();
+    gb_match_wrap->setSpacing(10);
+    gb_match_wrap->addWidget(binding_box);
+    gb_match_wrap->addWidget(gb_match_mode);
+    form->addRow(gb_match_wrap);
+
+    form->addRow("", chk_active);
+
+    layout->addStretch();
+
+    auto *btn_box = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    layout->addWidget(btn_box);
+    connect(btn_box, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(btn_box, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+
+    if (dlg.exec() == QDialog::Accepted) {
+        QString avg_tpl_id = ed_avg_tpl_id->text().trimmed();
+        if (avg_tpl_id.isEmpty()) {
+            QMessageBox::warning(this, "提示", "合同ID不能为空");
+            return;
+        }
+        if (ed_name->text().trimmed().isEmpty()) {
+            QMessageBox::warning(this, "提示", "合同名称不能为空");
+            return;
+        }
+
+        QVariantMap tpl;
+        tpl["avg_tpl_id"] = avg_tpl_id;
+        tpl["name"] = ed_name->text().trimmed();
+        tpl["contract_no"] = ed_contract_no->text().trimmed();
+        tpl["template_id"] = template_combo->currentData().toString();
+        tpl["version"] = sp_version->value();
+        tpl["effective_from"] = de_from->date().toString(Qt::ISODate);
+        tpl["effective_to"] = de_to->date().toString(Qt::ISODate);
+        tpl["base_avg_kg"] = sp_base_avg_kg->value();
+        tpl["avg_pool_max_kg"] = sp_avg_pool_max_kg->value();
+        tpl["avg_fee_cap_kg"] = sp_avg_fee_cap_kg->value();
+        tpl["base_fee"] = sp_base_fee->value();
+        tpl["step_kg"] = sp_step_kg->value();
+        tpl["step_fee"] = sp_step_fee->value();
+        tpl["min_tickets"] = sp_min_tickets->value();
+        tpl["over_cap_mode"] = cb_over_cap->currentData().toInt();
+
+        bool use_plan_a = rb_plan_a->isChecked();
+        tpl["reuse_zone_groups"] = use_plan_a ? 1 : 0;
+        tpl["is_active"] = chk_active->isChecked();
+
+        bool ok = repo.SaveAvgWeightTemplate(tpl);
+
+        // ====== 分步骤保存，把每一步返回值单独记录 + 失败时直接在弹窗里显示哪一步失败 ======
+        QString err_detail;
+        auto record_fail = [&](const QString &step_name, const QString &extra = QString()) {
+            err_detail += QString("\n❌ 步骤 [").append(step_name).append("] 失败");
+            if (!extra.isEmpty()) err_detail.append("：").append(extra);
+            err_detail.append("\n");
+        };
+
+        if (ok && use_plan_a) {
+            int expected_groups = 0, expected_excl = 0;
+            {
+                QVariantList groups_vl;
+                for (const auto &key : sel_tpl_groups) {
+                    auto parts = key.split("::");
+                    if (parts.size() < 2) continue;
+                    QVariantMap g;
+                    g["template_id"] = parts[0];
+                    g["group_code"] = parts[1];
+                    groups_vl << g;
+                }
+                expected_groups = groups_vl.size();
+                qCritical() << "[LajzSave-DIAG] 方案A SetAvgWeightTplGroups： groups_vl.size ="
+                            << groups_vl.size() << "（sel_tpl_groups =" << sel_tpl_groups.values() << "）";
+                QString qry_err;
+                bool ok_g = repo.SetAvgWeightTplGroups(avg_tpl_id, groups_vl, &qry_err);
+                if (!ok_g) {
+                    QString db_err = !qry_err.isEmpty() ? qry_err : (
+                        repo.Database().lastError().isValid()
+                            ? repo.Database().lastError().text()
+                            : QStringLiteral("(无Qt数据库错误，查看控制台[SetAvgWeightTplGroups]详细日志)"));
+                    record_fail("SetAvgWeightTplGroups",
+                                QString("拟写入%1组，内存key=%2，SQLite错误=[%3]")
+                                    .arg(groups_vl.size())
+                                    .arg(sel_tpl_groups.values().join(","))
+                                    .arg(db_err));
+                    ok = false;
+                }
+            }
+            {
+                QVariantList excl_vl;
+                for (const auto &ek : excl_tplg_provs) {
+                    auto parts = ek.split("::");
+                    if (parts.size() < 3) continue;
+                    QVariantMap e;
+                    e["template_id"] = parts[0];
+                    e["group_code"] = parts[1];
+                    e["province"] = parts[2];
+                    excl_vl << e;
+                }
+                expected_excl = excl_vl.size();
+                qCritical() << "[LajzSave-DIAG] 方案A SetAvgWeightExcludes： excl_vl.size ="
+                            << excl_vl.size() << "（excl_tplg_provs =" << excl_tplg_provs.values() << "）";
+                QString qry_err;
+                bool ok_e = repo.SetAvgWeightExcludes(avg_tpl_id, excl_vl, &qry_err);
+                if (!ok_e) {
+                    QString db_err = !qry_err.isEmpty() ? qry_err : (
+                        repo.Database().lastError().isValid()
+                            ? repo.Database().lastError().text()
+                            : QStringLiteral("(无Qt数据库错误，查看控制台[SetAvgWeightExcludes]详细日志)"));
+                    record_fail("SetAvgWeightExcludes",
+                                QString("拟写入%1个排除省，SQLite错误=[%2]")
+                                    .arg(excl_vl.size()).arg(db_err));
+                    ok = false;
+                }
+            }
+            QString qry_err_z;
+            bool ok_z = repo.SetAvgWeightZones(avg_tpl_id, QVariantList(), &qry_err_z);
+            if (!ok_z) {
+                QString db_err = !qry_err_z.isEmpty() ? qry_err_z : (
+                    repo.Database().lastError().isValid()
+                        ? repo.Database().lastError().text()
+                        : QStringLiteral("(无Qt数据库错误)"));
+                record_fail("SetAvgWeightZones(清空方案B)", db_err);
+                ok = false;
+            }
+
+            auto tgl_check = repo.GetAvgWeightTplGroups(avg_tpl_id);
+            auto excl_check = repo.GetAvgWeightExcludes(avg_tpl_id);
+            qCritical() << "[LajzSave-DIAG] 保存后 GetAvgWeightTplGroups 实际 DB size =" << tgl_check.size()
+                        << "（预期=" << expected_groups << "）；GetAvgWeightExcludes 实际 DB size =" << excl_check.size()
+                        << "（预期=" << expected_excl << "）";
+            if (tgl_check.size() != expected_groups) {
+                record_fail("方案A-回读校验分区组", QString("预期%1组，DB实得%2组").arg(expected_groups).arg(tgl_check.size()));
+                ok = false;
+            }
+            if (excl_check.size() != expected_excl) {
+                record_fail("方案A-回读校验排除省", QString("预期%1个，DB实得%2个").arg(expected_excl).arg(excl_check.size()));
+                ok = false;
+            }
+        } else if (ok) {
+            if (rb_b_global->isChecked()) save_b_global_to_mem();
+            else save_b_current_zone_to_mem();
+
+            QVariantList zones_vl;
+            if (rb_b_global->isChecked()) {
+                QVariantMap z;
+                z["zone_code"] = "__global__";
+                z["provinces"] = mem_b_zones.value("__global__");
+                zones_vl << z;
+            } else {
+                for (int i = 0; i < b_zone_list->count(); i++) {
+                    auto *itm = b_zone_list->item(i);
+                    QString zc = itm->data(Qt::UserRole).toString();
+                    QVariantMap z;
+                    z["zone_code"] = zc;
+                    z["provinces"] = mem_b_zones.value(zc);
+                    zones_vl << z;
+                }
+            }
+            int expected_zones = zones_vl.size();
+            qCritical() << "[LajzSave-DIAG] 方案B SetAvgWeightZones： zones_vl.size ="
+                        << zones_vl.size();
+            for (int i = 0; i < zones_vl.size(); i++) {
+                auto z = zones_vl[i].toMap();
+                qCritical() << "    [" << i << "] zone=" << z["zone_code"]
+                            << "，provinces count=" << z["provinces"].toStringList().size()
+                            << "，provinces =" << z["provinces"].toStringList().join(",");
+            }
+            QString qry_err_z;
+            bool ok_z = repo.SetAvgWeightZones(avg_tpl_id, zones_vl, &qry_err_z);
+            if (!ok_z) {
+                QString db_err = !qry_err_z.isEmpty() ? qry_err_z : (
+                    repo.Database().lastError().isValid()
+                        ? repo.Database().lastError().text()
+                        : QStringLiteral("(查看控制台[SetAvgWeightZones]详细日志)"));
+                record_fail("SetAvgWeightZones",
+                            QString("拟写入%1个自定义分区，SQLite错误=[%2]")
+                                .arg(zones_vl.size()).arg(db_err));
+                ok = false;
+            }
+            QString qry_err_g;
+            bool ok_g = repo.SetAvgWeightTplGroups(avg_tpl_id, QVariantList(), &qry_err_g);
+            if (!ok_g) {
+                QString db_err = !qry_err_g.isEmpty() ? qry_err_g :
+                    (repo.Database().lastError().isValid() ? repo.Database().lastError().text() : QString());
+                record_fail("SetAvgWeightTplGroups(清空方案A)", db_err);
+                ok = false;
+            }
+            QString qry_err_e;
+            bool ok_e = repo.SetAvgWeightExcludes(avg_tpl_id, QVariantList(), &qry_err_e);
+            if (!ok_e) {
+                QString db_err = !qry_err_e.isEmpty() ? qry_err_e :
+                    (repo.Database().lastError().isValid() ? repo.Database().lastError().text() : QString());
+                record_fail("SetAvgWeightExcludes(清空方案A)", db_err);
+                ok = false;
+            }
+
+            auto zones_check = repo.GetAvgWeightZones(avg_tpl_id);
+            qCritical() << "[LajzSave-DIAG] 保存后 GetAvgWeightZones 实际 DB zones size ="
+                        << zones_check.size() << "（预期=" << expected_zones << "）";
+            for (int i = 0; i < zones_check.size(); i++) {
+                auto z = zones_check[i].toMap();
+                qCritical() << "    [" << i << "] zone=" << z["zone_code"]
+                            << "，provinces count=" << z["provinces"].toStringList().size()
+                            << "，provinces =" << z["provinces"].toStringList().join(",");
+            }
+            if (zones_check.size() != expected_zones) {
+                record_fail("方案B-回读校验自定义分区", QString("预期%1个分区，DB实得%2个").arg(expected_zones).arg(zones_check.size()));
+                ok = false;
+            }
+        } else {
+            QString db_err = repo.Database().lastError().isValid()
+                               ? repo.Database().lastError().text()
+                               : QStringLiteral("(查看控制台[SaveAvgWeightTemplate]详细日志)");
+            record_fail("SaveAvgWeightTemplate(主表写入)",
+                        QString("SQLite错误=[%1]，请再查看控制台里 [SaveAvgWeightTemplate] 开头的 SQLite lastError() 详细错误")
+                            .arg(db_err));
+        }
+
+        LoadLajzTable();
+        if (ok) {
+            QMessageBox::information(this, "成功", is_add ? "合同已添加" : "合同已更新");
+        } else {
+            QString msg = "保存失败，具体错误步骤如下：\n————————————\n";
+            msg += err_detail;
+            msg += "\n————————————\n"
+                   "🔍 排查步骤：\n"
+                   " ① 请查看控制台（终端）里以 [SaveAvgWeightTemplate] / [SetAvgWeightTplGroups] / \n"
+                   "     [SetAvgWeightExcludes] / [SetAvgWeightZones] 开头的行；\n"
+                   " ② 把这些 SQLite lastError() 报错文本复制出来，发送给开发者。";
+            QMessageBox::warning(this, "保存失败（已记录哪一步出错）", msg);
         }
     }
 }

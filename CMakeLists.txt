@@ -1,5 +1,20 @@
 cmake_minimum_required(VERSION 3.20)
-project(xiaoqiao_freight VERSION 1.0.0 LANGUAGES CXX)
+project(xiaoqiao_freight VERSION 1.0.7 LANGUAGES CXX)
+
+# ========== 唯一真源：项目版本号 X.Y.Z（每次大更改 Y.Z 加 0.01，即改 Y 或 Z 即可）==========
+#   显示格式：X.YZ    —— 比如 1.0.1 → "1.01"，1.0.10 → "1.10"，1.1.0 → "1.10"
+#   Bundle 格式：X.Y.Z —— CFBundleShortVersionString / CFBundleVersion 按苹果规范
+string(CONCAT APP_VERSION_DISPLAY
+    "${PROJECT_VERSION_MAJOR}."
+    "${PROJECT_VERSION_MINOR}${PROJECT_VERSION_PATCH}")
+message(STATUS "[version] CMake VERSION = ${PROJECT_VERSION} ，GUI 显示版本 = ${APP_VERSION_DISPLAY}")
+
+# 生成版本头（唯一一处 VERSION 定义源）
+configure_file(
+    "${CMAKE_SOURCE_DIR}/src/core/version_defs.hpp.in"
+    "${CMAKE_BINARY_DIR}/generated/version_defs.hpp"
+    @ONLY
+)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -78,6 +93,7 @@ add_executable(xiaoqiao_freight WIN32 MACOSX_BUNDLE ${PROJECT_SOURCES})
 
 target_include_directories(xiaoqiao_freight PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
     ${DUCKDB_INCLUDE_DIR}
 )
 
@@ -128,6 +144,7 @@ add_executable(license_generator MACOSX_BUNDLE
 
 target_include_directories(license_generator PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
 )
 
 target_link_libraries(license_generator PRIVATE
@@ -140,8 +157,8 @@ target_link_libraries(license_generator PRIVATE
 if(APPLE)
     set_target_properties(license_generator PROPERTIES
         MACOSX_BUNDLE_BUNDLE_NAME "授权生成器"
-        MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION ${PROJECT_VERSION}
+        MACOSX_BUNDLE_SHORT_VERSION_STRING ${PROJECT_VERSION}
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.hbdxm.license-generator"
     )
 
@@ -175,6 +192,7 @@ add_executable(batch_runner
 )
 target_include_directories(batch_runner PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
     ${DUCKDB_INCLUDE_DIR}
 )
 target_link_libraries(batch_runner PRIVATE
@@ -214,6 +232,7 @@ add_executable(t7_test
 )
 target_include_directories(t7_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
     ${DUCKDB_INCLUDE_DIR}
 )
 target_link_libraries(t7_test PRIVATE
@@ -261,6 +280,7 @@ add_executable(billing_params_test
 )
 target_include_directories(billing_params_test PRIVATE
     ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
     ${DUCKDB_INCLUDE_DIR}
 )
 target_link_libraries(billing_params_test PRIVATE
@@ -272,6 +292,43 @@ target_link_libraries(billing_params_test PRIVATE
 )
 if(APPLE)
     set_target_properties(billing_params_test PROPERTIES
+        MACOSX_BUNDLE OFF
+        RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+endif()
+
+# Step2：SQLite/DuckDB Schema 迁移验证（v10→v15、Fresh、R3回滚）
+add_executable(schema_migration_verify
+    tools/schema_migration_verify/main.cpp
+    src/core/app_config.hpp
+    src/core/app_config.cpp
+    src/core/freight_types.hpp
+    src/core/license_manager.hpp
+    src/core/license_manager.cpp
+    src/db/duckdb_manager.hpp
+    src/db/duckdb_manager.cpp
+    src/db/sqlite_rule_repository.hpp
+    src/db/sqlite_rule_repository.cpp
+    src/services/rule_service.hpp
+    src/services/rule_service.cpp
+)
+target_compile_definitions(schema_migration_verify PRIVATE
+    PROJECT_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+target_include_directories(schema_migration_verify PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
+    ${DUCKDB_INCLUDE_DIR}
+)
+target_link_libraries(schema_migration_verify PRIVATE
+    Qt6::Core
+    Qt6::Sql
+    Qt6::Concurrent
+    Qt6::Network
+    ${DUCKDB_LIBRARY}
+)
+if(APPLE)
+    set_target_properties(schema_migration_verify PROPERTIES
         MACOSX_BUNDLE OFF
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )

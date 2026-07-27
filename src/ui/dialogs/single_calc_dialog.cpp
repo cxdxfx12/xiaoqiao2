@@ -2,6 +2,7 @@
 #include "services/calc_service.hpp"
 #include "ui/icon_manager.hpp"
 #include "db/sqlite_rule_repository.hpp"
+#include "db/duckdb_manager.hpp"
 #include "core/app_config.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -85,6 +86,15 @@ void SingleCalcDialog::SetupUI() {
         }
     }
     form_layout->addRow("运费模板：", cbo_template_);
+
+    chk_enable_avg_weight_ = new QCheckBox("⚖️ 启用拉均重合同定价");
+    chk_enable_avg_weight_->setChecked(false);
+    chk_enable_avg_weight_->setCursor(Qt::PointingHandCursor);
+    chk_enable_avg_weight_->setStyleSheet("QCheckBox { font-size: 13px; color: #606266; spacing: 8px; }");
+    chk_enable_avg_weight_->setToolTip(
+        "默认禁用。勾选后，若所选模板/客户签有拉均重合同，\n"
+        "将按池均重 + 封顶规则重新定价（单条演示，批量才会有稳定池效果）。");
+    form_layout->addRow("", chk_enable_avg_weight_);
 
     main_layout->addWidget(input_group);
 
@@ -204,9 +214,20 @@ void SingleCalcDialog::OnCalc() {
     double weight = spn_weight_->value();
     double vol_weight = spn_vol_weight_->value();
     QString tpl_id = cbo_template_->currentData().toString();
+    const bool enable_avg_weight = chk_enable_avg_weight_ != nullptr && chk_enable_avg_weight_->isChecked();
+
+    // DEBUG-01 关键修复：每次单条计算前强制重新加载 SQLite → DuckDB 规则表
+    try {
+        auto &cfg = core::AppConfig::Instance();
+        auto &dbm = db::DuckDBManager::Instance();
+        dbm.ReloadRules(cfg.GetRulesDbPath());
+    } catch (const std::exception &re) {
+        qWarning() << "[SingleCalc] ReloadRules skipped:" << re.what();
+    }
 
     services::CalcService calc_svc;
-    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id, city, customer);
+    auto result = calc_svc.CalcSingle(province, weight, vol_weight, tpl_id, city, customer,
+                                      0.0, 0.0, 0.0, enable_avg_weight);
 
     if (result.success) {
         lbl_result_charge_weight_->setText(QString::number(result.charge_weight, 'f', 3) + " kg");

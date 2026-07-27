@@ -1,4 +1,5 @@
 #include "app_config.hpp"
+#include "version_defs.hpp"
 #include <QStandardPaths>
 #include <QDir>
 #include <QThread>
@@ -266,7 +267,7 @@ QString AppConfig::GetCompanyName() const { return QStringLiteral("杭州喵喵�
 QString AppConfig::GetAppName() const { return QStringLiteral("小乔运费结算"); }
 QString AppConfig::GetWebsite() const { return QStringLiteral("www.hbdxm.com"); }
 QString AppConfig::GetServicePhone() const { return QStringLiteral("17771300068 / 19171045360"); }
-QString AppConfig::GetVersion() const { return QStringLiteral("1.0.0"); }
+QString AppConfig::GetVersion() const { return QStringLiteral(XQ_APP_VERSION_DISPLAY); }
 
 int AppConfig::GetTotalMemoryMB() {
 #ifdef Q_OS_MAC

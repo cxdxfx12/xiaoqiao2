@@ -70,6 +70,20 @@ int main(int argc, char *argv[]) {
         qCritical() << "DuckDBManager::Init failed";
         return 4;
     }
+    // 每次 batch_runner 从干净 duckdb 启动，避免历史 75 万行 _output_tmp 被误导出
+    dbm.ResetDB();
+    // ResetDB 之后需要重设内存/线程配置
+    {
+        auto &cfg2 = core::AppConfig::Instance();
+        try {
+            auto con = dbm.CreateConnection();
+            QString mem_limit = QString("%1MB").arg(cfg2.GetMemoryLimitMB());
+            QString threads   = QString::number(cfg2.GetThreadCount());
+            con.Query(QString("SET memory_limit = '%1'").arg(mem_limit).toStdString());
+            con.Query(QString("SET threads = %1").arg(threads).toStdString());
+            try { con.Query("LOAD excel"); } catch (...) {}
+        } catch (...) {}
+    }
     if (!dbm.LoadRulesFromSQLite(cfg.GetRulesDbPath())) {
         qCritical() << "LoadRulesFromSQLite failed";
         return 5;

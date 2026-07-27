@@ -7,6 +7,7 @@
 #include <QDoubleSpinBox>
 #include <QFormLayout>
 #include <QVBoxLayout>
+#include <QCheckBox>
 
 namespace freight::ui::dialogs {
 
@@ -32,6 +33,7 @@ private:
     QDoubleSpinBox *spn_weight_ = nullptr;
     QDoubleSpinBox *spn_vol_weight_ = nullptr;
     QComboBox *cbo_template_ = nullptr;
+    QCheckBox *chk_enable_avg_weight_ = nullptr;
 
     QLabel *lbl_result_charge_weight_ = nullptr;
     QLabel *lbl_result_base_fee_ = nullptr;

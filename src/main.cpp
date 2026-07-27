@@ -4,6 +4,7 @@
 #include <QDebug>
 #include "core/app_config.hpp"
 #include "core/license_manager.hpp"
+#include "version_defs.hpp"
 #include "db/duckdb_manager.hpp"
 #include "services/rule_service.hpp"
 #include "ui/main_window.hpp"
@@ -13,11 +14,11 @@ int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
 
     app.setApplicationName("小乔运费结算");
-    app.setApplicationVersion("1.0.0");
+    app.setApplicationVersion(XQ_APP_VERSION_DISPLAY);
     app.setOrganizationName("杭州喵喵至家网络有限公司");
     app.setOrganizationDomain("hbdxm.com");
 
-    qDebug() << "=== 小乔运费结算 v1.0.0 ===";
+    qDebug() << "=== 小乔运费结算 v" << XQ_APP_VERSION_DISPLAY << " ===";
     qDebug() << "杭州喵喵至家网络有限公司";
 
     if (!freight::core::AppConfig::Instance().Init()) {

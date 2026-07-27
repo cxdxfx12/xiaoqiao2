@@ -99,7 +99,12 @@ bool DuckDBManager::LoadRulesFromSQLite(const QString &rules_db_path) {
                     contact_phone VARCHAR,
                     address VARCHAR,
                     created_at TIMESTAMP,
-                    updated_at TIMESTAMP
+                    updated_at TIMESTAMP,
+                    cust_rounding_mode VARCHAR DEFAULT '',
+                    cust_additional_unit DOUBLE DEFAULT 0,
+                    cust_vol_divisor INTEGER DEFAULT 0,
+                    avg_weight_tpl_id VARCHAR,
+                    cust_contract_no VARCHAR DEFAULT ''
                 )
             )SQL"},
             {"freight_templates", R"SQL(
@@ -214,6 +219,57 @@ bool DuckDBManager::LoadRulesFromSQLite(const QString &rules_db_path) {
                     week_days VARCHAR
                 )
             )SQL"},
+            {"avg_weight_templates", R"SQL(
+                CREATE TABLE avg_weight_templates (
+                    avg_tpl_id VARCHAR PRIMARY KEY,
+                    template_id VARCHAR NOT NULL,
+                    name VARCHAR NOT NULL,
+                    version INTEGER DEFAULT 1,
+                    effective_from DATE NOT NULL DEFAULT CURRENT_DATE,
+                    effective_to DATE,
+                    avg_pool_min_kg DOUBLE DEFAULT 0.0,
+                    avg_pool_max_kg DOUBLE DEFAULT 1.0,
+                    base_avg_kg DOUBLE DEFAULT 0.3,
+                    avg_fee_cap_kg DOUBLE DEFAULT 1.0,
+                    over_cap_mode INTEGER DEFAULT 0,
+                    threshold_kg DOUBLE DEFAULT 1.0,
+                    base_fee DOUBLE NOT NULL DEFAULT 2.7,
+                    step_kg DOUBLE DEFAULT 0.1,
+                    step_fee DOUBLE DEFAULT 0.2,
+                    min_tickets INTEGER DEFAULT 50,
+                    reuse_zone_groups INTEGER DEFAULT 1,
+                    period_type VARCHAR DEFAULT 'month',
+                    contract_no VARCHAR DEFAULT '',
+                    is_active INTEGER DEFAULT 1,
+                    created_at TIMESTAMP,
+                    updated_at TIMESTAMP
+                )
+            )SQL"},
+            {"avg_weight_zones", R"SQL(
+                CREATE TABLE avg_weight_zones (
+                    id INTEGER,
+                    avg_tpl_id VARCHAR NOT NULL,
+                    zone_code VARCHAR NOT NULL,
+                    province VARCHAR NOT NULL
+                )
+            )SQL"},
+            {"avg_weight_zone_tpl_groups", R"SQL(
+                CREATE TABLE avg_weight_zone_tpl_groups (
+                    avg_tpl_id VARCHAR NOT NULL,
+                    template_id VARCHAR NOT NULL,
+                    group_code VARCHAR NOT NULL,
+                    PRIMARY KEY (avg_tpl_id, template_id, group_code)
+                )
+            )SQL"},
+            {"avg_weight_zone_excludes", R"SQL(
+                CREATE TABLE avg_weight_zone_excludes (
+                    avg_tpl_id VARCHAR NOT NULL,
+                    template_id VARCHAR NOT NULL,
+                    group_code VARCHAR NOT NULL,
+                    province VARCHAR NOT NULL,
+                    PRIMARY KEY (avg_tpl_id, template_id, group_code, province)
+                )
+            )SQL"},
         };
 
         // 删除旧表，创建新表
@@ -306,6 +362,22 @@ bool DuckDBManager::ReloadRules(const QString &rules_db_path) {
 
 duckdb::Connection DuckDBManager::CreateConnection() {
     return duckdb::Connection(*db_);
+}
+
+void DuckDBManager::ResetDB() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    db_.reset();
+    if (!db_path_.isEmpty()) {
+        try {
+            QFile::remove(db_path_);
+            QFile::remove(db_path_ + ".wal");
+        } catch (...) {}
+        try {
+            db_ = std::make_unique<duckdb::DuckDB>(db_path_.toStdString());
+        } catch (const std::exception &e) {
+            qWarning() << "[ResetDB] re-init failed:" << e.what();
+        }
+    }
 }
 
 bool DuckDBManager::ImportFromFile(const QString &table_name, const QString &file_path) {

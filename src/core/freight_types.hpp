@@ -100,6 +100,22 @@ struct CalcResult {
     QString currency = "CNY";
     bool success = true;
     QString error_msg;
+
+    // ---- L6 拉均重扩展（Step5 接入）----
+    bool    lajz_in_pool          = false;   // 本单是否命中拉均重池
+    QString lajz_avg_tpl_id       = "";      // 命中的合同 avg_tpl_id
+    QString lajz_contract_no      = "";      // 命中的合同编号
+    double  lajz_pool_avg_kg      = 0.0;     // 池均重（kg）
+    double  lajz_pool_max_kg      = 0.0;     // L2 进池上限（kg）
+    double  lajz_base_avg_kg      = 0.0;     // 约定基准均重（kg）
+    double  lajz_fee_cap_kg       = 0.0;     // L4 加价封顶 kg
+    double  lajz_base_fee         = 0.0;     // 基准价（元/票）
+    double  lajz_step_kg          = 0.0;     // 超基准步长 kg
+    double  lajz_step_fee         = 0.0;     // 每步加价 元
+    int     lajz_over_cap_mode    = 0;       // 0=按cap封顶 1=超cap整池回阶梯
+    bool    lajz_used             = false;   // 本单最终是否采用了拉均重总价（=true 时total_fee用拉均重；=false时total_fee用阶梯）
+    double  lajz_fee_per_ticket   = 0.0;     // 拉均重单票总价（不含燃油/偏远/策略；与L6决策独立保存方便对账）
+    double  lajz_save_vs_tier     = 0.0;     // 相对阶梯 base_fee 的节省（正数=便宜了多少 元/票；负数=贵了）
 };
 
 } // namespace freight::core

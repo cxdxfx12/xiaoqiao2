@@ -69,8 +69,11 @@ bool SqliteRuleRepository::Init() {
     bool ok = CreateTables();
 
     // schema 升级到 11：增加无重量默认运费
-    if (current_version >= 10 && current_version < 11) {
-        qInfo() << "Upgrading schema from version" << current_version << "to 11";
+    // 说明：此处及以下分段版本升级统一用 current_version < N 判断，
+    //       目的是让 v10→v15 大跨度升级时 11/12/13/14/15 每个阶段都能被触发。
+    //       每个阶段用 tryAddCol 容错 duplicate column，可重入。
+    if (current_version < 11) {
+        qInfo() << "Upgrading schema -> 11";
         QSqlQuery aq(db_);
         aq.exec("ALTER TABLE freight_templates ADD COLUMN default_no_weight_fee REAL DEFAULT 0");
     }
@@ -153,7 +156,7 @@ bool SqliteRuleRepository::Init() {
     //   2. fuel_surcharge：同理，每个 effective_date，若 *=全局
     //      不存在就把 zto_standard 的 rate 复制到 *=全局。
     // ============================================================
-    if (current_version >= 12 && current_version < 13) {
+    if (current_version < 13) {
         qInfo() << "[data-fix] Schema 12→13: 升级 zto_standard 绑定的 remote/fuel 记录为全局 * 生效模板";
         {
             QSqlQuery qmig(db_);
@@ -206,7 +209,7 @@ bool SqliteRuleRepository::Init() {
     // 比老 REAL 类型 additional_unit/vol_weight_ratio 更直观，保留老列同时
     // 读写新列保证向后兼容（80% 普通散客代码也能继续读老列兜底）。
     // ============================================================
-    if (current_version >= 13 && current_version < 14) {
+    if (current_version < 14) {
         qInfo() << "[data-fix] Schema 13→14: freight_templates 计费参数三列升级(tpl_rounding/tpl_add_unit/tpl_vol)";
         auto tryAddCol = [&](const QString &addSql) {
             QSqlQuery qt(db_);
@@ -244,13 +247,211 @@ bool SqliteRuleRepository::Init() {
         }
     }
 
+    // ============================================================
+    // Schema 14→15 客户级覆写 + 独立拉均重合同表（DESIGN_v1.2）：
+    //   1. customers 加 5 列客户覆写 + 拉均重外键
+    //      （cust_rounding_mode / cust_additional_unit / cust_vol_divisor
+    //       / avg_weight_tpl_id / cust_contract_no）
+    //   2. freight_templates 不加额外列（13→14 已经加了 tpl_rounding/
+    //      add_unit/vol_divisor；v1.2 起已不再用 v1.0 的 tpl_avg_* 三列）
+    //   3. 新建 avg_weight_templates 21 列 + avg_weight_zones 4 列 + 索引
+    //      （独立拉均重合同表，快递小管家/快宝同构）
+    // 所有 ADD COLUMN 用 tryAddCol 容错 duplicate column，保证多次升级可重入。
+    // ============================================================
+    if (current_version < 15) {
+        qInfo() << "[migrate] Schema 14→15: customers+5列、新增独立拉均重合同两张表";
+        auto tryAddCol = [&](const QString &addSql) {
+            QSqlQuery qt(db_);
+            if (!qt.exec(addSql)) {
+                const QString err = qt.lastError().text().toLower();
+                if (err.contains("duplicate column") || err.contains("already exists"))
+                    return true;
+                qCritical() << "  ALTER failed:" << qt.lastError().text() << "SQL=" << addSql;
+                return false;
+            }
+            return true;
+        };
+        bool okMig = true;
+        okMig &= tryAddCol("ALTER TABLE customers ADD COLUMN cust_rounding_mode VARCHAR(30) DEFAULT ''");
+        okMig &= tryAddCol("ALTER TABLE customers ADD COLUMN cust_additional_unit REAL DEFAULT 0");
+        okMig &= tryAddCol("ALTER TABLE customers ADD COLUMN cust_vol_divisor INTEGER DEFAULT 0");
+        okMig &= tryAddCol("ALTER TABLE customers ADD COLUMN avg_weight_tpl_id VARCHAR(60)");
+        okMig &= tryAddCol("ALTER TABLE customers ADD COLUMN cust_contract_no VARCHAR(60) DEFAULT ''");
+        if (!okMig) {
+            qWarning() << "  [warn] 部分 customers 列 ADD 失败，可能已存在；继续建表";
+        }
+        // 建两张独立均重合同表（CREATE TABLE IF NOT EXISTS，天然可重入）
+        {
+            QSqlQuery qc(db_);
+            qc.exec(R"SQL(
+                CREATE TABLE IF NOT EXISTS avg_weight_templates (
+                    avg_tpl_id          VARCHAR(60) PRIMARY KEY,
+                    template_id         VARCHAR(100) NOT NULL,
+                    name                VARCHAR(200) NOT NULL,
+                    version             INTEGER     DEFAULT 1,
+                    effective_from      DATE        NOT NULL DEFAULT CURRENT_DATE,
+                    effective_to        DATE,
+                    avg_pool_min_kg     REAL        DEFAULT 0.0,
+                    avg_pool_max_kg     REAL        DEFAULT 1.0,
+                    base_avg_kg         REAL        DEFAULT 0.3,
+                    avg_fee_cap_kg      REAL        DEFAULT 1.0,
+                    over_cap_mode       INTEGER     DEFAULT 0,
+                    threshold_kg        REAL        DEFAULT 1.0,
+                    base_fee            REAL        NOT NULL DEFAULT 2.7,
+                    step_kg             REAL        DEFAULT 0.1,
+                    step_fee            REAL        DEFAULT 0.2,
+                    min_tickets         INTEGER     DEFAULT 50,
+                    reuse_zone_groups   INTEGER     DEFAULT 1,
+                    period_type         VARCHAR(10) DEFAULT 'month',
+                    contract_no         VARCHAR(60) DEFAULT '',
+                    is_active           INTEGER     DEFAULT 1,
+                    created_at          TIMESTAMP   DEFAULT CURRENT_TIMESTAMP,
+                    updated_at          TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
+                )
+            )SQL");
+            if (qc.lastError().isValid())
+                qCritical() << "  CREATE avg_weight_templates failed:" << qc.lastError().text();
+            else
+                qInfo() << "  ✓ avg_weight_templates 表就绪（21列）";
+        }
+        {
+            QSqlQuery qc(db_);
+            qc.exec(R"SQL(
+                CREATE TABLE IF NOT EXISTS avg_weight_zones (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    avg_tpl_id VARCHAR(60) NOT NULL,
+                    zone_code  VARCHAR(20) NOT NULL,
+                    province   VARCHAR(50) NOT NULL,
+                    UNIQUE(avg_tpl_id, zone_code, province)
+                )
+            )SQL");
+            if (qc.lastError().isValid())
+                qCritical() << "  CREATE avg_weight_zones failed:" << qc.lastError().text();
+            else
+                qInfo() << "  ✓ avg_weight_zones 表就绪";
+            qc.exec("CREATE INDEX IF NOT EXISTS idx_avg_weight_zones_tpl ON avg_weight_zones(avg_tpl_id)");
+        }
+        {
+            QSqlQuery qc(db_);
+            qc.exec(R"SQL(
+                CREATE TABLE IF NOT EXISTS avg_weight_zone_tpl_groups (
+                    avg_tpl_id  VARCHAR(60) NOT NULL,
+                    template_id VARCHAR(100) NOT NULL,
+                    group_code  VARCHAR(20) NOT NULL,
+                    PRIMARY KEY (avg_tpl_id, template_id, group_code)
+                )
+            )SQL");
+            if (qc.lastError().isValid())
+                qCritical() << "  CREATE avg_weight_zone_tpl_groups failed:" << qc.lastError().text();
+            else
+                qInfo() << "  ✓ avg_weight_zone_tpl_groups 表就绪（方案A勾选模板分区）";
+        }
+        {
+            QSqlQuery qc(db_);
+            qc.exec(R"SQL(
+                CREATE TABLE IF NOT EXISTS avg_weight_zone_excludes (
+                    avg_tpl_id  VARCHAR(60) NOT NULL,
+                    template_id VARCHAR(100) NOT NULL,
+                    group_code  VARCHAR(20) NOT NULL,
+                    province    VARCHAR(50) NOT NULL,
+                    PRIMARY KEY (avg_tpl_id, template_id, group_code, province)
+                )
+            )SQL");
+            if (qc.lastError().isValid())
+                qCritical() << "  CREATE avg_weight_zone_excludes failed:" << qc.lastError().text();
+            else
+                qInfo() << "  ✓ avg_weight_zone_excludes 表就绪（方案A排除省）";
+            qc.exec("CREATE INDEX IF NOT EXISTS idx_avg_weight_zone_excludes_tpl ON avg_weight_zone_excludes(avg_tpl_id)");
+        }
+    }
+
     // 更新 schema 版本
-    int new_version = 14;
+    int new_version = 15;
     if (current_version < new_version) {
         vq.exec("DELETE FROM schema_version");
         vq.prepare("INSERT INTO schema_version VALUES (?)");
         vq.addBindValue(new_version);
         vq.exec();
+        qInfo() << "[migrate] Schema version 升级完成 → v" << new_version;
+    }
+
+    // ============================================================
+    // 【兜底三层保险·第二层】  拉均重合同 4 张核心表强制补全
+    //   不依赖任何 schema_version 判断：
+    //   - 老版本库 schema_version 已冲到 15，但当时 CreateTables 缺
+    //     avg_weight_zone_tpl_groups / avg_weight_zone_excludes
+    //   - 迁移块 CREATE TABLE 执行失败但 lastError() 丢失
+    //   → 所有这些情况，启动时都会在这里被 CREATE TABLE IF NOT EXISTS 兜底补建
+    // ============================================================
+    {
+        auto try_exec = [&](const QString &name, const QString &sql) {
+            QSqlQuery qc(db_);
+            if (!qc.exec(sql)) {
+                const QString err = qc.lastError().text().toLower();
+                if (err.contains("already exists") || err.contains("duplicate") || err.contains("already"))
+                    return true;
+                qCritical() << "[lajz-ensure-schema]" << name << "CREATE failed:" << qc.lastError().text();
+                return false;
+            }
+            qInfo() << "[lajz-ensure-schema]  ✓ " << name << "表就绪";
+            return true;
+        };
+        try_exec("avg_weight_templates", R"SQL(
+            CREATE TABLE IF NOT EXISTS avg_weight_templates (
+                avg_tpl_id          VARCHAR(60) PRIMARY KEY,
+                template_id         VARCHAR(100) NOT NULL,
+                name                VARCHAR(200) NOT NULL,
+                version             INTEGER     DEFAULT 1,
+                effective_from      DATE        NOT NULL DEFAULT CURRENT_DATE,
+                effective_to        DATE,
+                avg_pool_min_kg     REAL        DEFAULT 0.0,
+                avg_pool_max_kg     REAL        DEFAULT 1.0,
+                base_avg_kg         REAL        DEFAULT 0.3,
+                avg_fee_cap_kg      REAL        DEFAULT 1.0,
+                over_cap_mode       INTEGER     DEFAULT 0,
+                threshold_kg        REAL        DEFAULT 1.0,
+                base_fee            REAL        NOT NULL DEFAULT 2.7,
+                step_kg             REAL        DEFAULT 0.1,
+                step_fee            REAL        DEFAULT 0.2,
+                min_tickets         INTEGER     DEFAULT 50,
+                reuse_zone_groups   INTEGER     DEFAULT 1,
+                period_type         VARCHAR(10) DEFAULT 'month',
+                contract_no         VARCHAR(60) DEFAULT '',
+                is_active           INTEGER     DEFAULT 1,
+                created_at          TIMESTAMP   DEFAULT CURRENT_TIMESTAMP,
+                updated_at          TIMESTAMP   DEFAULT CURRENT_TIMESTAMP
+            )
+        )SQL");
+        try_exec("avg_weight_zones", R"SQL(
+            CREATE TABLE IF NOT EXISTS avg_weight_zones (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                avg_tpl_id VARCHAR(60) NOT NULL,
+                zone_code  VARCHAR(20) NOT NULL,
+                province   VARCHAR(50) NOT NULL,
+                UNIQUE(avg_tpl_id, zone_code, province)
+            )
+        )SQL");
+        try_exec("avg_weight_zones_idx",
+                 "CREATE INDEX IF NOT EXISTS idx_avg_weight_zones_tpl ON avg_weight_zones(avg_tpl_id)");
+        try_exec("avg_weight_zone_tpl_groups", R"SQL(
+            CREATE TABLE IF NOT EXISTS avg_weight_zone_tpl_groups (
+                avg_tpl_id  VARCHAR(60) NOT NULL,
+                template_id VARCHAR(100) NOT NULL,
+                group_code  VARCHAR(20) NOT NULL,
+                PRIMARY KEY (avg_tpl_id, template_id, group_code)
+            )
+        )SQL");
+        try_exec("avg_weight_zone_excludes", R"SQL(
+            CREATE TABLE IF NOT EXISTS avg_weight_zone_excludes (
+                avg_tpl_id  VARCHAR(60) NOT NULL,
+                template_id VARCHAR(100) NOT NULL,
+                group_code  VARCHAR(20) NOT NULL,
+                province    VARCHAR(50) NOT NULL,
+                PRIMARY KEY (avg_tpl_id, template_id, group_code, province)
+            )
+        )SQL");
+        try_exec("avg_weight_zone_excludes_idx",
+                 "CREATE INDEX IF NOT EXISTS idx_avg_weight_zone_excludes_tpl ON avg_weight_zone_excludes(avg_tpl_id)");
     }
 
     return ok;
@@ -276,7 +477,12 @@ bool SqliteRuleRepository::CreateTables() {
            "contact_phone VARCHAR(50),"
            "address TEXT,"
            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
-           "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
+           "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+           "cust_rounding_mode VARCHAR(30) DEFAULT '',"
+           "cust_additional_unit REAL DEFAULT 0,"
+           "cust_vol_divisor INTEGER DEFAULT 0,"
+           "avg_weight_tpl_id VARCHAR(60),"
+           "cust_contract_no VARCHAR(60) DEFAULT '')");
 
     q.exec("CREATE TABLE IF NOT EXISTS freight_templates ("
            "template_id VARCHAR(100) PRIMARY KEY,"
@@ -374,6 +580,61 @@ bool SqliteRuleRepository::CreateTables() {
            "start_date DATE NOT NULL,"
            "end_date DATE NOT NULL,"
            "week_days VARCHAR(20))");
+
+    q.exec("CREATE TABLE IF NOT EXISTS avg_weight_templates ("
+           "avg_tpl_id VARCHAR(60) PRIMARY KEY,"
+           "template_id VARCHAR(100) NOT NULL,"
+           "name VARCHAR(200) NOT NULL,"
+           "version INTEGER DEFAULT 1,"
+           "effective_from DATE NOT NULL DEFAULT CURRENT_DATE,"
+           "effective_to DATE,"
+           "avg_pool_min_kg REAL DEFAULT 0.0,"
+           "avg_pool_max_kg REAL DEFAULT 1.0,"
+           "base_avg_kg REAL DEFAULT 0.3,"
+           "avg_fee_cap_kg REAL DEFAULT 1.0,"
+           "over_cap_mode INTEGER DEFAULT 0,"
+           "threshold_kg REAL DEFAULT 1.0,"
+           "base_fee REAL NOT NULL DEFAULT 2.7,"
+           "step_kg REAL DEFAULT 0.1,"
+           "step_fee REAL DEFAULT 0.2,"
+           "min_tickets INTEGER DEFAULT 50,"
+           "reuse_zone_groups INTEGER DEFAULT 1,"
+           "period_type VARCHAR(10) DEFAULT 'month',"
+           "contract_no VARCHAR(60) DEFAULT '',"
+           "is_active INTEGER DEFAULT 1,"
+           "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+           "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)");
+
+    q.exec("CREATE TABLE IF NOT EXISTS avg_weight_zones ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+           "avg_tpl_id VARCHAR(60) NOT NULL,"
+           "zone_code VARCHAR(20) NOT NULL,"
+           "province VARCHAR(50) NOT NULL,"
+           "UNIQUE(avg_tpl_id, zone_code, province))");
+    if (q.lastError().isValid()) {
+        qCritical() << "CREATE avg_weight_zones failed:" << q.lastError().text();
+    }
+    q.exec("CREATE INDEX IF NOT EXISTS idx_avg_weight_zones_tpl ON avg_weight_zones(avg_tpl_id)");
+
+    q.exec("CREATE TABLE IF NOT EXISTS avg_weight_zone_tpl_groups ("
+           "avg_tpl_id  VARCHAR(60) NOT NULL,"
+           "template_id VARCHAR(100) NOT NULL,"
+           "group_code  VARCHAR(20) NOT NULL,"
+           "PRIMARY KEY (avg_tpl_id, template_id, group_code))");
+    if (q.lastError().isValid()) {
+        qCritical() << "CREATE avg_weight_zone_tpl_groups failed:" << q.lastError().text();
+    }
+
+    q.exec("CREATE TABLE IF NOT EXISTS avg_weight_zone_excludes ("
+           "avg_tpl_id  VARCHAR(60) NOT NULL,"
+           "template_id VARCHAR(100) NOT NULL,"
+           "group_code  VARCHAR(20) NOT NULL,"
+           "province    VARCHAR(50) NOT NULL,"
+           "PRIMARY KEY (avg_tpl_id, template_id, group_code, province))");
+    if (q.lastError().isValid()) {
+        qCritical() << "CREATE avg_weight_zone_excludes failed:" << q.lastError().text();
+    }
+    q.exec("CREATE INDEX IF NOT EXISTS idx_avg_weight_zone_excludes_tpl ON avg_weight_zone_excludes(avg_tpl_id)");
 
     return true;
 }
@@ -984,13 +1245,23 @@ QVariantMap SqliteRuleRepository::GetCustomer(const QString &customer_id) {
     q.prepare("SELECT * FROM customers WHERE customer_id = ?");
     q.addBindValue(customer_id);
     if (q.next()) {
-        m["customer_id"] = q.value("customer_id");
-        m["customer_name"] = q.value("customer_name");
-        m["discount_rate"] = q.value("discount_rate").toDouble();
-        m["default_template"] = q.value("default_template");
-        m["contact_person"] = q.value("contact_person");
-        m["contact_phone"] = q.value("contact_phone");
-        m["address"] = q.value("address");
+        m["customer_id"]        = q.value("customer_id");
+        m["customer_name"]      = q.value("customer_name");
+        m["discount_rate"]      = q.value("discount_rate").toDouble();
+        m["default_template"]   = q.value("default_template");
+        m["contact_person"]     = q.value("contact_person");
+        m["contact_phone"]      = q.value("contact_phone");
+        m["address"]            = q.value("address");
+        // Step2 customers +5 列 支持读回
+        QSqlRecord rec = q.record();
+        auto hasCol = [&](const char *col) {
+            return rec.indexOf(QString::fromUtf8(col)) >= 0;
+        };
+        if (hasCol("cust_rounding_mode")) m["cust_rounding_mode"]   = q.value("cust_rounding_mode");
+        if (hasCol("cust_additional_unit")) m["cust_additional_unit"] = q.value("cust_additional_unit");
+        if (hasCol("cust_vol_divisor"))   m["cust_vol_divisor"]     = q.value("cust_vol_divisor");
+        if (hasCol("avg_weight_tpl_id"))  m["avg_weight_tpl_id"]    = q.value("avg_weight_tpl_id");
+        if (hasCol("cust_contract_no"))   m["cust_contract_no"]     = q.value("cust_contract_no");
     }
     return m;
 }
@@ -999,7 +1270,10 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
     QSqlQuery q(db_);
     QString cust_id = cust["customer_id"].toString();
 
-    q.prepare("INSERT INTO customers (customer_id, customer_name, discount_rate, default_template, contact_person, contact_phone, address) VALUES (?,?,?,?,?,?,?)");
+    q.prepare("INSERT INTO customers (customer_id, customer_name, discount_rate, default_template,"
+              " contact_person, contact_phone, address,"
+              " cust_rounding_mode, cust_additional_unit, cust_vol_divisor, avg_weight_tpl_id, cust_contract_no)"
+              " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)");
     q.addBindValue(cust_id);
     q.addBindValue(cust["customer_name"].toString());
     q.addBindValue(cust.value("discount_rate", 1.0).toDouble());
@@ -1007,6 +1281,11 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
     q.addBindValue(cust["contact_person"].toString());
     q.addBindValue(cust["contact_phone"].toString());
     q.addBindValue(cust["address"].toString());
+    q.addBindValue(cust.value("cust_rounding_mode", "").toString());
+    q.addBindValue(cust.value("cust_additional_unit", 0.0).toDouble());
+    q.addBindValue(cust.value("cust_vol_divisor", 0).toInt());
+    q.addBindValue(cust.value("avg_weight_tpl_id", "").toString());
+    q.addBindValue(cust.value("cust_contract_no", "").toString());
     if (!q.exec()) {
         return false;
     }
@@ -1114,13 +1393,20 @@ bool SqliteRuleRepository::AddCustomer(const QVariantMap &cust) {
 
 bool SqliteRuleRepository::UpdateCustomer(const QVariantMap &cust) {
     QSqlQuery q(db_);
-    q.prepare("UPDATE customers SET customer_name=?, discount_rate=?, default_template=?, contact_person=?, contact_phone=?, address=?, updated_at=CURRENT_TIMESTAMP WHERE customer_id=?");
+    q.prepare("UPDATE customers SET customer_name=?, discount_rate=?, default_template=?, contact_person=?, contact_phone=?, address=?,"
+              " cust_rounding_mode=?, cust_additional_unit=?, cust_vol_divisor=?, avg_weight_tpl_id=?, cust_contract_no=?,"
+              " updated_at=CURRENT_TIMESTAMP WHERE customer_id=?");
     q.addBindValue(cust["customer_name"].toString());
     q.addBindValue(cust["discount_rate"].toDouble());
     q.addBindValue(cust["default_template"].toString());
     q.addBindValue(cust["contact_person"].toString());
     q.addBindValue(cust["contact_phone"].toString());
     q.addBindValue(cust["address"].toString());
+    q.addBindValue(cust.value("cust_rounding_mode", "").toString());
+    q.addBindValue(cust.value("cust_additional_unit", 0.0).toDouble());
+    q.addBindValue(cust.value("cust_vol_divisor", 0).toInt());
+    q.addBindValue(cust.value("avg_weight_tpl_id", "").toString());
+    q.addBindValue(cust.value("cust_contract_no", "").toString());
     q.addBindValue(cust["customer_id"].toString());
     return q.exec();
 }
@@ -1130,6 +1416,683 @@ bool SqliteRuleRepository::DeleteCustomer(const QString &customer_id) {
     q.prepare("DELETE FROM customers WHERE customer_id = ?");
     q.addBindValue(customer_id);
     return q.exec();
+}
+
+// ====== 拉均重合同 (avg_weight_templates) ======
+QVariantList SqliteRuleRepository::ListAvgWeightTemplates() {
+    QVariantList result;
+    QSqlQuery q(db_);
+    q.exec("SELECT avg_tpl_id,template_id,name,version,effective_from,effective_to,"
+           "contract_no,base_avg_kg,avg_pool_max_kg,avg_fee_cap_kg,base_fee,step_kg,step_fee,"
+           "min_tickets,over_cap_mode,reuse_zone_groups,period_type,is_active,"
+           "created_at,updated_at FROM avg_weight_templates ORDER BY is_active DESC, avg_tpl_id");
+    auto hasCol = [&](const char *col) { return q.record().indexOf(QString::fromUtf8(col)) >= 0; };
+    while (q.next()) {
+        QVariantMap m;
+        m["avg_tpl_id"]          = q.value("avg_tpl_id").toString();
+        m["template_id"]         = q.value("template_id").toString();
+        m["name"]                = q.value("name").toString();
+        m["version"]             = q.value("version").toInt();
+        m["effective_from"]      = q.value("effective_from").toString();
+        m["effective_to"]        = q.value("effective_to").toString();
+        m["contract_no"]         = q.value("contract_no").toString();
+        m["base_avg_kg"]         = q.value("base_avg_kg").toDouble();
+        m["avg_pool_max_kg"]     = q.value("avg_pool_max_kg").toDouble();
+        m["avg_fee_cap_kg"]      = q.value("avg_fee_cap_kg").toDouble();
+        m["base_fee"]            = q.value("base_fee").toDouble();
+        m["step_kg"]             = q.value("step_kg").toDouble();
+        m["step_fee"]            = q.value("step_fee").toDouble();
+        m["min_tickets"]         = q.value("min_tickets").toInt();
+        m["over_cap_mode"]       = q.value("over_cap_mode").toInt();
+        m["reuse_zone_groups"]   = q.value("reuse_zone_groups").toInt();
+        if (hasCol("period_type")) m["period_type"] = q.value("period_type").toString();
+        else                        m["period_type"] = QStringLiteral("month");
+        m["is_active"]           = q.value("is_active").toInt() == 1;
+        result << m;
+    }
+    return result;
+}
+
+QVariantMap SqliteRuleRepository::GetAvgWeightTemplate(const QString &avg_tpl_id) {
+    QVariantList all = ListAvgWeightTemplates();
+    for (const auto &a : all) {
+        const auto m = a.toMap();
+        if (m["avg_tpl_id"].toString() == avg_tpl_id) return m;
+    }
+    return {};
+}
+
+bool SqliteRuleRepository::SaveAvgWeightTemplate(const QVariantMap &tpl) {
+    QSqlQuery q(db_);
+    QString avg_tpl_id = tpl["avg_tpl_id"].toString().trimmed();
+    if (avg_tpl_id.isEmpty()) return false;
+
+    // 版本自增：如已存在同 ID 则 version = MAX(version)+1
+    int next_version = tpl.value("version", 1).toInt();
+    {
+        QSqlQuery qv(db_);
+        qv.prepare("SELECT MAX(version) FROM avg_weight_templates WHERE avg_tpl_id=?");
+        qv.addBindValue(avg_tpl_id);
+        if (qv.exec() && qv.next()) next_version = qv.value(0).toInt() + 1;
+    }
+    // 如果显式传 version 且比自增大，用显式
+    if (tpl.contains("version") && tpl["version"].toInt() > next_version)
+        next_version = tpl["version"].toInt();
+
+    q.prepare("INSERT OR REPLACE INTO avg_weight_templates("
+              "avg_tpl_id,template_id,name,version,effective_from,effective_to,"
+              "contract_no,base_avg_kg,avg_pool_max_kg,avg_fee_cap_kg,base_fee,step_kg,step_fee,"
+              "min_tickets,over_cap_mode,reuse_zone_groups,is_active,updated_at)"
+              " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP)");
+    q.addBindValue(avg_tpl_id);
+    q.addBindValue(tpl.value("template_id", "").toString());
+    q.addBindValue(tpl.value("name", "").toString());
+    q.addBindValue(next_version);
+    q.addBindValue(tpl.value("effective_from", QDate::currentDate().toString(Qt::ISODate)).toString());
+    q.addBindValue(tpl.value("effective_to", "").toString());
+    q.addBindValue(tpl.value("contract_no", "").toString());
+    q.addBindValue(tpl.value("base_avg_kg", 0.3).toDouble());
+    q.addBindValue(tpl.value("avg_pool_max_kg", 1.0).toDouble());
+    q.addBindValue(tpl.value("avg_fee_cap_kg", 1.0).toDouble());
+    q.addBindValue(tpl.value("base_fee", 2.7).toDouble());
+    q.addBindValue(tpl.value("step_kg", 0.1).toDouble());
+    q.addBindValue(tpl.value("step_fee", 0.2).toDouble());
+    q.addBindValue(tpl.value("min_tickets", 50).toInt());
+    q.addBindValue(tpl.value("over_cap_mode", 0).toInt());
+    q.addBindValue(tpl.value("reuse_zone_groups", 1).toInt());
+    q.addBindValue(tpl.value("is_active", true).toBool() ? 1 : 0);
+    bool exec_ok = q.exec();
+    if (!exec_ok) {
+        qCritical() << "[SaveAvgWeightTemplate] SQL 失败：" << q.lastError().text()
+                    << "\n    绑定的列：avg_tpl_id=" << avg_tpl_id
+                    << "，template_id=" << tpl.value("template_id", "").toString()
+                    << "，name=" << tpl.value("name", "").toString();
+    }
+    return exec_ok;
+}
+
+bool SqliteRuleRepository::DeleteAvgWeightTemplate(const QString &avg_tpl_id) {
+    QSqlQuery q(db_);
+    q.prepare("DELETE FROM avg_weight_templates WHERE avg_tpl_id=?");
+    q.addBindValue(avg_tpl_id);
+    return q.exec();
+}
+
+bool SqliteRuleRepository::SetAvgWeightTemplateActive(const QString &avg_tpl_id, bool active) {
+    QSqlQuery q(db_);
+    q.prepare("UPDATE avg_weight_templates SET is_active=?, updated_at=CURRENT_TIMESTAMP WHERE avg_tpl_id=?");
+    q.addBindValue(active ? 1 : 0);
+    q.addBindValue(avg_tpl_id);
+    return q.exec();
+}
+
+// ====== 拉均重方案A：勾选模板分区 + 排除省 ======
+QVariantList SqliteRuleRepository::GetAvgWeightTplGroups(const QString &avg_tpl_id) {
+    QVariantList out;
+    if (!db_.isOpen()) {
+        qCritical() << "[GetAvgWeightTplGroups-FATAL] db_ is NOT OPEN! avg_tpl_id=" << avg_tpl_id;
+        return out;
+    }
+    {
+        QSqlQuery cq(db_);
+        cq.prepare("SELECT COUNT(*) FROM avg_weight_zone_tpl_groups WHERE avg_tpl_id=?");
+        cq.addBindValue(avg_tpl_id);
+        if (cq.exec() && cq.next()) {
+            qInfo() << "[GetAvgWeightTplGroups-DIAG] BEFORE_SELECT_COUNT] avg_tpl_id=" << avg_tpl_id
+                     << " DB_count=" << cq.value(0).toInt()
+                     << " conn_open=" << db_.isOpen()
+                     << " lastError=" << db_.lastError().text();
+        } else {
+            qCritical() << "[GetAvgWeightTplGroups-DIAG] COUNT query failed:" << cq.lastError().text();
+        }
+    }
+    QSqlQuery q(db_);
+    q.prepare("SELECT template_id, group_code FROM avg_weight_zone_tpl_groups WHERE avg_tpl_id=? ORDER BY template_id, group_code");
+    q.addBindValue(avg_tpl_id);
+    qDebug() << "[GetAvgWeightTplGroups-DIAG] bound avg_tpl_id=" << avg_tpl_id
+             << " last query:" << q.lastQuery();
+    bool ok = q.exec();
+    if (!ok) {
+        qCritical() << "[GetAvgWeightTplGroups] SELECT failed:" << q.lastError().text() << " boundValue(0)=" << q.boundValue(0).toString();
+        return out;
+    }
+    int row = 0;
+    while (q.next()) {
+        QVariantMap m;
+        m["template_id"] = q.value(0).toString();
+        m["group_code"]  = q.value(1).toString();
+        out << m;
+        row++;
+    }
+    qInfo() << "[GetAvgWeightTplGroups-DIAG] AFTER] iterated rows=" << row << " out.size=" << out.size();
+    return out;
+}
+
+namespace {
+// ===================================================================
+// 兜底三层保险·第三层：写入时自动重建缺失的拉均重合同相关表
+//   三张表各一个独立 helper，返回值为「是否尝试过建表」。
+//   规则：
+//     1. 检测到 PREPARE 失败且 lastError 含 no such table 时，调用对应 helper
+//     2. helper 会执行 CREATE TABLE IF NOT EXISTS + 索引
+//     3. SetXxx 函数内 helper 返回后 retry 整个 Set 操作一次（仅一次）
+// ===================================================================
+static inline void ensure_lajz_tpl_groups_table(QSqlDatabase &db) {
+    QSqlQuery cq(db);
+    cq.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS avg_weight_zone_tpl_groups (
+            avg_tpl_id  VARCHAR(60) NOT NULL,
+            template_id VARCHAR(100) NOT NULL,
+            group_code  VARCHAR(20) NOT NULL,
+            PRIMARY KEY (avg_tpl_id, template_id, group_code)
+        )
+    )SQL");
+    if (cq.lastError().isValid())
+        qCritical() << "[ensure-lajz-schema] avg_weight_zone_tpl_groups CREATE failed:" << cq.lastError().text();
+    else
+        qInfo() << "[ensure-lajz-schema]  ✓ avg_weight_zone_tpl_groups 已自动重建";
+}
+
+static inline void ensure_lajz_excludes_table(QSqlDatabase &db) {
+    QSqlQuery cq(db);
+    cq.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS avg_weight_zone_excludes (
+            avg_tpl_id  VARCHAR(60) NOT NULL,
+            template_id VARCHAR(100) NOT NULL,
+            group_code  VARCHAR(20) NOT NULL,
+            province    VARCHAR(50) NOT NULL,
+            PRIMARY KEY (avg_tpl_id, template_id, group_code, province)
+        )
+    )SQL");
+    if (cq.lastError().isValid())
+        qCritical() << "[ensure-lajz-schema] avg_weight_zone_excludes CREATE failed:" << cq.lastError().text();
+    else
+        qInfo() << "[ensure-lajz-schema]  ✓ avg_weight_zone_excludes 已自动重建";
+    QSqlQuery iq(db);
+    iq.exec("CREATE INDEX IF NOT EXISTS idx_avg_weight_zone_excludes_tpl ON avg_weight_zone_excludes(avg_tpl_id)");
+}
+
+static inline void ensure_lajz_zones_table(QSqlDatabase &db) {
+    QSqlQuery cq(db);
+    cq.exec(R"SQL(
+        CREATE TABLE IF NOT EXISTS avg_weight_zones (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            avg_tpl_id VARCHAR(60) NOT NULL,
+            zone_code  VARCHAR(20) NOT NULL,
+            province   VARCHAR(50) NOT NULL,
+            UNIQUE(avg_tpl_id, zone_code, province)
+        )
+    )SQL");
+    if (cq.lastError().isValid())
+        qCritical() << "[ensure-lajz-schema] avg_weight_zones CREATE failed:" << cq.lastError().text();
+    else
+        qInfo() << "[ensure-lajz-schema]  ✓ avg_weight_zones 已自动重建";
+    QSqlQuery iq(db);
+    iq.exec("CREATE INDEX IF NOT EXISTS idx_avg_weight_zones_tpl ON avg_weight_zones(avg_tpl_id)");
+}
+
+static inline bool err_is_no_such_table(const QString &err) {
+    return err.toLower().contains("no such table");
+}
+} // anon namespace
+
+bool SqliteRuleRepository::SetAvgWeightTplGroups(const QString &avg_tpl_id, const QVariantList &groups, QString *out_err) {
+    int attempt = 0;
+    QString inner_err;
+    QString *perr = out_err ? out_err : &inner_err;
+try_again:
+    attempt++;
+    QSqlQuery dq(db_), iq(db_), vq(db_);
+    static const QString kDelSql = QStringLiteral("DELETE FROM avg_weight_zone_tpl_groups WHERE avg_tpl_id=?");
+    if (!dq.prepare(kDelSql)) {
+        QString msg = QStringLiteral("[PREPARE DELETE]%1 (sql=%2)").arg(dq.lastError().text(), kDelSql);
+        qCritical() << "[SetAvgWeightTplGroups]" << msg << "（avg_tpl_id=" << avg_tpl_id << "）";
+        if (attempt == 1 && err_is_no_such_table(dq.lastError().text())) {
+            qInfo() << "[SetAvgWeightTplGroups-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_tpl_groups_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    dq.addBindValue(avg_tpl_id);
+    if (!dq.exec()) {
+        QString msg = QStringLiteral("[DELETE]%1").arg(dq.lastError().text());
+        qCritical() << "[SetAvgWeightTplGroups]" << msg << "（avg_tpl_id=" << avg_tpl_id << "）";
+        if (attempt == 1 && err_is_no_such_table(dq.lastError().text())) {
+            qInfo() << "[SetAvgWeightTplGroups-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_tpl_groups_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    int del_rows = dq.numRowsAffected();
+    static const QString kInsSql = QStringLiteral("INSERT INTO avg_weight_zone_tpl_groups (avg_tpl_id, template_id, group_code) VALUES (?,?,?)");
+    if (!iq.prepare(kInsSql)) {
+        QString msg = QStringLiteral("[PREPARE INSERT]%1 (sql=%2)").arg(iq.lastError().text(), kInsSql);
+        qCritical() << "[SetAvgWeightTplGroups]" << msg;
+        if (attempt == 1 && err_is_no_such_table(iq.lastError().text())) {
+            qInfo() << "[SetAvgWeightTplGroups-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_tpl_groups_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    int ins_attempted = 0, ins_skipped = 0, ins_succeeded = 0;
+    for (const auto &g : groups) {
+        const auto m = g.toMap();
+        QString tid = m["template_id"].toString().trimmed();
+        QString gcode = m["group_code"].toString().trimmed();
+        if (tid.isEmpty() || gcode.isEmpty()) { ins_skipped++; continue; }
+        ins_attempted++;
+        iq.addBindValue(avg_tpl_id); iq.addBindValue(tid); iq.addBindValue(gcode);
+        if (!iq.exec()) {
+            QString msg = QStringLiteral("[INSERT avg_tpl_id=%1,template_id=%2,group_code=%3]%4")
+                            .arg(avg_tpl_id).arg(tid).arg(gcode).arg(iq.lastError().text());
+            qCritical() << "[SetAvgWeightTplGroups]" << msg;
+            if (attempt == 1 && err_is_no_such_table(iq.lastError().text())) {
+                qInfo() << "[SetAvgWeightTplGroups-RETRY] 检测到表缺失，自动建表后重试一次";
+                ensure_lajz_tpl_groups_table(db_);
+                goto try_again;
+            }
+            *perr = msg;
+            return false;
+        }
+        if (iq.numRowsAffected() > 0) ins_succeeded++;
+        else {
+            qCritical() << "[SetAvgWeightTplGroups] INSERT 未影响任何行（可能主键冲突？）"
+                        << " avg_tpl_id=" << avg_tpl_id << " template_id=" << tid << " group_code=" << gcode
+                        << " lastError=" << iq.lastError().text();
+        }
+    }
+    static const QString kCountSql = QStringLiteral("SELECT COUNT(*) FROM avg_weight_zone_tpl_groups WHERE avg_tpl_id=?");
+    if (!vq.prepare(kCountSql)) {
+        QString msg = QStringLiteral("[PREPARE COUNT]%1 (sql=%2)").arg(vq.lastError().text(), kCountSql);
+        qWarning() << "[SetAvgWeightTplGroups]" << msg;
+        if (attempt == 1 && err_is_no_such_table(vq.lastError().text())) {
+            qInfo() << "[SetAvgWeightTplGroups-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_tpl_groups_table(db_);
+            goto try_again;
+        }
+        if (perr->isEmpty()) *perr = msg;
+    } else {
+        vq.addBindValue(avg_tpl_id);
+        int actual_count = -1;
+        if (vq.exec() && vq.next()) actual_count = vq.value(0).toInt();
+        qInfo().noquote() << QString("[SetAvgWeightTplGroups-DIAG] attempt=%2 | avg_tpl_id=%1 input_groups=%3 del_rows=%4 "
+                                      "ins_attempted=%5 ins_skipped=%6 ins_succeeded=%7 actual_DB_count=%8")
+                             .arg(avg_tpl_id).arg(attempt).arg(groups.size()).arg(del_rows)
+                             .arg(ins_attempted).arg(ins_skipped).arg(ins_succeeded).arg(actual_count);
+        if (actual_count != ins_succeeded) {
+            QString msg = QStringLiteral("[VERIFY COUNT] 预期INSERT成功%1行，但DB实得%2行（%3成功%4跳过%5尝试，DELETE删%6行）")
+                            .arg(ins_succeeded).arg(actual_count).arg(ins_succeeded).arg(ins_skipped)
+                            .arg(ins_attempted).arg(del_rows);
+            qWarning() << "[SetAvgWeightTplGroups]" << msg;
+            if (perr->isEmpty()) *perr = msg;
+        }
+    }
+    if (attempt > 1) {
+        qInfo() << "[SetAvgWeightTplGroups]  自动修复成功（原因为缺失 avg_weight_zone_tpl_groups 表） attempt=" << attempt;
+    }
+    return true;
+}
+
+QVariantList SqliteRuleRepository::GetAvgWeightExcludes(const QString &avg_tpl_id) {
+    QVariantList out;
+    if (!db_.isOpen()) {
+        qCritical() << "[GetAvgWeightExcludes-FATAL] db_ is NOT OPEN! avg_tpl_id=" << avg_tpl_id;
+        return out;
+    }
+    {
+        QSqlQuery cq(db_);
+        cq.prepare("SELECT COUNT(*) FROM avg_weight_zone_excludes WHERE avg_tpl_id=?");
+        cq.addBindValue(avg_tpl_id);
+        if (cq.exec() && cq.next()) {
+            qInfo() << "[GetAvgWeightExcludes-DIAG] BEFORE_COUNT] avg_tpl_id=" << avg_tpl_id
+                     << " DB_count=" << cq.value(0).toInt();
+        }
+    }
+    QSqlQuery q(db_);
+    q.prepare("SELECT template_id, group_code, province FROM avg_weight_zone_excludes WHERE avg_tpl_id=? ORDER BY template_id, group_code, province");
+    q.addBindValue(avg_tpl_id);
+    bool ok = q.exec();
+    if (!ok) {
+        qCritical() << "[GetAvgWeightExcludes] SELECT failed:" << q.lastError().text();
+        return out;
+    }
+    int row = 0;
+    while (q.next()) {
+        QVariantMap m;
+        m["template_id"] = q.value(0).toString();
+        m["group_code"]  = q.value(1).toString();
+        m["province"]    = q.value(2).toString();
+        out << m;
+        row++;
+    }
+    qInfo() << "[GetAvgWeightExcludes-DIAG] AFTER] rows=" << row << " out.size=" << out.size();
+    return out;
+}
+
+bool SqliteRuleRepository::SetAvgWeightExcludes(const QString &avg_tpl_id, const QVariantList &excludes, QString *out_err) {
+    int attempt = 0;
+    QString inner_err;
+    QString *perr = out_err ? out_err : &inner_err;
+try_again:
+    attempt++;
+    QSqlQuery dq(db_), iq(db_), vq(db_);
+    static const QString kDelSql = QStringLiteral("DELETE FROM avg_weight_zone_excludes WHERE avg_tpl_id=?");
+    if (!dq.prepare(kDelSql)) {
+        QString msg = QStringLiteral("[PREPARE DELETE]%1 (sql=%2)").arg(dq.lastError().text(), kDelSql);
+        qCritical() << "[SetAvgWeightExcludes]" << msg << "（avg_tpl_id=" << avg_tpl_id << "）";
+        if (attempt == 1 && err_is_no_such_table(dq.lastError().text())) {
+            qInfo() << "[SetAvgWeightExcludes-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_excludes_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    dq.addBindValue(avg_tpl_id);
+    if (!dq.exec()) {
+        QString msg = QStringLiteral("[DELETE]%1").arg(dq.lastError().text());
+        qCritical() << "[SetAvgWeightExcludes]" << msg << "（avg_tpl_id=" << avg_tpl_id << "）";
+        if (attempt == 1 && err_is_no_such_table(dq.lastError().text())) {
+            qInfo() << "[SetAvgWeightExcludes-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_excludes_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    int del_rows = dq.numRowsAffected();
+    static const QString kInsSql = QStringLiteral("INSERT INTO avg_weight_zone_excludes (avg_tpl_id, template_id, group_code, province) VALUES (?,?,?,?)");
+    if (!iq.prepare(kInsSql)) {
+        QString msg = QStringLiteral("[PREPARE INSERT]%1 (sql=%2)").arg(iq.lastError().text(), kInsSql);
+        qCritical() << "[SetAvgWeightExcludes]" << msg;
+        if (attempt == 1 && err_is_no_such_table(iq.lastError().text())) {
+            qInfo() << "[SetAvgWeightExcludes-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_excludes_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    int ins_attempted = 0, ins_skipped = 0, ins_succeeded = 0;
+    for (const auto &e : excludes) {
+        const auto m = e.toMap();
+        QString tid = m["template_id"].toString().trimmed();
+        QString gcode = m["group_code"].toString().trimmed();
+        QString prov  = m["province"].toString().trimmed();
+        if (tid.isEmpty() || gcode.isEmpty() || prov.isEmpty()) { ins_skipped++; continue; }
+        ins_attempted++;
+        iq.addBindValue(avg_tpl_id); iq.addBindValue(tid); iq.addBindValue(gcode); iq.addBindValue(prov);
+        if (!iq.exec()) {
+            QString msg = QStringLiteral("[INSERT avg_tpl_id=%1,template_id=%2,group_code=%3,province=%4]%5")
+                            .arg(avg_tpl_id).arg(tid).arg(gcode).arg(prov).arg(iq.lastError().text());
+            qCritical() << "[SetAvgWeightExcludes]" << msg;
+            if (attempt == 1 && err_is_no_such_table(iq.lastError().text())) {
+                qInfo() << "[SetAvgWeightExcludes-RETRY] 检测到表缺失，自动建表后重试一次";
+                ensure_lajz_excludes_table(db_);
+                goto try_again;
+            }
+            *perr = msg;
+            return false;
+        }
+        if (iq.numRowsAffected() > 0) ins_succeeded++;
+        else {
+            qCritical() << "[SetAvgWeightExcludes] INSERT 未影响任何行（主键冲突？）"
+                        << " avg_tpl_id=" << avg_tpl_id << " tpl=" << tid << " grp=" << gcode << " prov=" << prov
+                        << " lastError=" << iq.lastError().text();
+        }
+    }
+    static const QString kCountSql = QStringLiteral("SELECT COUNT(*) FROM avg_weight_zone_excludes WHERE avg_tpl_id=?");
+    if (!vq.prepare(kCountSql)) {
+        QString msg = QStringLiteral("[PREPARE COUNT]%1 (sql=%2)").arg(vq.lastError().text(), kCountSql);
+        qWarning() << "[SetAvgWeightExcludes]" << msg;
+        if (attempt == 1 && err_is_no_such_table(vq.lastError().text())) {
+            qInfo() << "[SetAvgWeightExcludes-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_excludes_table(db_);
+            goto try_again;
+        }
+        if (perr->isEmpty()) *perr = msg;
+    } else {
+        vq.addBindValue(avg_tpl_id);
+        int actual_count = -1;
+        if (vq.exec() && vq.next()) actual_count = vq.value(0).toInt();
+        qInfo().noquote() << QString("[SetAvgWeightExcludes-DIAG] attempt=%2 | avg_tpl_id=%1 input=%3 del=%4 "
+                                      "ins_att=%5 ins_skip=%6 ins_succ=%7 actual=%8")
+                             .arg(avg_tpl_id).arg(attempt).arg(excludes.size()).arg(del_rows)
+                             .arg(ins_attempted).arg(ins_skipped).arg(ins_succeeded).arg(actual_count);
+        if (actual_count != ins_succeeded) {
+            QString msg = QStringLiteral("[VERIFY COUNT] 预期INSERT成功%1行，但DB实得%2行（%3成功%4跳过%5尝试，DELETE删%6行）")
+                            .arg(ins_succeeded).arg(actual_count).arg(ins_succeeded).arg(ins_skipped)
+                            .arg(ins_attempted).arg(del_rows);
+            qWarning() << "[SetAvgWeightExcludes]" << msg;
+            if (perr->isEmpty()) *perr = msg;
+        }
+    }
+    if (attempt > 1) {
+        qInfo() << "[SetAvgWeightExcludes]  自动修复成功（原因为缺失 avg_weight_zone_excludes 表） attempt=" << attempt;
+    }
+    return true;
+}
+
+// ====== 拉均重方案B：自定义省份（avg_weight_zones） ======
+QVariantList SqliteRuleRepository::GetAvgWeightZones(const QString &avg_tpl_id) {
+    QVariantList out;
+    if (!db_.isOpen()) {
+        qCritical() << "[GetAvgWeightZones-FATAL] db_ is NOT OPEN! avg_tpl_id=" << avg_tpl_id;
+        return out;
+    }
+    {
+        QSqlQuery cq(db_);
+        cq.prepare("SELECT COUNT(*) FROM avg_weight_zones WHERE avg_tpl_id=?");
+        cq.addBindValue(avg_tpl_id);
+        if (cq.exec() && cq.next()) {
+            qInfo() << "[GetAvgWeightZones-DIAG] BEFORE_COUNT] avg_tpl_id=" << avg_tpl_id
+                     << " DB_row_count=" << cq.value(0).toInt();
+        }
+    }
+    // 1) 取所有 zone_code（按 id 从小到大保序）
+    QMap<QString, QStringList> zone_provs;
+    QMap<QString, int> zone_order;
+    QMap<QString, QString> zone_name;
+    int total_raw_rows = 0;
+    {
+        QSqlQuery q(db_);
+        q.prepare("SELECT zone_code, province, id FROM avg_weight_zones WHERE avg_tpl_id=? ORDER BY id ASC");
+        q.addBindValue(avg_tpl_id);
+        bool ok = q.exec();
+        if (!ok) {
+            qCritical() << "[GetAvgWeightZones] SELECT failed:" << q.lastError().text();
+            return out;
+        }
+        int idx = 0;
+        while (q.next()) {
+            QString zc = q.value(0).toString();
+            QString prov = q.value(1).toString();
+            int id = q.value(2).toInt();
+            zone_provs[zc] << prov;
+            if (!zone_order.contains(zc)) zone_order[zc] = id;
+            idx++;
+            total_raw_rows++;
+        }
+    }
+    // 2) 从 zone_groups 里捞可能对应的 zone_name（如果 avg_weight_zones.zone_code == zone_groups.group_code 且 template_id 匹配/通配）
+    //    没匹配到就用 zone_code 本身作为 name
+    for (auto it = zone_order.begin(); it != zone_order.end(); ++it) {
+        const QString &zc = it.key();
+        QVariantMap m;
+        m["zone_code"] = zc;
+        m["provinces"] = zone_provs[zc];
+        out << m;
+    }
+    qInfo() << "[GetAvgWeightZones-DIAG] AFTER] total_raw_rows=" << total_raw_rows
+            << " unique_zones=" << out.size()
+            << " zone_codes=" << zone_order.keys();
+    return out;
+}
+
+bool SqliteRuleRepository::SetAvgWeightZones(const QString &avg_tpl_id, const QVariantList &zones, QString *out_err) {
+    int attempt = 0;
+    QString inner_err;
+    QString *perr = out_err ? out_err : &inner_err;
+try_again:
+    attempt++;
+    QSqlQuery dq(db_), iq(db_), vq(db_);
+    static const QString kDelSql = QStringLiteral("DELETE FROM avg_weight_zones WHERE avg_tpl_id=?");
+    if (!dq.prepare(kDelSql)) {
+        QString msg = QStringLiteral("[PREPARE DELETE]%1 (sql=%2)").arg(dq.lastError().text(), kDelSql);
+        qCritical() << "[SetAvgWeightZones]" << msg << "（avg_tpl_id=" << avg_tpl_id << "）";
+        if (attempt == 1 && err_is_no_such_table(dq.lastError().text())) {
+            qInfo() << "[SetAvgWeightZones-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_zones_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    dq.addBindValue(avg_tpl_id);
+    if (!dq.exec()) {
+        QString msg = QStringLiteral("[DELETE]%1").arg(dq.lastError().text());
+        qCritical() << "[SetAvgWeightZones]" << msg << "（avg_tpl_id=" << avg_tpl_id << "）";
+        if (attempt == 1 && err_is_no_such_table(dq.lastError().text())) {
+            qInfo() << "[SetAvgWeightZones-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_zones_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    int del_rows = dq.numRowsAffected();
+    static const QString kInsSql = QStringLiteral("INSERT INTO avg_weight_zones (avg_tpl_id, zone_code, province) VALUES (?,?,?)");
+    if (!iq.prepare(kInsSql)) {
+        QString msg = QStringLiteral("[PREPARE INSERT]%1 (sql=%2)").arg(iq.lastError().text(), kInsSql);
+        qCritical() << "[SetAvgWeightZones]" << msg;
+        if (attempt == 1 && err_is_no_such_table(iq.lastError().text())) {
+            qInfo() << "[SetAvgWeightZones-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_zones_table(db_);
+            goto try_again;
+        }
+        *perr = msg;
+        return false;
+    }
+    int zone_attempted = 0, zone_skipped_empty = 0, prov_attempted = 0, prov_succeeded = 0;
+    for (const auto &z : zones) {
+        const auto m = z.toMap();
+        QString zc = m["zone_code"].toString().trimmed();
+        if (zc.isEmpty()) { zone_skipped_empty++; continue; }
+        zone_attempted++;
+        const QStringList provs = m["provinces"].toStringList();
+        qInfo() << "   [SetAvgWeightZones-TRACE] zone=" << zc << " provinces_list_size=" << provs.size() << " raw_provinces=" << provs;
+        for (const auto &p : provs) {
+            QString pp = p.trimmed();
+            if (pp.isEmpty()) continue;
+            prov_attempted++;
+            iq.addBindValue(avg_tpl_id); iq.addBindValue(zc); iq.addBindValue(pp);
+            if (!iq.exec()) {
+                QString msg = QStringLiteral("[INSERT avg_tpl_id=%1,zone_code=%2,province=%3]%4")
+                                .arg(avg_tpl_id).arg(zc).arg(pp).arg(iq.lastError().text());
+                qCritical() << "[SetAvgWeightZones]" << msg;
+                if (attempt == 1 && err_is_no_such_table(iq.lastError().text())) {
+                    qInfo() << "[SetAvgWeightZones-RETRY] 检测到表缺失，自动建表后重试一次";
+                    ensure_lajz_zones_table(db_);
+                    goto try_again;
+                }
+                *perr = msg;
+                return false;
+            }
+            if (iq.numRowsAffected() > 0) prov_succeeded++;
+            else {
+                qCritical() << "[SetAvgWeightZones] INSERT 未影响任何行（UNIQUE冲突？）"
+                            << " avg_tpl_id=" << avg_tpl_id << " zone=" << zc << " prov=" << pp
+                            << " lastError=" << iq.lastError().text();
+            }
+        }
+    }
+    static const QString kCountSql = QStringLiteral("SELECT COUNT(*) FROM avg_weight_zones WHERE avg_tpl_id=?");
+    if (!vq.prepare(kCountSql)) {
+        QString msg = QStringLiteral("[PREPARE COUNT]%1 (sql=%2)").arg(vq.lastError().text(), kCountSql);
+        qWarning() << "[SetAvgWeightZones]" << msg;
+        if (attempt == 1 && err_is_no_such_table(vq.lastError().text())) {
+            qInfo() << "[SetAvgWeightZones-RETRY] 检测到表缺失，自动建表后重试一次";
+            ensure_lajz_zones_table(db_);
+            goto try_again;
+        }
+        if (perr->isEmpty()) *perr = msg;
+    } else {
+        vq.addBindValue(avg_tpl_id);
+        int actual_count = -1;
+        if (vq.exec() && vq.next()) actual_count = vq.value(0).toInt();
+        qInfo().noquote() << QString("[SetAvgWeightZones-DIAG] attempt=%2 | avg_tpl_id=%1 input_zones=%3 del=%4 "
+                                      "zone_att=%5 zone_skip_empty=%6 prov_att=%7 prov_succ=%8 actual_DB_rows=%9")
+                             .arg(avg_tpl_id).arg(attempt).arg(zones.size()).arg(del_rows)
+                             .arg(zone_attempted).arg(zone_skipped_empty).arg(prov_attempted)
+                             .arg(prov_succeeded).arg(actual_count);
+        if (actual_count != prov_succeeded) {
+            QString msg = QStringLiteral("[VERIFY COUNT] 预期INSERT成功%1行，但DB实得%2行（分区%3尝试%4跳过，省份%5尝试%6成功，DELETE删%7行）")
+                            .arg(prov_succeeded).arg(actual_count).arg(zone_attempted).arg(zone_skipped_empty)
+                            .arg(prov_attempted).arg(prov_succeeded).arg(del_rows);
+            qWarning() << "[SetAvgWeightZones]" << msg;
+            if (perr->isEmpty()) *perr = msg;
+        }
+    }
+    if (attempt > 1) {
+        qInfo() << "[SetAvgWeightZones]  自动修复成功（原因为缺失 avg_weight_zones 表） attempt=" << attempt;
+    }
+    return true;
+}
+
+// ====== 辅助：ListCourierTemplatesWithZones ======
+QVariantList SqliteRuleRepository::ListCourierTemplatesWithZones() {
+    QVariantList templates = ListTemplates();
+    QVariantList out;
+
+    // 预加载所有 zone_groups + zone_group_provinces
+    QMap<QString, QMap<QString, QVariantMap>> tpl_groups;   // tpl_id -> group_code -> group_info
+    QMap<QString, QMap<QString, QStringList>> tpl_group_provs; // tpl_id -> group_code -> [prov]
+    {
+        QSqlQuery q(db_);
+        q.exec("SELECT template_id, group_code, group_name, sort_order FROM zone_groups ORDER BY template_id, sort_order");
+        while (q.next()) {
+            QString tid = q.value(0).toString();
+            QString gc  = q.value(1).toString();
+            QString gn  = q.value(2).toString();
+            int so      = q.value(3).toInt();
+            QVariantMap g;
+            g["group_code"] = gc; g["group_name"] = gn; g["sort_order"] = so;
+            tpl_groups[tid][gc] = g;
+        }
+    }
+    {
+        QSqlQuery q(db_);
+        q.exec("SELECT template_id, group_code, province FROM zone_group_provinces ORDER BY template_id, group_code");
+        while (q.next()) {
+            QString tid = q.value(0).toString();
+            QString gc  = q.value(1).toString();
+            QString p   = q.value(2).toString();
+            tpl_group_provs[tid][gc] << p;
+        }
+    }
+
+    for (const auto &t : templates) {
+        QVariantMap tm = t.toMap();
+        QString tid = tm["template_id"].toString();
+        QVariantList groups;
+        const auto gmap = tpl_groups.value(tid);
+        for (auto it = gmap.begin(); it != gmap.end(); ++it) {
+            QVariantMap g = it.value();
+            const QStringList ps = tpl_group_provs.value(tid).value(it.key());
+            g["province_count"] = ps.size();
+            g["provinces"] = ps;
+            groups << g;
+        }
+        tm["groups"] = groups;
+        out << tm;
+    }
+    return out;
 }
 
 QVariantList SqliteRuleRepository::ListFuelSurcharges(const QString &template_id) {

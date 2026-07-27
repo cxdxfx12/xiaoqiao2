@@ -353,7 +353,328 @@ INSERT INTO _ut_input VALUES
         ASSERT_NEAR(rows["A32"].second, 17.0, "batch A32 bf=17");
     }
 
-    qInfo() << "\n🎉 全部 6 类 共 30 个断言全部通过！✅\n";
+    // ========== 测试7：启用拉均重 vs 禁用拉均重 —— 端到端门控 + 进池 + 封顶价 ==========
+    qInfo() << "\n=========【测试7】enable_avg_weight=TRUE 启用拉均重端到端验证=========";
+    {
+        // 7.1 在 customers 的 客户A/cA 上挂 avg_weight_tpl_id，再写一份合同到 SQLite
+        {
+            QSqlQuery q(repo.Database());
+            // 给客户A挂合同号（测试"客户级优先"绑定）
+            q.prepare("UPDATE customers SET avg_weight_tpl_id='POLAIYA_LAJZ_001' WHERE customer_id='cA'");
+            if (!q.exec()) { qCritical() << "upd cust fail:" << q.lastError().text(); return 1; }
+            // 写一份 拉均重模板 tpl_a（客户级绑定 + 模板级 fallback 覆盖）
+            q.prepare("INSERT OR REPLACE INTO avg_weight_templates"
+                      "(avg_tpl_id,template_id,name,contract_no,avg_pool_max_kg,base_avg_kg,"
+                      " avg_fee_cap_kg,base_fee,step_kg,step_fee,min_tickets,"
+                      " reuse_zone_groups,over_cap_mode,is_active,version,effective_from,effective_to)"
+                      " VALUES"
+                      "('POLAIYA_LAJZ_001','tpl_a','珀莱-拉均重-测试合同','LAJZ-PLY-2026', 2.5, 0.3,"
+                      " 1.5, 3.0, 0.1, 0.15, 5,"   // 只要 5 票就够门槛，基础价 3 元，每 0.1kg 加 0.15，封顶 1.5kg
+                      " 0, 0, 1, 1, '2025-01-01', '2099-12-31')");
+            if (!q.exec()) { qCritical() << "ins lajztpl fail:" << q.lastError().text(); return 1; }
+            // reuse_zone_groups=0：用 avg_weight_zones 直接配省白名单（江苏 + 浙江 + 上海）
+            auto insZone = [&](const QString &prov) {
+                QSqlQuery iq(repo.Database());
+                iq.prepare("INSERT INTO avg_weight_zones (avg_tpl_id, zone_code, province) VALUES (?,?,?)");
+                iq.addBindValue("POLAIYA_LAJZ_001"); iq.addBindValue("华东区"); iq.addBindValue(prov);
+                if (!iq.exec()) { qCritical() << "ins zone fail:" << iq.lastError().text() << prov; return false; }
+                return true;
+            };
+            if (!insZone("江苏")) return 1;
+            if (!insZone("浙江")) return 1;
+            if (!insZone("上海")) return 1;
+            qInfo() << "   [7.1] 写入合同 POLAIYA_LAJZ_001：基础价 3.0 + 步 0.1kg/0.15 元，封顶 1.5kg，5 票即可进池，进池省=江浙沪";
+        }
+        // 7.2 重新 SyncRulesSqliteToDuckDB 后再 ReloadRules（模拟 CalcBatch 开始时会 ReloadRules）
+        SyncRulesSqliteToDuckDB(repo, rulesDb);
+        dbm.ReloadRules(rulesDb);
+
+        // 7.3 构造 10 条 客户A + 1 条上海（全部命中 0.5kg 小件 → 按合同池均重≈0.5 定价≈ 3.0 + ceil((0.5-0.3)/0.1)*0.15 = 3+2*0.15=3.30）
+        {
+            auto con2 = dbm.CreateConnection();
+            con2.Query("DROP TABLE IF EXISTS _lajz_in");
+            con2.Query(R"SQL(
+CREATE TABLE _lajz_in (
+    order_id VARCHAR, dest_province VARCHAR, dest_city VARCHAR,
+    weight DOUBLE, vol_weight DOUBLE, customer_id VARCHAR
+);
+INSERT INTO _lajz_in VALUES
+  ('L1','江苏','苏州', 0.5, 0, 'cA'),
+  ('L2','江苏','南京', 0.5, 0, 'cA'),
+  ('L3','江苏','无锡', 0.5, 0, 'cA'),
+  ('L4','江苏','常州', 0.5, 0, 'cA'),
+  ('L5','江苏','南通', 0.5, 0, 'cA'),
+  ('L6','浙江','杭州', 0.6, 0, 'cA'),
+  ('L7','浙江','宁波', 0.4, 0, 'cA'),
+  ('L8','上海','浦东', 0.5, 0, 'cA'),
+  ('L9','上海','徐汇', 0.5, 0, 'cA'),
+  ('L10','江苏','盐城', 0.5, 0, 'cA'),
+  ('X1','江苏','南京', 3.0, 0, 'cA');   -- 江苏在方案B白名单中，但 charge_weight=3.0 > 合同池上限 2.5 → lajz_in_pool_raw=FALSE → 退回 tpl_a 阶梯首8+续重（3.0-首1kg）=8+CEIL(2.0/1)*3 = 8+6=14元
+)SQL");
+        }
+
+        // 7.4 enable=FALSE（关）→ 必须全走阶梯价，L1 基础运费=11
+        {
+            services::CalcService cs2;
+            if (!cs2.CalcBatch("_lajz_in", "_lajz_off", false)) { qCritical() << "CalcBatch off fail"; return 1; }
+            auto con3 = dbm.CreateConnection();
+            auto r_off = con3.Query(R"SQL(SELECT "订单号","目的省份","基础运费","是否采用拉均重价","是否命中拉均重池" FROM _lajz_off ORDER BY "订单号")SQL");
+            for (size_t i = 0; i < r_off->RowCount(); ++i) {
+                QString oid = QString::fromStdString(r_off->GetValue(0,i).ToString());
+                QString prov = QString::fromStdString(r_off->GetValue(1,i).ToString());
+                double  bf   = r_off->GetValue(2,i).GetValue<double>();
+                QString used = QString::fromStdString(r_off->GetValue(3,i).ToString());
+                QString inpool = QString::fromStdString(r_off->GetValue(4,i).ToString());
+                if (oid == "L1") {
+                    ASSERT_NEAR(bf, 8.0, "off_L1 bf阶梯首1kg=8");
+                    if (used != "否") { qCritical() << "off_L1 采用拉均重价必须是否，got=" << used; return 1; }
+                    if (inpool != "否") { qCritical() << "off_L1 是否命中拉均重池必须是否，got=" << inpool; return 1; }
+                    qInfo() << "   ✅ 开关关：L1 是否采用=" << used << "，命中池=" << inpool << "，基础运费=" << bf << "（阶梯首1kg）";
+                }
+            }
+        }
+
+        // 7.5 enable=TRUE（开）→ L1~L10 进池，池均重≈0.5kg，基础价≈3.30；X1北京不进池=11；"是否采用拉均重价=是" 必须命中
+        {
+            services::CalcService cs3;
+            if (!cs3.CalcBatch("_lajz_in", "_lajz_on", true)) { qCritical() << "CalcBatch on fail"; return 1; }
+            auto con4 = dbm.CreateConnection();
+            auto r_on = con4.Query(R"SQL(SELECT "订单号","目的省份","基础运费","是否采用拉均重价","是否命中拉均重池","拉均重池平均重量(KG)","拉均重单票基础价(元)" FROM _lajz_on ORDER BY "订单号")SQL");
+            qInfo() << "   -- enable=TRUE 全部结果：--";
+            for (size_t i = 0; i < r_on->RowCount(); ++i) {
+                QString oid = QString::fromStdString(r_on->GetValue(0,i).ToString());
+                QString prov = QString::fromStdString(r_on->GetValue(1,i).ToString());
+                double bf = r_on->GetValue(2,i).GetValue<double>();
+                QString used = QString::fromStdString(r_on->GetValue(3,i).ToString());
+                QString inp = QString::fromStdString(r_on->GetValue(4,i).ToString());
+                double avgkg = r_on->GetValue(5,i).GetValue<double>();
+                double lajz_bf = r_on->GetValue(6,i).GetValue<double>();
+                qInfo().noquote() << QString("      %1 %2 基础费=%3  是否用拉=%4  进池=%5  池均重=%6  拉单票=%7")
+                                         .arg(oid,-5).arg(prov,-4).arg(bf,0,'f',2)
+                                         .arg(used,-4).arg(inp,-4).arg(avgkg,0,'f',4).arg(lajz_bf,0,'f',2);
+            }
+            // L1 必须：采用拉=是，命中池=是，基础费≈3.3
+            {
+                auto rL1 = con4.Query(R"SQL(SELECT "是否采用拉均重价","是否命中拉均重池","基础运费","拉均重单票基础价(元)" FROM _lajz_on WHERE "订单号"='L1')SQL");
+                if (rL1->RowCount() == 0) { qCritical() << "L1 not found!"; return 1; }
+                QString u = QString::fromStdString(rL1->GetValue(0,0).ToString());
+                QString i = QString::fromStdString(rL1->GetValue(1,0).ToString());
+                double bf  = rL1->GetValue(2,0).GetValue<double>();
+                double lbf = rL1->GetValue(3,0).GetValue<double>();
+                if (u != "是") { qCritical() << "FAIL：L1 是否采用拉均重价 必须是，got=" << u; return 1; }
+                if (i != "是") { qCritical() << "FAIL：L1 是否命中拉均重池 必须是，got=" << i; return 1; }
+                // 期望：池均重≈0.5 → 3.0 + ceil((0.5-0.3)/0.1)*0.15 = 3+2*0.15 = 3.30
+                ASSERT_NEAR(lbf, 3.30, "L1 lajz_single_ticket≈3.30");
+                ASSERT_NEAR(bf,  3.30, "L1 final_base_fee≈3.30 (拉均重价已覆盖阶梯)");
+                qInfo() << "   ✅ 开关开：L1 采用拉均重价，基础价被覆盖为" << bf << "元（原阶梯 11 元 ↓↓↓）";
+            }
+            // X1 江苏 3kg：charge_weight=3.0 > pool_max=2.5 → 进池=否，采用拉=否，基础费=阶梯 8 + CEIL(2.0/1)*3 = 14 元
+            {
+                auto rX1 = con4.Query(R"SQL(SELECT "是否采用拉均重价","是否命中拉均重池","基础运费","计费重量(KG)" FROM _lajz_on WHERE "订单号"='X1')SQL");
+                QString u = QString::fromStdString(rX1->GetValue(0,0).ToString());
+                QString i = QString::fromStdString(rX1->GetValue(1,0).ToString());
+                double bf  = rX1->GetValue(2,0).GetValue<double>();
+                double cw  = rX1->GetValue(3,0).GetValue<double>();
+                if (u != "否") { qCritical() << "FAIL：X1 是否采用拉均重价 必须否（超池重），got=" << u; return 1; }
+                if (i != "否") { qCritical() << "FAIL：X1 是否命中拉均重池 必须否（超池重），got=" << i; return 1; }
+                ASSERT_NEAR(cw, 3.0, "X1 3.0→0.1进一=3.0");
+                ASSERT_NEAR(bf, 14.0, "X1 江苏超池重 → 阶梯首8+续2kg*3=14");
+                qInfo() << "   ✅ 开关开：X1 江苏 3kg（超池上限2.5）→ 不进池，维持阶梯 14 元（计费重" << cw << "kg）";
+            }
+        }
+    }
+
+    // ========== 测试7.1：SqliteRuleRepository 层面直连——SaveAvgWeightTemplate + SetAvgWeightTplGroups/Excludes/Zones，验证主表+三张子表写库不报错（放在T7之后/T8之前，防止T8 return 1 导致 T7.1 根本不运行）==========
+    qInfo() << "\n=========【测试7.1】SqliteRuleRepository 层：保存拉均重合同/分区/排除省/自定义省（DB 直连写入）=========";
+    {
+        const QString avg_tpl_id = "UT_LAJZ_DIRECT_001";
+        QVariantMap tpl;
+        tpl["avg_tpl_id"] = avg_tpl_id;
+        tpl["name"] = "UT 直接写库测试合同";
+        tpl["contract_no"] = "UT-001";
+        tpl["template_id"] = "tpl_a";
+        tpl["version"] = 1;
+        tpl["effective_from"] = "2025-01-01";
+        tpl["effective_to"] = "2099-12-31";
+        tpl["base_avg_kg"] = 0.3;
+        tpl["avg_pool_max_kg"] = 2.5;
+        tpl["avg_fee_cap_kg"] = 1.5;
+        tpl["base_fee"] = 3.0;
+        tpl["step_kg"] = 0.1;
+        tpl["step_fee"] = 0.15;
+        tpl["min_tickets"] = 5;
+        tpl["over_cap_mode"] = 0;
+        tpl["reuse_zone_groups"] = 1;
+        tpl["is_active"] = 1;
+        bool ok1 = repo.SaveAvgWeightTemplate(tpl);
+        if (!ok1) { qCritical() << "FAIL 7.1.1 SaveAvgWeightTemplate 失败"; return 1; }
+        qInfo() << "   ✅ 7.1.1 主行 SaveAvgWeightTemplate 成功：avg_tpl_id=" << avg_tpl_id;
+
+        QVariantList groups;
+        auto addG = [&](const QString &tid, const QString &gc) {
+            QVariantMap g;
+            g["template_id"] = tid; g["group_code"] = gc;
+            groups << g;
+        };
+        addG("tpl_a", "Z1");
+        addG("tpl_a", "Z2");
+        bool ok2 = repo.SetAvgWeightTplGroups(avg_tpl_id, groups);
+        if (!ok2) { qCritical() << "FAIL 7.1.2 SetAvgWeightTplGroups 失败"; return 1; }
+        auto rgroups = repo.GetAvgWeightTplGroups(avg_tpl_id);
+        if (rgroups.size() != 2) { qCritical() << "FAIL 7.1.2 Get 回来 size!=2，实际=" << rgroups.size(); return 1; }
+        qInfo() << "   ✅ 7.1.2 SetAvgWeightTplGroups 成功，DB 实际行数=" << rgroups.size();
+
+        QVariantList excl;
+        auto addE = [&](const QString &tid, const QString &gc, const QString &p) {
+            QVariantMap e;
+            e["template_id"] = tid; e["group_code"] = gc; e["province"] = p;
+            excl << e;
+        };
+        addE("tpl_a", "Z1", "上海");
+        addE("tpl_a", "Z2", "福建");
+        bool ok3 = repo.SetAvgWeightExcludes(avg_tpl_id, excl);
+        if (!ok3) { qCritical() << "FAIL 7.1.3 SetAvgWeightExcludes 失败"; return 1; }
+        auto rexcl = repo.GetAvgWeightExcludes(avg_tpl_id);
+        if (rexcl.size() != 2) { qCritical() << "FAIL 7.1.3 Get 回来 size!=2，实际=" << rexcl.size(); return 1; }
+        qInfo() << "   ✅ 7.1.3 SetAvgWeightExcludes 成功，DB 实际行数=" << rexcl.size();
+
+        QVariantList zones;
+        QVariantMap z1; z1["zone_code"] = "__global__";
+        z1["provinces"] = QStringList{"江苏", "浙江", "上海", "安徽"};
+        zones << z1;
+        bool ok4 = repo.SetAvgWeightTplGroups(avg_tpl_id, QVariantList());
+        bool ok5 = repo.SetAvgWeightExcludes(avg_tpl_id, QVariantList());
+        bool ok6 = repo.SetAvgWeightZones(avg_tpl_id, zones);
+        if (!ok4 || !ok5 || !ok6) { qCritical() << "FAIL 7.1.4 清空A并写方案B失败：ok4=" << ok4 << "ok5=" << ok5 << "ok6=" << ok6; return 1; }
+        auto rzones = repo.GetAvgWeightZones(avg_tpl_id);
+        if (rzones.size() != 1) { qCritical() << "FAIL 7.1.4 zones 条数!=1，实际=" << rzones.size(); return 1; }
+        QStringList provs = rzones[0].toMap()["provinces"].toStringList();
+        if (provs.size() != 4) { qCritical() << "FAIL 7.1.4 zone 省个数!=4，实际=" << provs; return 1; }
+        qInfo() << "   ✅ 7.1.4 SetAvgWeightZones 成功，DB 实际 zones[0] 省个数=" << provs.size() << "，provs=" << provs.join(",");
+        qInfo() << "   ✅ 测试7.1：SqliteRuleRepository 直连 4 个子操作 + Get 回读全部通过";
+    }
+
+    // ========== 测试8：用户真实场景方案A reuse_zone_groups=1 + 模板级绑定 fallback + 分区组白名单 + 排除省 ==========
+    qInfo() << "\n=========【测试8】方案A（默认）+ 模板级绑定 + 分区勾选 + 排除省  ==========";
+    {
+        // 8.1 重置客户A的客户级外键（模拟用户"没有在客户资料里挂合同，只在合同里选模板=tpl_a 这种模板级绑定"）
+        {
+            QSqlQuery q(repo.Database());
+            q.prepare("UPDATE customers SET avg_weight_tpl_id=NULL WHERE customer_id='cA'");
+            if (!q.exec()) { qCritical() << "reset cust fail:" << q.lastError().text(); return 1; }
+            // 写一份新合同：POLAIYA_TPL_BIND，template_id='tpl_a'（模板级绑定），reuse_zone_groups=1，min_tickets=3
+            q.prepare("INSERT OR REPLACE INTO avg_weight_templates"
+                      "(avg_tpl_id,template_id,name,contract_no,avg_pool_max_kg,base_avg_kg,"
+                      " avg_fee_cap_kg,base_fee,step_kg,step_fee,min_tickets,"
+                      " reuse_zone_groups,over_cap_mode,is_active,version,effective_from,effective_to)"
+                      " VALUES"
+                      "('POL_TPL_001','tpl_a','珀莱-模板级绑定测试','LAJZ-TPL-001', 2.5, 0.3,"
+                      " 1.5, 2.7, 0.1, 0.12, 3,"   // 3 票即可，基础价 2.7，每 0.1kg 0.12，封顶 1.5
+                      " 1, 0, 1, 1, '2025-01-01', '2099-12-31')");
+            if (!q.exec()) { qCritical() << "ins POL_TPL_001 fail:" << q.lastError().text(); return 1; }
+            // 方案A：勾选模板分区 tpl_a 的 Z1（只有Z1，大写！），并再新建 Z2 但 tpl_a 原本没有 Z2，就只勾 Z1 模拟"全勾"
+            QVariantList tplGroups;
+            auto addGrp = [&](const QString &tid, const QString &gcode) {
+                QVariantMap m; m["template_id"]=tid; m["group_code"]=gcode; tplGroups << m;
+            };
+            addGrp("tpl_a", "Z1");   // 勾选 Z1（江浙沪 zone1=江浙沪 3省）
+            if (!repo.SetAvgWeightTplGroups("POL_TPL_001", tplGroups)) { qCritical() << "SetTplGrp fail"; return 1; }
+            // 方案A排除省：Z1 下 排除 上海（上海不进池）
+            QVariantList excl;
+            auto addExcl = [&](const QString &tid, const QString &gcode, const QString &prov) {
+                QVariantMap m; m["template_id"]=tid; m["group_code"]=gcode; m["province"]=prov; excl << m;
+            };
+            addExcl("tpl_a", "Z1", "上海");  // Z1 下排除 上海
+            if (!repo.SetAvgWeightExcludes("POL_TPL_001", excl)) { qCritical() << "SetExcl fail"; return 1; }
+            qInfo() << "   [8.1] 新合同 POL_TPL_001：模板级绑定 tpl_a，方案A勾选 Z1(江浙沪)，Z1排除省=上海，min_tickets=3，2.7+0.12/0.1kg 封顶1.5kg";
+        }
+        // 8.2 强制 reload
+        SyncRulesSqliteToDuckDB(repo, rulesDb);
+        dbm.ReloadRules(rulesDb);
+        // 8.3 构造 5 条：江苏/浙江/上海/安徽/山东 → L1江苏进池、L2浙江进池、L3上海EXCLUDED不进池、L4安徽zone2进池、L5山东zone2进池
+        {
+            auto con = dbm.CreateConnection();
+            con.Query("DROP TABLE IF EXISTS _t8in");
+            con.Query(R"SQL(
+CREATE TABLE _t8in (
+    order_id VARCHAR, dest_province VARCHAR, dest_city VARCHAR,
+    weight DOUBLE, vol_weight DOUBLE, customer_id VARCHAR
+);
+INSERT INTO _t8in VALUES
+  ('T8L1','江苏','苏州', 0.5, 0, 'cA'),   -- Z1 江浙沪 → 勾选 → 不排除（只排除上海）→ 进池
+  ('T8L2','浙江','杭州', 0.5, 0, 'cA'),   -- Z1 → 勾选 → 进池
+  ('T8L3','上海','浦东', 0.5, 0, 'cA'),   -- Z1 → 勾选但 上海在排除省 → 不进池（阶梯 8）
+  ('T8L4','江苏','南京', 0.4, 0, 'cA'),   -- Z1 → 勾选 → 进池（3 票 ≥ 门槛 3）
+  ('T8X2','福建','福州', 0.5, 0, 'cA');   -- 福建不在 tpl_a Z1 列表 → group_code 空 → 进池=否（阶梯匹配失败 → base_fee=0 正常，不影响拉均重判定）
+)
+)SQL");
+        }
+        // 8.4 enable=TRUE 跑批
+        {
+            services::CalcService cs;
+            if (!cs.CalcBatch("_t8in", "_t8out", true)) { qCritical() << "CalcBatch t8 fail"; return 1; }
+            auto con = dbm.CreateConnection();
+            // 先看有多少行 + 订单号列名到底是什么（防止列名不一致造成找不到）
+            {
+                auto rc = con.Query("SELECT COUNT(*) AS c FROM _t8out");
+                long long cnt = (rc && rc->RowCount()) ? rc->GetValue(0,0).GetValue<long long>() : -1;
+                qInfo() << "   _t8out rows=" << cnt;
+                if (cnt <= 0) {
+                    auto rci = con.Query("SELECT COUNT(*) FROM _t8in");
+                    qInfo() << "     输入表 _t8in rows=" << (rci && rci->RowCount() ? rci->GetValue(0,0).GetValue<long long>() : -1);
+                }
+            }
+            auto rs = con.Query(R"SQL(SELECT "订单号","目的省份","是否命中拉均重池","是否采用拉均重价","基础运费","拉均重单票基础价(元)","拉均重池有效票数/门槛","拉均重池平均重量(KG)" FROM _t8out ORDER BY "订单号")SQL");
+            qInfo() << "   -- 测试8 enable=TRUE 结果：--";
+            for (size_t i = 0; i < rs->RowCount(); ++i) {
+                QString o = QString::fromStdString(rs->GetValue(0,i).ToString());
+                QString p = QString::fromStdString(rs->GetValue(1,i).ToString());
+                QString hit = QString::fromStdString(rs->GetValue(2,i).ToString());
+                QString use = QString::fromStdString(rs->GetValue(3,i).ToString());
+                double bf = rs->GetValue(4,i).GetValue<double>();
+                double lbf = rs->GetValue(5,i).GetValue<double>();
+                QString nt = QString::fromStdString(rs->GetValue(6,i).ToString());
+                double avgk = rs->GetValue(7,i).GetValue<double>();
+                qInfo().noquote() << QString("      %1 %2 命中=%3 用拉=%4 基础费=%5 拉单票=%6 票/槛=%7 池均=%8")
+                                         .arg(o,-5).arg(p,-4).arg(hit,-4).arg(use,-4)
+                                         .arg(bf,0,'f',2).arg(lbf,0,'f',2).arg(nt,-8).arg(avgk,0,'f',3);
+            }
+            // 核心断言：T8L1 江苏 → 进池 + 采用拉均重价，基础费≈ 2.7 + ceil((0.5-0.3)/0.1)*0.12 = 2.7 + 2*0.12 = 2.94
+            {
+                auto r = con.Query(R"SQL(SELECT "是否命中拉均重池","是否采用拉均重价","基础运费" FROM _t8out WHERE "订单号"='T8L1')SQL");
+                if (r->RowCount()==0) { qCritical() << "T8L1 miss"; return 1; }
+                QString h = QString::fromStdString(r->GetValue(0,0).ToString());
+                QString u = QString::fromStdString(r->GetValue(1,0).ToString());
+                double bf = r->GetValue(2,0).GetValue<double>();
+                if (h != "是") { qCritical() << "FAIL T8L1 命中必须是，got=" << h; return 1; }
+                if (u != "是") { qCritical() << "FAIL T8L1 采用必须是，got=" << u; return 1; }
+                ASSERT_NEAR(bf, 2.94, "T8L1 基础费≈2.7+2*0.12=2.94");
+                qInfo() << "   ✅ T8L1（江苏 zone1 勾选+不排除）：进池+采用拉均重价，基础价" << bf << "元";
+            }
+            // T8L3 上海 → 命中="否"（被排除），基础费=8
+            {
+                auto r = con.Query(R"SQL(SELECT "是否命中拉均重池","是否采用拉均重价","基础运费" FROM _t8out WHERE "订单号"='T8L3')SQL");
+                QString h = QString::fromStdString(r->GetValue(0,0).ToString());
+                QString u = QString::fromStdString(r->GetValue(1,0).ToString());
+                double bf = r->GetValue(2,0).GetValue<double>();
+                if (h != "否") { qCritical() << "FAIL T8L3 命中必须否（上海被排除），got=" << h; return 1; }
+                if (u != "否") { qCritical() << "FAIL T8L3 采用必须否，got=" << u; return 1; }
+                ASSERT_NEAR(bf, 8.0, "T8L3 上海被排除 → 阶梯 8");
+                qInfo() << "   ✅ T8L3（上海被排除省剔除）：不进池，阶梯 8 元";
+            }
+            // T8X2 福建 → 不在 tpl_a Z1 勾选分区 → group_code 空 → 命中=否（福建没有在 Z1 阶梯里，阶梯 base_fee=0 是正常数据集问题，不影响拉均重进池判定）
+            {
+                auto r = con.Query(R"SQL(SELECT "是否命中拉均重池","是否采用拉均重价" FROM _t8out WHERE "订单号"='T8X2')SQL");
+                QString h = QString::fromStdString(r->GetValue(0,0).ToString());
+                QString u = QString::fromStdString(r->GetValue(1,0).ToString());
+                if (h != "否") { qCritical() << "FAIL T8X2 命中必须否（福建非勾选分区），got=" << h; return 1; }
+                if (u != "否") { qCritical() << "FAIL T8X2 采用必须否，got=" << u; return 1; }
+                qInfo() << "   ✅ T8X2（福建非勾选分区）：不进池";
+            }
+        }
+    }
+
+    qInfo() << "\n🎉 全部 8 类 断言全部通过！✅\n";
     // cleanup
     QDir(tmpDir).removeRecursively();
     return 0;

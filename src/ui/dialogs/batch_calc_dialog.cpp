@@ -5,6 +5,7 @@
 #include "ui/dialogs/fee_breakdown_dialog.hpp"
 #include "ui/dialogs/diff_report_dialog.hpp"
 #include "ui/dialogs/courier_template_manager_dialog.hpp"
+#include "ui/dialogs/rule_setting_dialog.hpp"
 #include "services/calc_service.hpp"
 #include "services/history_service.hpp"
 #include "services/template_recognizer.hpp"
@@ -179,12 +180,40 @@ QPushButton { padding: 5px 14px; border-radius: 6px; border: 1px solid #67c23a; 
 QPushButton:hover { background: #f0f9eb; border-color: #67c23a; color: #67c23a; }
     )QSS");
     connect(btn_manage_tpl, &QPushButton::clicked, this, &BatchCalcDialog::OnManageTemplates);
+
+    auto *btn_lajz_contract = new QPushButton("📋 拉均重合同");
+    btn_lajz_contract->setCursor(Qt::PointingHandCursor);
+    btn_lajz_contract->setStyleSheet(R"QSS(
+QPushButton { padding: 5px 14px; border-radius: 6px; border: 1px solid #409eff; color: #409eff;
+    background: white; font-size: 12px; font-weight: 500; }
+QPushButton:hover { background: #ecf5ff; border-color: #409eff; color: #409eff; }
+    )QSS");
+    connect(btn_lajz_contract, &QPushButton::clicked, this, [this]() {
+        auto *dlg = new RuleSettingDialog(this);
+        dlg->OpenAvgWeightTab();
+        dlg->exec();
+        dlg->deleteLater();
+    });
+
     chk_show_diff_ = new QCheckBox("📊 重算生成差异报告 (S7)");
     chk_show_diff_->setChecked(true);
     chk_show_diff_->setCursor(Qt::PointingHandCursor);
     chk_show_diff_->setStyleSheet(chk_detect_template_->styleSheet());
+
+    chk_enable_avg_weight_ = new QCheckBox("⚖️ 启用拉均重合同定价");
+    chk_enable_avg_weight_->setChecked(false);
+    chk_enable_avg_weight_->setCursor(Qt::PointingHandCursor);
+    chk_enable_avg_weight_->setStyleSheet("QCheckBox { font-size: 13px; color: #606266; spacing: 8px; }"
+                                          "QCheckBox::indicator { width: 16px; height: 16px; }");
+    chk_enable_avg_weight_->setToolTip(
+        "默认禁用。勾选后，对签有拉均重合同的客户/模板，\n"
+        "将按池均重 + 阶梯封顶模式重新定价（可能低于常规阶梯价）。\n"
+        "※ 每次计算前会自动加载最新合同，无需重启程序。");
+
     opts_row->addWidget(chk_detect_template_);
     opts_row->addWidget(btn_manage_tpl);
+    opts_row->addWidget(btn_lajz_contract);
+    opts_row->addWidget(chk_enable_avg_weight_);
     opts_row->addWidget(chk_show_diff_);
     opts_row->addStretch();
     form_layout->addRow("", opts_row);
@@ -552,6 +581,16 @@ void BatchCalcDialog::OnStartCalc() {
     cfg.AddRecentFile(input);
     qDebug() << "Resolved output path:" << output;
 
+    // DEBUG-01 关键修复：每次批量计算前强制重新加载 SQLite → DuckDB 规则表
+    try {
+        auto &dbm_pre = db::DuckDBManager::Instance();
+        dbm_pre.ReloadRules(cfg.GetRulesDbPath());
+    } catch (const std::exception &re) {
+        qWarning() << "[BatchCalc] ReloadRules skipped:" << re.what();
+    }
+    const bool enable_avg_weight = chk_enable_avg_weight_ != nullptr && chk_enable_avg_weight_->isChecked();
+    qDebug() << "[BatchCalc] enable_avg_weight =" << enable_avg_weight;
+
     btn_start_->setEnabled(false);
     progress_->setValue(10);
     lbl_status_->setText("正在读取文件...");
@@ -654,7 +693,8 @@ void BatchCalcDialog::OnStartCalc() {
     QFuture<CalcContext> future = QtConcurrent::run(
         [input, output, normalized_table, output_table,
          prev_fee = last_total_fee_, prev_rows = last_rows_,
-         show_diff = chk_show_diff_->isChecked()]() -> CalcContext {
+         show_diff = chk_show_diff_->isChecked(),
+         enable_avg_weight]() -> CalcContext {
             CalcContext ctx;
             ctx.normalized_table = normalized_table;
             ctx.output_table = output_table;
@@ -669,8 +709,10 @@ void BatchCalcDialog::OnStartCalc() {
             t.start();
             try {
                 services::CalcService svc;
+                qCritical() << "[DIAG] BatchCalc lambda captured: enable_avg_weight =" << enable_avg_weight
+                            << "（show_diff=" << show_diff << "，input_table=" << normalized_table << "）";
                 auto &db = db::DuckDBManager::Instance();
-                if (!svc.CalcBatch(normalized_table, output_table)) {
+                if (!svc.CalcBatch(normalized_table, output_table, enable_avg_weight)) {
                     ctx.error_title = "失败";
                     ctx.error_msg =
                         "计算失败，请检查：\n"

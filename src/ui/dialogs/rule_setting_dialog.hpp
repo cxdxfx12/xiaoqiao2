@@ -16,6 +16,7 @@ public:
     ~RuleSettingDialog() override;
 
     void OpenMappingTab();
+    void OpenAvgWeightTab();
 
 private slots:
     void OnFuelItemClicked(int row, int col);
@@ -28,6 +29,11 @@ private slots:
     void OnFuelFilterChanged(int idx);
     void OnRemoteFilterChanged(int idx);
     void OnSurchargeFilterChanged(int idx);
+    void OnLajzItemClicked(int row, int col);
+    void OnLajzAdd();
+    void OnLajzEdit();
+    void OnLajzDel();
+    void OnLajzToggle(bool active);
 
 private:
     void SetupUI();
@@ -35,9 +41,12 @@ private:
     void ShowSurchargeDialog(bool is_add);
     void ShowFuelDialog(bool is_add);
     void ShowRemoteDialog(bool is_add);
+    void ShowLajzDialog(bool is_add);
 
     void SetupMappingTab(QWidget *tab);
     void LoadMappingTable();
+    void SetupLajzTab(QWidget *tab);
+    void LoadLajzTable();
 
     QTabWidget *tab_widget_ = nullptr;
     QTableWidget *tpl_table_ = nullptr;
@@ -45,6 +54,7 @@ private:
     QTableWidget *fuel_table_ = nullptr;
     QTableWidget *remote_table_ = nullptr;
     QTableWidget *mapping_table_ = nullptr;
+    QTableWidget *lajz_table_ = nullptr;
     QPushButton *btn_close_ = nullptr;
     QPushButton *btn_apply_ = nullptr;
 
@@ -59,6 +69,7 @@ private:
     QLineEdit *ed_mapping_quick_kw_ = nullptr;
 
     int mapping_tab_idx_ = -1;
+    int lajz_tab_idx_ = -1;
 };
 
 } // namespace freight::ui::dialogs
