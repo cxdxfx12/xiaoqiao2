@@ -530,13 +530,68 @@ bool CalcService::CalcBatch(const QString &input_table,
                             const QString &output_table,
                             bool enable_avg_weight) {
     try {
-        emit ProgressChanged(5);
+        emit ProgressChanged(2);
+        auto &cfg = core::AppConfig::Instance();
         auto &dbm = db::DuckDBManager::Instance();
+        // 防御性：CalcBatch 外部直接调用时（不走 CalcFromFile），也要确保规则表已 reload
+        //   T8 集成测试 + 单条计算对话框都可能直接调用 CalcBatch 而未先 ReloadRules，
+        //   这会导致 DuckDB 找不到 customers/freight_templates/avg_weight_templates 报 Catalog Error
+        try {
+            dbm.ReloadRules(cfg.GetRulesDbPath());
+        } catch (const std::exception &re) {
+            qWarning() << "[CalcBatch] ReloadRules skipped:" << re.what();
+        }
+        emit ProgressChanged(5);
         auto con = dbm.CreateConnection();
 
         QString sql = BuildCalcSQL(input_table, output_table, enable_avg_weight);
         emit ProgressChanged(15);
-        con.Query(sql.toStdString());
+        // ========= 关键修复：检查 CREATE TABLE 的 Query 返回值 =========
+        //   原代码没检查 Result 是否为 nullptr / 是否含 Error；SQL 语法错/列不匹配只会被吞掉返回 true
+        auto qresult = con.Query(sql.toStdString());
+        bool sql_exec_ok = (bool)qresult;
+        long long qr_rows = qresult ? (long long)qresult->RowCount() : -1;
+        QString qr_lasterr;
+        // 防御性：用同一个 connection 再查一次 output 是否存在；失败则说明 SQL 其实报错了（DuckDB 有时 CREATE TABLE AS 失败不会抛异常，只在 Result 里体现）
+        try {
+            auto probe = con.Query(QString("SELECT COUNT(*) FROM %1").arg(output_table).toStdString());
+            if (!probe || probe->RowCount()==0) sql_exec_ok = false;
+            else {
+                auto pc = probe->GetValue(0,0);
+                // 只要能查询就认为 OK（行数为 0 也行）
+            }
+        } catch (const std::exception &pe) {
+            sql_exec_ok = false;
+            qr_lasterr = QString::fromStdString(pe.what());
+        } catch (...) {
+            sql_exec_ok = false;
+        }
+        if (!sql_exec_ok) {
+            const QString err = QStringLiteral("DuckDB Calc SQL 执行失败（输出表未生成）");
+            qCritical() << "[CalcBatch FAIL]" << err << " enable_avg_weight=" << enable_avg_weight
+                        << " output_table=" << output_table
+                        << " qresult.valid=" << (bool)qresult
+                        << " qresult.RowCount=" << qr_rows
+                        << " probe.exception=" << qr_lasterr;
+            // 调试：写 SQL 到 /tmp 方便 duckdb CLI 复现
+            QFile dump(QStringLiteral("/tmp/_calc_debug_%1.sql").arg(output_table));
+            if (dump.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                dump.write(sql.toUtf8());
+                dump.close();
+                qCritical() << "    调试用 SQL 文件：" << QFileInfo(dump).absoluteFilePath();
+            }
+            // 打印关键片段：__lajz_global 前 800 字符，以及 avg_weight_pool_in（进池判断）前后 2000 字符
+            int idx = sql.indexOf("avg_weight_pool_in AS (");
+            qCritical() << "    === 调试片段 1/2（SQL 前 2000 字符）===\n" << sql.left(2000);
+            if (idx >= 0) {
+                qCritical() << "    === 调试片段 2/2（avg_weight_pool_in 进池判断 前后 2500 字符）===\n"
+                            << sql.mid(qMax(0, idx-300), 3200);
+            } else {
+                qCritical() << "    （SQL 中找不到 avg_weight_pool_in AS，打印后 3000 字符）\n" << sql.right(3000);
+            }
+            emit CalcFinished(false, err);
+            return false;
+        }
 
         // 诊断：当输出为空或输入行丢失时打印 enable_avg_weight + SQL 片段，便于定位门控/进池判定问题
     try {
@@ -548,13 +603,32 @@ bool CalcService::CalcBatch(const QString &input_table,
             if (cnt == 0) {
                 qWarning() << "[CalcBatch WARN] output=" << output_table << "ROWS=" << cnt
                            << "（input_rows=" << in_cnt << "，enable_avg_weight=" << enable_avg_weight << "）";
-                qWarning() << "                SQL 前 1500 字符：\n" << sql.left(1500);
-                qWarning() << "                SQL 后 1500 字符：\n" << sql.right(1500);
+                qWarning() << "                SQL 前 2000 字符：\n" << sql.left(2000);
+                qWarning() << "                SQL 后 4000 字符：\n" << sql.right(4000);
             } else if (in_cnt > 0 && cnt != in_cnt && cnt != 0) {
                 qDebug() << "[CalcBatch] rows：input=" << in_cnt << " output=" << cnt
                          << "（enable_avg_weight=" << enable_avg_weight << "）";
             }
+        } else {
+            // 输出表甚至都不存在（CREATE TABLE 静默失败的情况）— 用第二个独立 con 再创建一次临时表试，尝试捕获原始 DuckDB SQL 错误
+            qCritical() << "[CalcBatch FAIL] SELECT COUNT 查询空表 " << output_table
+                        << " enable_avg_weight=" << enable_avg_weight;
+            qCritical() << "    尝试在 /tmp/_t8_debug.sql 写入 SQL 后独立执行，检查 DuckDB 原错误:";
+            QFile dump(QStringLiteral("/tmp/_calc_debug_%1.sql").arg(output_table));
+            if (dump.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                dump.write(sql.toUtf8());
+                dump.close();
+                qCritical() << "    SQL 已写入：" << QFileInfo(dump).absoluteFilePath();
+            }
+            qCritical() << "    SQL(前2000字符):\n" << sql.left(2000);
+            qCritical() << "    SQL(后4000字符):\n" << sql.right(4000);
+            emit CalcFinished(false, QStringLiteral("输出表未生成，请查看日志/Debug SQL文件"));
+            return false;
         }
+    } catch(const std::exception &chk_e) {
+        qCritical() << "[CalcBatch CHECK] exception: " << chk_e.what();
+        emit CalcFinished(false, QString::fromStdString(chk_e.what()));
+        return false;
     } catch(...) {}
 
         emit ProgressChanged(100);
@@ -563,6 +637,10 @@ bool CalcService::CalcBatch(const QString &input_table,
     } catch (const std::exception &e) {
         qCritical() << "CalcBatch failed:" << e.what();
         emit CalcFinished(false, QString::fromStdString(e.what()));
+        return false;
+    } catch (...) {
+        qCritical() << "CalcBatch failed: unknown exception";
+        emit CalcFinished(false, QStringLiteral("未知错误，请查看控制台日志"));
         return false;
     }
 }
@@ -747,20 +825,22 @@ avg_weight_pool_in AS (
                 (
                    awj.group_code IS NOT NULL
                    AND (
-                         EXISTS (SELECT 1 FROM avg_weight_zone_tpl_groups gt
-                                 WHERE gt.avg_tpl_id  = awj.lajz_avg_tpl_id
-                                   AND (gt.template_id = awj.template_id OR gt.template_id='*' OR gt.template_id=''))
-                               = FALSE
+                         -- 子场景 A-1：本合同完全没勾选任何「模板级分区组」 → 视为「全部开放」（老合同/通配），省只要在阶梯表里有 group_code 就进
+                         NOT EXISTS (SELECT 1 FROM avg_weight_zone_tpl_groups gt0
+                                     WHERE gt0.avg_tpl_id = awj.lajz_avg_tpl_id)
                          OR
+                         -- 子场景 A-2：有勾选分区组 → 严格命中分区组：gt.group_code = awj.group_code
+                         --   注意：gt.template_id 字段仅是 UI 展示用（标记该组来自哪个模板），不参与过滤！
+                         --         因为同一个合同可能给多个客户共用，勾选哪组就哪组生效，不应和订单归属模板再比一次
                          EXISTS (SELECT 1 FROM avg_weight_zone_tpl_groups gt
                                  WHERE gt.avg_tpl_id  = awj.lajz_avg_tpl_id
-                                   AND (gt.template_id = awj.template_id OR gt.template_id='*' OR gt.template_id='')
                                    AND gt.group_code  = awj.group_code)
                    )
                    AND
+                   -- 公共：该省未在排除省名单（分区一致 + 省份规范化后相同）
+                   --   注意：ex.template_id 字段同样仅 UI 展示用（标记该组来自哪个模板），不参与过滤
                    NOT EXISTS (SELECT 1 FROM avg_weight_zone_excludes ex
                                WHERE ex.avg_tpl_id  = awj.lajz_avg_tpl_id
-                                 AND (ex.template_id = awj.template_id OR ex.template_id='*' OR ex.template_id='')
                                  AND ex.group_code  = awj.group_code
                                  AND REGEXP_REPLACE(ex.province, '(省|市|维吾尔自治区|回族自治区|壮族自治区|自治区)$', '')
                                    = awj.norm_province)
@@ -942,7 +1022,7 @@ customer_template_lookup AS (
              THEN c.cust_vol_divisor ELSE NULL END               AS cust_vol_divisor,
         COALESCE(NULLIF(TRIM(c.avg_weight_tpl_id), ''), NULL)    AS cust_avg_weight_tpl_id
     FROM input_data i
-    LEFT JOIN customers c ON c.customer_id = i.customer_id
+    LEFT JOIN customers c ON (TRIM(c.customer_id) = TRIM(i.customer_id) OR TRIM(c.customer_name) = TRIM(i.customer_id))
 ),
 template_info AS (
     SELECT

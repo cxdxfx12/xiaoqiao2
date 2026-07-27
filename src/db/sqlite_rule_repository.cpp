@@ -1242,9 +1242,19 @@ QVariantList SqliteRuleRepository::ListCustomers() {
 QVariantMap SqliteRuleRepository::GetCustomer(const QString &customer_id) {
     QVariantMap m;
     QSqlQuery q(db_);
+    const QString cid = customer_id.trimmed();
+    // 先按主键 customer_id 精确查；查不到再按 customer_name（别名/中文名称）精确 fallback——用户Excel里客户编号列常填中文名
     q.prepare("SELECT * FROM customers WHERE customer_id = ?");
-    q.addBindValue(customer_id);
-    if (q.next()) {
+    q.addBindValue(cid);
+    bool ok = false;
+    if (q.exec() && q.next()) {
+        ok = true;
+    } else {
+        q.prepare("SELECT * FROM customers WHERE TRIM(customer_name) = ?");
+        q.addBindValue(cid);
+        if (q.exec() && q.next()) ok = true;
+    }
+    if (ok) {
         m["customer_id"]        = q.value("customer_id");
         m["customer_name"]      = q.value("customer_name");
         m["discount_rate"]      = q.value("discount_rate").toDouble();

@@ -1,5 +1,9 @@
 # 小乔运费结算系统 - 项目文档
 
+> **🚨 最新改动 2026-07-27 v1.09 — 拉均重真实场景端到端打通！**
+> 🔥 核心修复 2 项：① 订单客户编号填中文名称时匹配不到客户；② 方案A进池资格多一层 template_id 多余过滤导致不命中。
+> 其他升级：CMake 版本号作为唯一真源（改一处自动传播到 Info.plist/GUI 显示/诊断列），billing_params_test T7/T7.1/T8 覆盖方案A/B、排除省、模板级/客户级双绑定。
+
 ## 目录
 
 1. [项目概述](#1-项目概述)
@@ -1217,6 +1221,77 @@ combined = Base64(JSON_payload) + "." + HMAC_HEX
 **现象**：主程序升级四维机器码算法后，发行商仍用旧算法生成的授权码全部不匹配。  
 **修复**：机器码/授权算法变更后**强制同步重新编译打包 license_generator.app**，与主程序同源；文档明确提醒旧算法授权码新版无法使用，老客户需重新采集机器码。
 
+### 9.7 拉均重（平均重量合同定价）相关（2026-07-27 集中修复 6 项）
+
+#### ❌ 坑 20：订单 CSV「客户编号」列填中文名称 → LEFT JOIN 匹配不到客户 → 诊断_合同ID 全空
+
+**真实场景数据**：
+- customers 主键 `customer_id = cust_1785106503_8611`，显示名 `customer_name = 珀莱雅`，客户级绑定 `avg_weight_tpl_id = contract_proya_25q2`（已正确设置）
+- 用户 Excel/CSV 实际填的是「珀莱雅」（中文显示名），不是内部 UUID 式主键
+
+**现象**：`LEFT JOIN customers c ON c.customer_id = i.customer_id` 永远匹配不上 → `cust_avg_weight_tpl_id`/`template_id` 全取默认值 → 拉均重完全不生效，且看起来是"用户没配置"。
+
+**修复（2 处对称）**：
+1. [calc_service.cpp L1030](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L1030) DuckDB 批量计算 SQL：
+   ```sql
+   LEFT JOIN customers c ON (
+     TRIM(c.customer_id) = TRIM(i.customer_id)
+     OR TRIM(c.customer_name) = TRIM(i.customer_id)
+   )
+   ```
+2. [sqlite_rule_repository.cpp L1242-L1255](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/sqlite_rule_repository.cpp#L1242-L1255) `GetCustomer()` 单查（单条计算/前端查询）：主键查不到 → fallback 按 `TRIM(customer_name)=?` 查。
+
+**教训**：凡是用户可见的输入列，**必须同时匹配主键和显示名**，不能假设用户会填内部 UUID。
+
+#### ❌ 坑 21：方案A `avg_weight_zone_tpl_groups.template_id` 参与了资格判断 → 多个客户共用合同或分区来源不同 → 进池资格被误杀
+
+**背景（数据模型设计）**：
+- `avg_weight_zone_tpl_groups.avg_tpl_id`：**真正的绑定列**（哪份拉均重合同）
+- `avg_weight_zone_tpl_groups.template_id`：**UI 展示列**（这个分区组来自哪张运费模板，仅用于前端勾选对话框里标"来源"，不参与业务逻辑）
+
+**现象**：真实数据里，珀莱雅的 `contract_proya_25q2` 在「拉均重合同编辑」里勾选了 zone1，但该 zone1 分区行写入 SQLite 时 `template_id = cust_cust_1784852606_9205`（来自客户「111」的模板）≠ 珀莱雅订单实际归属的 `cust_cust_1785106503_8611`。
+
+**根因 SQL（写反了，多余一层过滤）**：
+```sql
+-- 原错误逻辑：多加了 gt.template_id ∈ {awj.template_id,'*',''} 的硬匹配
+EXISTS (SELECT 1 FROM avg_weight_zone_tpl_groups gt
+  WHERE gt.avg_tpl_id = 合同ID
+    AND (gt.template_id = 订单模板 OR gt.template_id='*' OR gt.template_id='')
+    AND gt.group_code = 分区code)
+```
+→ `template_id` 不相等 → EXISTS = FALSE → 全省被排除 → 8 条订单「是否命中拉均重池 = 否」。
+
+**修复（calc_service.cpp L825-L847）**：把分区资格判断改回**只按 avg_tpl_id + group_code 两列匹配**，完全去掉 gt.template_id / ex.template_id 的过滤（同理 avg_weight_zone_excludes.template_id 也去掉）：
+```sql
+EXISTS (SELECT 1 FROM avg_weight_zone_tpl_groups gt
+         WHERE gt.avg_tpl_id = awj.lajz_avg_tpl_id
+           AND gt.group_code = awj.group_code)
+```
+
+**教训**：一张表的字段要么"参与过滤/命中判断"，要么"仅 UI 展示"，不能混用，否则跨客户共用合同、跨模板导入分区时必然被多余条件误杀。需要文档中**强约束** UI 展示列绝不进 WHERE 子句。
+
+#### ❌ 坑 22：T7 写的合同没有清理，和 T8 新合同同 version 同 template_id → DuckDB `GROUP BY MAX(version)` 随机取一份
+
+**现象**：billing_params_test 测试 T8（方案A分区排除上海）结果有时是对的，有时完全不生效，同一份代码两个分支随机切换，看起来是「DuckDB 非确定性」。
+
+**根因**：T7 先写入 `POLAIYA_LAJZ_001`，T7.1 又写入 `UT_LAJZ_DIRECT_001`，T8 再写 `POL_TPL_001`，三份都是 `template_id='tpl_a'`、`version=1`、`is_active=1`。avg_weight_active 的取最大 version 逻辑里，同 version 多份 → DuckDB 非确定取 → T8 随机拿到前两份之一（POLAIYA_LAJZ_001 是方案B、min_tickets=5，T8 期望 POL_TPL_001 方案A min=3）。
+
+**修复（billing_params_test T8 开头 + 真实使用建议）**：
+- T8 测试开头先循环清理旧合同：从 `avg_weight_templates / zones / zone_tpl_groups / zone_excludes` 四张表 DELETE 掉 UT_LAJZ_DIRECT_001 / POLAIYA_LAJZ_001。
+- 真实生产建议：升级旧合同一律 version++，不要和同 template_id 老合同同 version。
+
+#### ❌ 坑 23：`CalcBatch()` 入口没 `ReloadRules()` → 前端 UI 点了保存 → 后台 DuckDB 还是老分区/老排除省 → "保存了但计算不生效"
+
+**修复**：[calc_service.cpp CalcBatch 入口](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp) 加防御式 `repo.ReloadRules(duckdb_)`，和 CalcFromFile 行为一致，确保 UI 保存 ↔ 批量计算无感知延迟。
+
+#### ❌ 坑 24：批量计算 .app 打包后规则库路径不是 `~/.xiaoqiao_freight/rules.db`，默认落到 QStandardPaths::AppDataLocation
+
+**真实路径（macOS）**：
+```
+/Users/<用户名>/Library/Application Support/杭州喵喵至家网络有限公司/小乔运费结算/rules.db
+```
+直接排障用 `sqlite3` CLI 打开这个路径，不要去看测试工具的 `billing_params_test/rules.db`。
+
 ---
 
 ## 10. 部署与打包
@@ -1270,6 +1345,38 @@ bash xiaoqiao_freight/scripts/deploy_mac.sh build/bin/license_generator.app
 ### 10.5 制作 DMG
 
 使用 `hdiutil create` 或第三方工具（如 create-dmg）制作拖拽安装 DMG。已生成产品：`build/xiaoqiao_freight.dmg`（约 55MB）。
+
+### 10.6 版本号管理（CMake 单源真源 v1.00 ~ ）
+
+> **唯一一处真源**：`CMakeLists.txt` 第一行 `project(xiaoqiao_freight VERSION X.Y.Z LANGUAGES CXX)`。修改这里会**自动传播**到：
+> - Info.plist 里的 `CFBundleShortVersionString / CFBundleVersion`（macOS Finder/Get Info 显示）
+> - GUI「关于」页显示的 `APP_VERSION_DISPLAY`（格式 `X.YZ`，比如 1.0.9 → 1.09）
+> - 所有输出诊断列 / 日志里埋点版本
+
+| 发布版本 | CMake VERSION | GUI 显示 | 日期 | 核心变更 |
+|---|---|---|---|---|
+| v1.00 | 1.0.0 | 1.00 | 2026-07-20 | 项目初版：单条/批量计算、表头自动映射、6 级阶梯+燃油/地区/自定义策略、SQLite 规则库 |
+| v1.01 | 1.0.1 | 1.01 | 2026-07-21 | 客户管理 + 客户级默认模板绑定 + 折扣率 |
+| v1.02 | 1.0.2 | 1.02 | 2026-07-22 | 历史记录服务、Diff 对比分析、旧数据清理 |
+| v1.03 | 1.0.3 | 1.03 | 2026-07-23 | 自动性能调优（90% 内存/CPU）、DuckDB 列式参数优化 |
+| v1.04 | 1.0.4 | 1.04 | 2026-07-24 | 8 家快递模板指纹识别 + 管理对话框（自定义覆盖内置） |
+| v1.05 | 1.0.5 | 1.05 | 2026-07-24 | 图标系统全套升级为「祥云快递盒」方案B + icns/9档PNG/QRC 一键生成 |
+| v1.06 | 1.0.6 | 1.06 | 2026-07-25 | 授权系统6项大修：试用版落盘/时间扣减持久化/双文件交叉防篡改/稳定MAC四维机器码/无效授权 days=-1 |
+| v1.07 | 1.0.7 | 1.07 | 2026-07-26 | 拉均重合同第一版：双绑定(客户级/模板级)、方案A分区复用 + 排除省、方案B自定义省白名单、4 列诊断、开关控制 |
+| v1.08 | 1.0.8 | 1.08 | 2026-07-27 | 修复方案A进池资格 EXISTS 写反 + CalcBatch 入口强制 ReloadRules + billing_params_test T7/T7.1/T8 覆盖 |
+| v1.09 | 1.0.9 | 1.09 | 2026-07-27 | 拉均重真实场景打通：LEFT JOIN customers 同时匹配 customer_name；方案A去掉 template_id 多余过滤（展示列不进 WHERE） |
+
+**升级流程（推荐）**：
+```bash
+cd xiaoqiao_freight
+# 1. 改 VERSION
+perl -i -pe 's/project\(xiaoqiao_freight VERSION \d+\.\d+\.\d+/project(xiaoqiao_freight VERSION 1.0.10/' CMakeLists.txt
+# 2. 重新跑单元测试
+cd build && cmake .. && make -j8 billing_params_test && ./bin/billing_params_test | grep FAIL
+# 3. 打包
+make -j8 xiaoqiao_freight
+# 4. 交付产物：build/bin/xiaoqiao_freight_v1.10.app
+```
 
 ---
 
@@ -1358,9 +1465,21 @@ bash xiaoqiao_freight/scripts/deploy_mac.sh build/bin/license_generator.app
 | 一键生成 .icns + 9档PNG 资源工具 | [gen_icon/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/gen_icon/main.cpp#L1-L240) | `DrawLogoSchemeB() + iconutil -c icns` |
 | T7 Headless 5项接口回归测试 | [t7_test/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/t7_test/main.cpp#L1-L180) | 1)8内置 2)开关 3)自定义覆盖 4)CRUD 5)持久化 |
 | 全局 Alt-Tab 窗口统一图标 app.setWindowIcon | [main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/main.cpp#L50-L52) | `app.setWindowIcon(icons.GetIcon(app_logo, LOGO, 64))` |
+| 拉均重合同双绑定查找（客户级优先 + 模板级 fallback MAX(version)） | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L717-L814) | `avg_weight_active CTE + avg_weight_joined CTE COALESCE(客户级子查询, 模板级子查询)` |
+| 拉均重方案A进池资格（分区勾选+排除省） | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L825-L847) | `NOT EXISTS(未配置分区) OR EXISTS(匹配分区) AND NOT EXISTS(排除省)` |
+| 拉均重方案B进池资格（自定义省白名单） | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L848-L858) | `EXISTS(avg_weight_zones 匹配省)` |
+| 客户 LEFT JOIN（同时匹配 customer_id 和 customer_name） | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L1029-L1031) | `TRIM(customer_id)=TRIM(i.customer_id) OR TRIM(customer_name)=TRIM(i.customer_id)` |
+| GetCustomer 两阶段查找（主键 + 中文名称 fallback） | [sqlite_rule_repository.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/sqlite_rule_repository.cpp#L1242-L1267) | `先 WHERE customer_id=? → 失败再 WHERE TRIM(customer_name)=?` |
+| 拉均重 4 张表写库（含失败重试+详细诊断日志） | [sqlite_rule_repository.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/db/sqlite_rule_repository.cpp#L1480-L1580) | `SaveAvgWeightTemplate / SetAvgWeightTplGroups / SetAvgWeightExcludes / SetAvgWeightZones` |
+| 拉均重合同编辑 UI（方案A/B切换 + 分区勾选左右双栏 + 排除省） | [rule_setting_dialog.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/ui/dialogs/rule_setting_dialog.cpp#L2540-L2800) | `rb_plan_a / sel_tpl_groups / excl_tplg_provs` |
+| billing_params_test T7（方案B端到端 10 行江浙沪 + X1 超上限） | [billing_params_test/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/billing_params_test/main.cpp#L390-L490) | `POLAIYA_LAJZ_001` 合同 + L1-L10 应全部采用拉价 |
+| billing_params_test T7.1（SqliteRuleRepository 层 CRUD 直写 + 回读） | [billing_params_test/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/billing_params_test/main.cpp#L492-L556) | `SaveAvgWeightTemplate + SetAvgWeightTplGroups/Excludes/Zones` 4 子操作 |
+| billing_params_test T8（方案A + 模板级绑定 + Z1勾选 + Z1排除上海） | [billing_params_test/main.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/tools/billing_params_test/main.cpp#L559-L720) | `POL_TPL_001` + CalcFromFile 真实 CSV 工作流 |
+| 拉均重开关双门控（C++端 + SQL __lajz_global CTE） 关时占位列全空 | [calc_service.cpp](file:///Users/cxd/duckdb/xiaoqiao_freight/src/services/calc_service.cpp#L706-L712 + L950-L980) | `enable_avg_weight ? 真实CTE : 占位CTE` |
+| CMake 单源版本号（VERSION 一处改动 三处输出） | [CMakeLists.txt](file:///Users/cxd/duckdb/xiaoqiao_freight/CMakeLists.txt#L1-L100) | `project(VERSION X.Y.Z) + configure_file(version_defs.hpp.in)` |
 
 ---
 
-*文档版本：1.2*  
-*最后更新：2026-07-25（v1.2 更新要点：授权系统6项修复、加价策略global跨模板、per_volume新增、shop_id列+客户兜底、7标准列、模板级scope移除、燃油/地区模板筛选、四维机器码+双文件篡改校验）*  
+*文档版本：1.3*  
+*最后更新：2026-07-27（v1.3 更新要点：拉均重真实场景 6 坑、版本号管理 v1.00~v1.09、§12 附录加拉均重核心代码位置速查）*  
 *版权所有 © 2026 杭州喵喵至家网络有限公司 www.hbdxm.com*

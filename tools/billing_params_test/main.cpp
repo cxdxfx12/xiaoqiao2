@@ -8,6 +8,8 @@
 #include <QDebug>
 #include <QDir>
 #include <QFile>
+#include <QTextStream>
+#include <QTemporaryDir>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QVariantMap>
@@ -558,18 +560,30 @@ INSERT INTO _lajz_in VALUES
     qInfo() << "\n=========【测试8】方案A（默认）+ 模板级绑定 + 分区勾选 + 排除省  ==========";
     {
         // 8.1 重置客户A的客户级外键（模拟用户"没有在客户资料里挂合同，只在合同里选模板=tpl_a 这种模板级绑定"）
+        //     关键：必须先删除 T7 测试写入的 POLAIYA_LAJZ_001 合同（方案B，template_id='tpl_a', version=1）
+        //           否则两个同 version=1、同 template_id='tpl_a' 的合同会冲突（DuckDB GROUP BY 随机取 POLAIYA_LAJZ_001），
+        //           导致 T8 的 POL_TPL_001（方案A、排除上海、min=3）永远不生效
         {
             QSqlQuery q(repo.Database());
+            // 清理：所有写在 T8 之前、template_id='tpl_a' 的拉均重合同（否则 GROUP BY 取 version=1 最大同 version=1 的，DuckDB 随机取，导致 POL_TPL_001 不生效）
+            for (const char *oldIds : {"UT_LAJZ_DIRECT_001", "POLAIYA_LAJZ_001"}) {
+                q.prepare(QString("DELETE FROM avg_weight_templates     WHERE avg_tpl_id='%1'").arg(oldIds));
+                q.exec();
+                q.prepare(QString("DELETE FROM avg_weight_zones           WHERE avg_tpl_id='%1'").arg(oldIds)); q.exec();
+                q.prepare(QString("DELETE FROM avg_weight_zone_tpl_groups WHERE avg_tpl_id='%1'").arg(oldIds)); q.exec();
+                q.prepare(QString("DELETE FROM avg_weight_zone_excludes   WHERE avg_tpl_id='%1'").arg(oldIds)); q.exec();
+            }
+            // 清客户A的客户级绑定（确保走模板级 fallback）
             q.prepare("UPDATE customers SET avg_weight_tpl_id=NULL WHERE customer_id='cA'");
             if (!q.exec()) { qCritical() << "reset cust fail:" << q.lastError().text(); return 1; }
-            // 写一份新合同：POLAIYA_TPL_BIND，template_id='tpl_a'（模板级绑定），reuse_zone_groups=1，min_tickets=3
+            // 写一份新合同：POL_TPL_001，template_id='tpl_a'（模板级绑定），reuse_zone_groups=1，min_tickets=3
             q.prepare("INSERT OR REPLACE INTO avg_weight_templates"
                       "(avg_tpl_id,template_id,name,contract_no,avg_pool_max_kg,base_avg_kg,"
                       " avg_fee_cap_kg,base_fee,step_kg,step_fee,min_tickets,"
                       " reuse_zone_groups,over_cap_mode,is_active,version,effective_from,effective_to)"
                       " VALUES"
                       "('POL_TPL_001','tpl_a','珀莱-模板级绑定测试','LAJZ-TPL-001', 2.5, 0.3,"
-                      " 1.5, 2.7, 0.1, 0.12, 3,"   // 3 票即可，基础价 2.7，每 0.1kg 0.12，封顶 1.5
+                      " 1.5, 2.7, 0.1, 0.12, 3,"
                       " 1, 0, 1, 1, '2025-01-01', '2099-12-31')");
             if (!q.exec()) { qCritical() << "ins POL_TPL_001 fail:" << q.lastError().text(); return 1; }
             // 方案A：勾选模板分区 tpl_a 的 Z1（只有Z1，大写！），并再新建 Z2 但 tpl_a 原本没有 Z2，就只勾 Z1 模拟"全勾"
@@ -591,53 +605,65 @@ INSERT INTO _lajz_in VALUES
         // 8.2 强制 reload
         SyncRulesSqliteToDuckDB(repo, rulesDb);
         dbm.ReloadRules(rulesDb);
-        // 8.3 构造 5 条：江苏/浙江/上海/安徽/山东 → L1江苏进池、L2浙江进池、L3上海EXCLUDED不进池、L4安徽zone2进池、L5山东zone2进池
+        // 8.3 构造 5 条：江苏/浙江/上海/江苏/福建 → 走 CalcFromFile（与用户真实场景完全一致的路径：自动 ReloadRules + 同 Connection 计算）
+        QString t8InputCSV, t8OutputCSV;
         {
-            auto con = dbm.CreateConnection();
-            con.Query("DROP TABLE IF EXISTS _t8in");
-            con.Query(R"SQL(
-CREATE TABLE _t8in (
-    order_id VARCHAR, dest_province VARCHAR, dest_city VARCHAR,
-    weight DOUBLE, vol_weight DOUBLE, customer_id VARCHAR
-);
-INSERT INTO _t8in VALUES
-  ('T8L1','江苏','苏州', 0.5, 0, 'cA'),   -- Z1 江浙沪 → 勾选 → 不排除（只排除上海）→ 进池
-  ('T8L2','浙江','杭州', 0.5, 0, 'cA'),   -- Z1 → 勾选 → 进池
-  ('T8L3','上海','浦东', 0.5, 0, 'cA'),   -- Z1 → 勾选但 上海在排除省 → 不进池（阶梯 8）
-  ('T8L4','江苏','南京', 0.4, 0, 'cA'),   -- Z1 → 勾选 → 进池（3 票 ≥ 门槛 3）
-  ('T8X2','福建','福州', 0.5, 0, 'cA');   -- 福建不在 tpl_a Z1 列表 → group_code 空 → 进池=否（阶梯匹配失败 → base_fee=0 正常，不影响拉均重判定）
-)
-)SQL");
+            QTemporaryDir td; td.setAutoRemove(false);
+            t8InputCSV = td.path() + QStringLiteral("/t8_input.csv");
+            t8OutputCSV = td.path() + QStringLiteral("/t8_output.csv");
+            QFile f(t8InputCSV);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) { qCritical() << "write csv fail"; return 1; }
+            QTextStream ts(&f);
+            ts << "订单号,目的省份,目的城市,实际重量(KG),体积重量(KG),客户编号\n";
+            auto addRow = [&](const QString &o, const QString &p, const QString &c, double w, double v, const QString &cid) {
+                ts << o << ',' << p << ',' << c << ','
+                   << QString::number(w,'f',2) << ',' << QString::number(v,'f',2) << ',' << cid << '\n';
+            };
+            addRow("T8L1","江苏","苏州",0.5,0,"cA");
+            addRow("T8L2","浙江","杭州",0.5,0,"cA");
+            addRow("T8L3","上海","浦东",0.5,0,"cA");
+            addRow("T8L4","江苏","南京",0.4,0,"cA");
+            addRow("T8X2","福建","福州",0.5,0,"cA");
+            f.close();
+            qInfo() << "   [8.3] 写入5条测试CSV:" << t8InputCSV << "（输出→" << t8OutputCSV << "）";
         }
-        // 8.4 enable=TRUE 跑批
+        // 8.4 enable=TRUE 跑 CalcFromFile（跟用户界面完全一致的路径：文件导入 → ReloadRules → 归一化列 → CalcBatch → 导出）
         {
             services::CalcService cs;
-            if (!cs.CalcBatch("_t8in", "_t8out", true)) { qCritical() << "CalcBatch t8 fail"; return 1; }
+            if (!cs.CalcFromFile(t8InputCSV, t8OutputCSV, true)) { qCritical() << "CalcFromFile t8 fail"; return 1; }
             auto con = dbm.CreateConnection();
-            // 先看有多少行 + 订单号列名到底是什么（防止列名不一致造成找不到）
+            // 8.4.1 把输出CSV 再次导入 DuckDB 的 _t8out 表，方便查询断言
+            con.Query("DROP TABLE IF EXISTS _t8out");
+            if (!dbm.ImportFromFile("_t8out", t8OutputCSV)) {
+                qCritical() << "re-import t8OutputCSV fail:" << t8OutputCSV;
+                return 1;
+            }
+            // 8.4.2 行数检查 + 打印所有行
             {
                 auto rc = con.Query("SELECT COUNT(*) AS c FROM _t8out");
                 long long cnt = (rc && rc->RowCount()) ? rc->GetValue(0,0).GetValue<long long>() : -1;
                 qInfo() << "   _t8out rows=" << cnt;
-                if (cnt <= 0) {
-                    auto rci = con.Query("SELECT COUNT(*) FROM _t8in");
-                    qInfo() << "     输入表 _t8in rows=" << (rci && rci->RowCount() ? rci->GetValue(0,0).GetValue<long long>() : -1);
+                if (cnt <= 0) { qCritical() << "CalcFromFile 输出 0 行"; return 1; }
+            }
+            {
+                auto cols = con.Query(R"SQL(SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='_t8out' ORDER BY ordinal_position)SQL");
+                if (cols) {
+                    QStringList cnames;
+                    for (size_t i = 0; i < cols->RowCount(); ++i) {
+                        cnames << QString::fromStdString(cols->GetValue(0,i).ToString());
+                    }
+                    qInfo() << "   _t8out columns=" << cnames.join(" | ");
                 }
             }
-            auto rs = con.Query(R"SQL(SELECT "订单号","目的省份","是否命中拉均重池","是否采用拉均重价","基础运费","拉均重单票基础价(元)","拉均重池有效票数/门槛","拉均重池平均重量(KG)" FROM _t8out ORDER BY "订单号")SQL");
+            // 输出列名在 CalcService 里是中文（带引号），CSV 导入 DuckDB 后列名一般会去掉引号或保留；这里用 CSV 导入的真实列名查
+            auto rs = con.Query(R"SQL(SELECT * FROM _t8out ORDER BY 1)SQL");
             qInfo() << "   -- 测试8 enable=TRUE 结果：--";
-            for (size_t i = 0; i < rs->RowCount(); ++i) {
-                QString o = QString::fromStdString(rs->GetValue(0,i).ToString());
-                QString p = QString::fromStdString(rs->GetValue(1,i).ToString());
-                QString hit = QString::fromStdString(rs->GetValue(2,i).ToString());
-                QString use = QString::fromStdString(rs->GetValue(3,i).ToString());
-                double bf = rs->GetValue(4,i).GetValue<double>();
-                double lbf = rs->GetValue(5,i).GetValue<double>();
-                QString nt = QString::fromStdString(rs->GetValue(6,i).ToString());
-                double avgk = rs->GetValue(7,i).GetValue<double>();
-                qInfo().noquote() << QString("      %1 %2 命中=%3 用拉=%4 基础费=%5 拉单票=%6 票/槛=%7 池均=%8")
-                                         .arg(o,-5).arg(p,-4).arg(hit,-4).arg(use,-4)
-                                         .arg(bf,0,'f',2).arg(lbf,0,'f',2).arg(nt,-8).arg(avgk,0,'f',3);
+            for (size_t i = 0; i < (rs ? rs->RowCount() : 0); ++i) {
+                QStringList cells;
+                for (size_t j = 0; j < (rs ? rs->ColumnCount() : 0); ++j) {
+                    cells << QString::fromStdString(rs->GetValue(j,i).ToString());
+                }
+                qInfo().noquote() << "      " << cells.join("  |  ");
             }
             // 核心断言：T8L1 江苏 → 进池 + 采用拉均重价，基础费≈ 2.7 + ceil((0.5-0.3)/0.1)*0.12 = 2.7 + 2*0.12 = 2.94
             {

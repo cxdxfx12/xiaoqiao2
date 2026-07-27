@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(xiaoqiao_freight VERSION 1.0.7 LANGUAGES CXX)
+project(xiaoqiao_freight VERSION 1.0.9 LANGUAGES CXX)
 
 # ========== 唯一真源：项目版本号 X.Y.Z（每次大更改 Y.Z 加 0.01，即改 Y 或 Z 即可）==========
 #   显示格式：X.YZ    —— 比如 1.0.1 → "1.01"，1.0.10 → "1.10"，1.1.0 → "1.10"
